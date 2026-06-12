@@ -182,15 +182,18 @@ set(ARROW_FLIGHT_SRCS
     middleware.cc
     serialization_internal.cc
     server.cc
+    server_async.cc
     server_auth.cc
     server_tracing_middleware.cc
     transport.cc
     transport_server.cc
     transport_server_internal.cc
+    transport_server_async.cc
     # Bundle the gRPC impl with libarrow_flight
     transport/grpc/grpc_client.cc
     transport/grpc/grpc_server.cc
     transport/grpc/grpc_server_internal.cc
+    transport/grpc/grpc_server_async.cc
     transport/grpc/serialization_internal.cc
     transport/grpc/protocol_grpc_internal.cc
     transport/grpc/util_internal.cc
@@ -331,6 +334,12 @@ add_arrow_test(flight_internals_test
                "arrow_flight")
 
 add_arrow_test(flight_test
+               STATIC_LINK_LIBS
+               ${ARROW_FLIGHT_TEST_LINK_LIBS}
+               LABELS
+               "arrow_flight")
+
+add_arrow_test(flight_async_test
                STATIC_LINK_LIBS
                ${ARROW_FLIGHT_TEST_LINK_LIBS}
                LABELS

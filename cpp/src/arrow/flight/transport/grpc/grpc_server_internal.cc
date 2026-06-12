@@ -86,9 +86,14 @@ void ConfigureServerBuilderOptions(const FlightServerOptions& options,
 
 Status StartFlightGrpcServer(const FlightServerOptions& options,
                              const arrow::util::Uri& uri, ::grpc::Service* service,
-                             std::unique_ptr<::grpc::Server>* server,
+                             bool callback_api, std::unique_ptr<::grpc::Server>* server,
                              Location* location) {
   ::grpc::ServerBuilder builder;
+  if (callback_api) {
+    builder.SetSyncServerOption(::grpc::ServerBuilder::SyncServerOption::NUM_CQS, 0);
+    builder.SetSyncServerOption(::grpc::ServerBuilder::SyncServerOption::MIN_POLLERS, 1);
+    builder.SetSyncServerOption(::grpc::ServerBuilder::SyncServerOption::MAX_POLLERS, 1);
+  }
   int port = 0;
   ARROW_ASSIGN_OR_RAISE(auto endpoint, ParseServerEndpoint(options, uri));
   *location = endpoint.location;
