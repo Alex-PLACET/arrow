@@ -28,6 +28,7 @@ install_headers(
         'platform.h',
         'server_auth.h',
         'server.h',
+        'server_async.h',
         'server_middleware.h',
         'server_tracing_middleware.h',
         'test_auth_handlers.h',
@@ -84,12 +85,17 @@ arrow_flight_srcs = [
     'middleware.cc',
     'serialization_internal.cc',
     'server.cc',
+    'server_async.cc',
     'server_auth.cc',
     'server_tracing_middleware.cc',
     'transport.cc',
     'transport_server.cc',
+    'transport_server_internal.cc',
+    'transport_server_async.cc',
     'transport/grpc/grpc_client.cc',
     'transport/grpc/grpc_server.cc',
+    'transport/grpc/grpc_server_internal.cc',
+    'transport/grpc/grpc_server_async.cc',
     'transport/grpc/serialization_internal.cc',
     'transport/grpc/protocol_grpc_internal.cc',
     'transport/grpc/util_internal.cc',
@@ -148,7 +154,7 @@ else
     arrow_flight_test_dep = disabler()
 endif
 
-flight_tests = ['flight_internals_test', 'flight_test']
+flight_tests = ['flight_internals_test', 'flight_test', 'flight_async_test']
 foreach flight_test : flight_tests
     test_name = '@0@'.format(flight_test.replace('_', '-'))
     exc = executable(

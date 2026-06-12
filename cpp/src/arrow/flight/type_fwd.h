@@ -43,6 +43,7 @@ class FlightListing;
 class FlightMetadataReader;
 class FlightMetadataWriter;
 struct FlightPayload;
+class AsyncFlightServerBase;
 class FlightServerBase;
 class FlightServerOptions;
 class FlightStreamReader;
