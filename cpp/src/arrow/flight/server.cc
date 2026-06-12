@@ -31,6 +31,7 @@
 #include "arrow/device.h"
 #include "arrow/flight/transport.h"
 #include "arrow/flight/transport/grpc/grpc_server.h"
+#include "arrow/flight/transport_server_internal.h"
 #include "arrow/flight/transport_server.h"
 #include "arrow/flight/transport_server_internal.h"
 #include "arrow/flight/types.h"
