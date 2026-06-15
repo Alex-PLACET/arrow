@@ -22,7 +22,6 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
-#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -41,6 +40,7 @@
 #include "arrow/flight/types.h"
 #include "arrow/result.h"
 #include "arrow/status.h"
+#include "arrow/util/thread_pool.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/uri.h"
 
@@ -90,10 +90,19 @@ using GrpcServerCallContext =
 using CallbackServiceHelper =
     transport::grpc::GrpcServerCallContextHelper<::grpc::CallbackServerContext>;
 
+arrow::internal::ThreadPool* GetAsyncGrpcWorkerPool() {
+  static std::shared_ptr<arrow::internal::ThreadPool> pool =
+      arrow::internal::ThreadPool::MakeEternal(
+          arrow::internal::ThreadPool::DefaultCapacity())
+          .ValueOrDie();
+  return pool.get();
+}
+
 template <typename Proto>
 class WriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
  public:
-  explicit WriteReactorBase(::grpc::CallbackServerContext* context) : context_(context) {}
+  explicit WriteReactorBase(::grpc::CallbackServerContext* context)
+      : context_(context), executor_(GetAsyncGrpcWorkerPool()) {}
 
   void OnWriteDone(bool ok) override {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -112,14 +121,17 @@ class WriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
   }
 
   void OnDone() override {
-    if (worker_.joinable()) {
-      worker_.join();
+    if (worker_future_.is_valid()) {
+      worker_future_.Wait();
     }
     delete this;
   }
 
  protected:
-  void StartWorker(std::function<void()> fn) { worker_ = std::thread(std::move(fn)); }
+  Status StartWorker(std::function<void()> fn) {
+    ARROW_ASSIGN_OR_RAISE(worker_future_, executor_->Submit(std::move(fn)));
+    return Status::OK();
+  }
 
   bool WriteOne(Proto message) {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -142,7 +154,8 @@ class WriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
   }
 
   ::grpc::CallbackServerContext* context_;
-  std::thread worker_;
+  arrow::internal::Executor* executor_;
+  Future<> worker_future_;
   std::mutex mutex_;
   std::condition_variable cv_;
   Proto current_write_;
@@ -163,7 +176,7 @@ class ImmediateWriteReactor final : public ::grpc::ServerWriteReactor<Proto> {
 class FlightDataWriteReactorBase : public ::grpc::ServerWriteReactor<pb::FlightData> {
  public:
   explicit FlightDataWriteReactorBase(::grpc::CallbackServerContext* context)
-      : context_(context) {}
+      : context_(context), executor_(GetAsyncGrpcWorkerPool()) {}
 
   void OnWriteDone(bool ok) override {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -190,14 +203,17 @@ class FlightDataWriteReactorBase : public ::grpc::ServerWriteReactor<pb::FlightD
       transport::grpc::UnregisterGrpcFlightDataMessage(&current_write_);
       flight_data_registered_ = false;
     }
-    if (worker_.joinable()) {
-      worker_.join();
+    if (worker_future_.is_valid()) {
+      worker_future_.Wait();
     }
     delete this;
   }
 
  protected:
-  void StartWorker(std::function<void()> fn) { worker_ = std::thread(std::move(fn)); }
+  Status StartWorker(std::function<void()> fn) {
+    ARROW_ASSIGN_OR_RAISE(worker_future_, executor_->Submit(std::move(fn)));
+    return Status::OK();
+  }
 
   arrow::Result<bool> WritePayloadOne(FlightPayload payload) {
     ARROW_ASSIGN_OR_RAISE(current_write_, SerializeFlightPayload(payload));
@@ -222,7 +238,8 @@ class FlightDataWriteReactorBase : public ::grpc::ServerWriteReactor<pb::FlightD
   }
 
   ::grpc::CallbackServerContext* context_;
-  std::thread worker_;
+  arrow::internal::Executor* executor_;
+  Future<> worker_future_;
   std::mutex mutex_;
   std::condition_variable cv_;
   pb::FlightData current_write_;
@@ -237,16 +254,18 @@ class FlightDataWriteReactorBase : public ::grpc::ServerWriteReactor<pb::FlightD
 template <typename Req, typename Resp>
 class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
  public:
-  explicit BidiReactorBase(::grpc::CallbackServerContext* context) : context_(context) {
+  explicit BidiReactorBase(::grpc::CallbackServerContext* context)
+      : context_(context), executor_(GetAsyncGrpcWorkerPool()) {
     if constexpr (std::is_same_v<Req, pb::FlightData>) {
       transport::grpc::RegisterGrpcFlightDataMessage(&read_buffer_);
       read_buffer_registered_ = true;
     }
   }
 
-  void StartWorker(std::function<void()> fn) {
+  Status StartWorker(std::function<void()> fn) {
     this->StartRead(&read_buffer_);
-    worker_ = std::thread(std::move(fn));
+    ARROW_ASSIGN_OR_RAISE(worker_future_, executor_->Submit(std::move(fn)));
+    return Status::OK();
   }
 
   void OnReadDone(bool ok) override {
@@ -295,8 +314,8 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
         flight_data_registered_ = false;
       }
     }
-    if (worker_.joinable()) {
-      worker_.join();
+    if (worker_future_.is_valid()) {
+      worker_future_.Wait();
     }
     delete this;
   }
@@ -350,7 +369,8 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   }
 
   ::grpc::CallbackServerContext* context_;
-  std::thread worker_;
+  arrow::internal::Executor* executor_;
+  Future<> worker_future_;
   Req read_buffer_;
   std::deque<Req> reads_;
   Resp current_write_;
@@ -568,7 +588,7 @@ class IteratorReactor : public WriteReactorBase<Proto> {
         to_proto_(std::move(to_proto)) {}
 
   void Start() {
-    this->StartWorker([this] {
+    auto status = this->StartWorker([this] {
       while (true) {
         auto maybe_value = next_fn_();
         if (!maybe_value.ok()) {
@@ -587,6 +607,9 @@ class IteratorReactor : public WriteReactorBase<Proto> {
       }
       this->FinishFromWorker(flight_context_.FinishRequest(Status::OK()));
     });
+    if (!status.ok()) {
+      this->Finish(flight_context_.FinishRequest(status));
+    }
   }
 
  private:
@@ -604,7 +627,7 @@ class DoGetReactor : public FlightDataWriteReactorBase {
         stream_(std::move(stream)) {}
 
   void Start() {
-    this->StartWorker([this] {
+    auto status = this->StartWorker([this] {
       if (!stream_) {
         this->FinishFromWorker(
             flight_context_.FinishRequest(Status::KeyError("No data in this flight")));
@@ -644,6 +667,9 @@ class DoGetReactor : public FlightDataWriteReactorBase {
       auto close_status = stream_->Close();
       this->FinishFromWorker(flight_context_.FinishRequest(close_status));
     });
+    if (!status.ok()) {
+      this->Finish(flight_context_.FinishRequest(status));
+    }
   }
 
  private:
@@ -667,7 +693,7 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
         return;
       }
       helper_.AddMiddlewareHeaders(this->context_, &flight_context_);
-      this->StartWorker([this] {
+      auto status = this->StartWorker([this] {
         Status status;
         if (helper_.auth_handler()) {
           auto outgoing = std::make_unique<HandshakeAuthWriter>(this);
@@ -683,6 +709,9 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
         }
         this->FinishFromWorker(flight_context_.FinishRequest(status));
       });
+      if (!status.ok()) {
+        this->Finish(flight_context_.FinishRequest(status));
+      }
     }
 
    private:
@@ -859,11 +888,14 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
         return;
       }
       helper_.AddMiddlewareHeaders(this->context_, &flight_context_);
-      this->StartWorker([this] {
+      auto status = this->StartWorker([this] {
         PutDataStream stream(this);
         auto status = impl_->DoPut(flight_context_, &stream);
         this->FinishFromWorker(flight_context_.FinishRequest(status));
       });
+      if (!status.ok()) {
+        this->Finish(flight_context_.FinishRequest(status));
+      }
     }
 
    private:
@@ -891,11 +923,14 @@ CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
         return;
       }
       helper_.AddMiddlewareHeaders(this->context_, &flight_context_);
-      this->StartWorker([this] {
+      auto status = this->StartWorker([this] {
         ExchangeDataStream stream(this);
         auto status = impl_->DoExchange(flight_context_, &stream);
         this->FinishFromWorker(flight_context_.FinishRequest(status));
       });
+      if (!status.ok()) {
+        this->Finish(flight_context_.FinishRequest(status));
+      }
     }
 
    private:

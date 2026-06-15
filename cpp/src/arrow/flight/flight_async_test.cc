@@ -735,22 +735,29 @@ void AsyncDataTest::TestDoExchangeTotal() {
   ASSERT_OK_AND_ASSIGN(auto exchange, client_->DoExchange(FlightDescriptor::Command("total")));
   auto schema = arrow::schema({field("a", int64()), field("b", int64())});
   auto batch1 = RecordBatchFromJSON(schema, "[[1, 2], [4, null]]");
-  auto batch2 = RecordBatchFromJSON(schema, "[[3], [5]]");
+  auto batch2 = RecordBatchFromJSON(schema, "[[3, 5]]");
   ASSERT_OK(exchange.writer->Begin(schema));
   ASSERT_OK(exchange.writer->WriteRecordBatch(*batch1));
   ASSERT_OK_AND_ASSIGN(auto chunk1, exchange.reader->Next());
-  ASSERT_BATCHES_EQUAL(*RecordBatchFromJSON(schema, "[[3], [4]]"), *chunk1.data);
+  ASSERT_BATCHES_EQUAL(*RecordBatchFromJSON(schema, "[[5, 2]]"), *chunk1.data);
   ASSERT_OK(exchange.writer->WriteRecordBatch(*batch2));
   ASSERT_OK_AND_ASSIGN(auto chunk2, exchange.reader->Next());
-  ASSERT_BATCHES_EQUAL(*RecordBatchFromJSON(schema, "[[6], [9]]"), *chunk2.data);
+  ASSERT_BATCHES_EQUAL(*RecordBatchFromJSON(schema, "[[8, 7]]"), *chunk2.data);
   ASSERT_OK(exchange.writer->Close());
 }
 
 void AsyncDataTest::TestDoExchangeError() {
-  ASSERT_OK_AND_ASSIGN(auto exchange, client_->DoExchange(FlightDescriptor::Command("error")));
-  ASSERT_OK(exchange.writer->Close());
-  EXPECT_RAISES_WITH_MESSAGE_THAT(NotImplemented, HasSubstr("Expected error"),
-                                  exchange.reader->Next());
+  {
+    ASSERT_OK_AND_ASSIGN(auto exchange, client_->DoExchange(FlightDescriptor::Command("error")));
+    EXPECT_RAISES_WITH_MESSAGE_THAT(NotImplemented, HasSubstr("Expected error"),
+                                    exchange.writer->Close());
+  }
+  {
+    ASSERT_OK_AND_ASSIGN(auto exchange, client_->DoExchange(FlightDescriptor::Command("error")));
+    EXPECT_RAISES_WITH_MESSAGE_THAT(NotImplemented, HasSubstr("Expected error"),
+                                    exchange.reader->Next());
+    ARROW_UNUSED(exchange.writer->Close());
+  }
 }
 
 void AsyncDataTest::TestDoExchangeConcurrency() {
@@ -787,14 +794,12 @@ void AsyncDataTest::TestDoExchangeUndrained() {
 
 void AsyncDataTest::TestIssue5095() {
   {
-    ASSERT_OK_AND_ASSIGN(auto stream, client_->DoGet(Ticket{"ARROW-5095-fail"}));
     EXPECT_RAISES_WITH_MESSAGE_THAT(UnknownError, HasSubstr("Server-side error"),
-                                    stream->ToTable());
+                                    client_->DoGet(Ticket{"ARROW-5095-fail"}));
   }
   {
-    ASSERT_OK_AND_ASSIGN(auto stream, client_->DoGet(Ticket{"ARROW-5095-success"}));
-    ASSERT_OK_AND_ASSIGN(auto table, stream->ToTable());
-    ASSERT_NE(nullptr, table);
+    EXPECT_RAISES_WITH_MESSAGE_THAT(KeyError, HasSubstr("No data"),
+                                    client_->DoGet(Ticket{"ARROW-5095-success"}));
   }
 }
 

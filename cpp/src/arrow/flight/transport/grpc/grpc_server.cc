@@ -227,6 +227,7 @@ class GrpcServiceHandler final : public FlightService::Service {
     GrpcServerCallContext flight_context(context);
     GRPC_RETURN_NOT_GRPC_OK(
         helper_.MakeCallContext(FlightMethod::Handshake, context, &flight_context));
+    helper_.AddMiddlewareHeaders(context, &flight_context);
 
     if (!helper_.auth_handler()) {
       RETURN_WITH_MIDDLEWARE(
