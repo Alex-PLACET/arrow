@@ -17,6 +17,7 @@
 
 #include "arrow/flight/transport_server_async.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -99,74 +100,6 @@ arrow::internal::ThreadPool* GetAsyncGrpcWorkerPool() {
 }
 
 template <typename Proto>
-class WriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
- public:
-  explicit WriteReactorBase(::grpc::CallbackServerContext* context)
-      : context_(context), executor_(GetAsyncGrpcWorkerPool()) {}
-
-  void OnWriteDone(bool ok) override {
-    std::unique_lock<std::mutex> lock(mutex_);
-    write_in_flight_ = false;
-    write_ok_ = ok;
-    if (finish_requested_) {
-      this->Finish(finish_status_);
-    }
-    cv_.notify_all();
-  }
-
-  void OnCancel() override {
-    std::unique_lock<std::mutex> lock(mutex_);
-    cancelled_ = true;
-    cv_.notify_all();
-  }
-
-  void OnDone() override {
-    if (worker_future_.is_valid()) {
-      worker_future_.Wait();
-    }
-    delete this;
-  }
-
- protected:
-  Status StartWorker(std::function<void()> fn) {
-    ARROW_ASSIGN_OR_RAISE(worker_future_, executor_->Submit(std::move(fn)));
-    return Status::OK();
-  }
-
-  bool WriteOne(Proto message) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (cancelled_) return false;
-    current_write_ = std::move(message);
-    write_in_flight_ = true;
-    write_ok_ = true;
-    this->StartWrite(&current_write_);
-    cv_.wait(lock, [&] { return !write_in_flight_ || cancelled_; });
-    return !cancelled_ && write_ok_;
-  }
-
-  void FinishFromWorker(::grpc::Status status) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    finish_requested_ = true;
-    finish_status_ = std::move(status);
-    if (!write_in_flight_) {
-      this->Finish(finish_status_);
-    }
-  }
-
-  ::grpc::CallbackServerContext* context_;
-  arrow::internal::Executor* executor_;
-  Future<> worker_future_;
-  std::mutex mutex_;
-  std::condition_variable cv_;
-  Proto current_write_;
-  bool write_in_flight_ = false;
-  bool write_ok_ = true;
-  bool cancelled_ = false;
-  bool finish_requested_ = false;
-  ::grpc::Status finish_status_;
-};
-
-template <typename Proto>
 class ImmediateWriteReactor final : public ::grpc::ServerWriteReactor<Proto> {
  public:
   explicit ImmediateWriteReactor(::grpc::Status status) { this->Finish(std::move(status)); }
@@ -203,16 +136,27 @@ class FlightDataWriteReactorBase : public ::grpc::ServerWriteReactor<pb::FlightD
       transport::grpc::UnregisterGrpcFlightDataMessage(&current_write_);
       flight_data_registered_ = false;
     }
-    if (worker_future_.is_valid()) {
-      worker_future_.Wait();
-    }
-    delete this;
+    ReleaseRef();
   }
 
  protected:
   Status StartWorker(std::function<void()> fn) {
-    ARROW_ASSIGN_OR_RAISE(worker_future_, executor_->Submit(std::move(fn)));
+    refs_.fetch_add(1, std::memory_order_relaxed);
+    auto maybe_future = executor_->Submit([this, fn = std::move(fn)]() mutable {
+      fn();
+      ReleaseRef();
+    });
+    if (!maybe_future.ok()) {
+      ReleaseRef();
+      return maybe_future.status();
+    }
     return Status::OK();
+  }
+
+  void ReleaseRef() {
+    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete this;
+    }
   }
 
   arrow::Result<bool> WritePayloadOne(FlightPayload payload) {
@@ -239,7 +183,6 @@ class FlightDataWriteReactorBase : public ::grpc::ServerWriteReactor<pb::FlightD
 
   ::grpc::CallbackServerContext* context_;
   arrow::internal::Executor* executor_;
-  Future<> worker_future_;
   std::mutex mutex_;
   std::condition_variable cv_;
   pb::FlightData current_write_;
@@ -249,6 +192,7 @@ class FlightDataWriteReactorBase : public ::grpc::ServerWriteReactor<pb::FlightD
   bool finish_requested_ = false;
   bool flight_data_registered_ = false;
   ::grpc::Status finish_status_;
+  std::atomic<int> refs_{1};
 };
 
 template <typename Req, typename Resp>
@@ -263,16 +207,28 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   }
 
   Status StartWorker(std::function<void()> fn) {
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      read_in_flight_ = true;
+    }
     this->StartRead(&read_buffer_);
-    ARROW_ASSIGN_OR_RAISE(worker_future_, executor_->Submit(std::move(fn)));
+    refs_.fetch_add(1, std::memory_order_relaxed);
+    auto maybe_future = executor_->Submit([this, fn = std::move(fn)]() mutable {
+      fn();
+      ReleaseRef();
+    });
+    if (!maybe_future.ok()) {
+      ReleaseRef();
+      return maybe_future.status();
+    }
     return Status::OK();
   }
 
   void OnReadDone(bool ok) override {
     std::unique_lock<std::mutex> lock(mutex_);
+    read_in_flight_ = false;
     if (ok) {
       reads_.push_back(read_buffer_);
-      this->StartRead(&read_buffer_);
     } else {
       reads_done_ = true;
     }
@@ -314,10 +270,7 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
         flight_data_registered_ = false;
       }
     }
-    if (worker_future_.is_valid()) {
-      worker_future_.Wait();
-    }
-    delete this;
+    ReleaseRef();
   }
 
   bool ReadOne(Req* out) { return PopRead(out); }
@@ -338,11 +291,19 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
 
  protected:
   bool PopRead(Req* out) {
+    bool start_next_read = false;
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [&] { return cancelled_ || reads_done_ || !reads_.empty(); });
     if (!reads_.empty()) {
       *out = std::move(reads_.front());
       reads_.pop_front();
+      if (!reads_done_ && !cancelled_ && !read_in_flight_) {
+        read_in_flight_ = true;
+        start_next_read = true;
+      }
+      if (start_next_read) {
+        this->StartRead(&read_buffer_);
+      }
       return true;
     }
     return false;
@@ -368,9 +329,14 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     }
   }
 
+  void ReleaseRef() {
+    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete this;
+    }
+  }
+
   ::grpc::CallbackServerContext* context_;
   arrow::internal::Executor* executor_;
-  Future<> worker_future_;
   Req read_buffer_;
   std::deque<Req> reads_;
   Resp current_write_;
@@ -378,12 +344,14 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   std::condition_variable cv_;
   bool reads_done_ = false;
   bool read_buffer_registered_ = false;
+  bool read_in_flight_ = false;
   bool cancelled_ = false;
   bool write_in_flight_ = false;
   bool write_ok_ = true;
   bool flight_data_registered_ = false;
   bool finish_requested_ = false;
   ::grpc::Status finish_status_;
+  std::atomic<int> refs_{1};
 };
 
 template <typename ReactorT>
@@ -575,106 +543,256 @@ class AsyncGrpcServerTransport : public internal::AsyncServerTransport {
 };
 
 template <typename Proto, typename UserType>
-class IteratorReactor : public WriteReactorBase<Proto> {
+class IteratorReactor : public ::grpc::ServerWriteReactor<Proto> {
  public:
   using NextFn = std::function<arrow::Result<std::unique_ptr<UserType>>()>;
   using ToProtoFn = std::function<Status(const UserType&, Proto*)>;
 
   IteratorReactor(::grpc::CallbackServerContext* context, GrpcServerCallContext flight_context,
                   NextFn next_fn, ToProtoFn to_proto)
-      : WriteReactorBase<Proto>(context),
+      : context_(context),
+        executor_(GetAsyncGrpcWorkerPool()),
         flight_context_(std::move(flight_context)),
         next_fn_(std::move(next_fn)),
         to_proto_(std::move(to_proto)) {}
 
   void Start() {
-    auto status = this->StartWorker([this] {
-      while (true) {
-        auto maybe_value = next_fn_();
-        if (!maybe_value.ok()) {
-          this->FinishFromWorker(flight_context_.FinishRequest(maybe_value.status()));
-          return;
-        }
-        auto value = std::move(maybe_value).ValueUnsafe();
-        if (!value) break;
-        Proto proto;
-        auto st = to_proto_(*value, &proto);
-        if (!st.ok()) {
-          this->FinishFromWorker(flight_context_.FinishRequest(st));
-          return;
-        }
-        if (!this->WriteOne(std::move(proto))) break;
-      }
-      this->FinishFromWorker(flight_context_.FinishRequest(Status::OK()));
-    });
+    auto status = ScheduleAdvance();
     if (!status.ok()) {
-      this->Finish(flight_context_.FinishRequest(status));
+      FinishOnce(flight_context_.FinishRequest(status));
     }
   }
 
+  void OnWriteDone(bool ok) override {
+    if (!ok) {
+      FinishOnce(flight_context_.FinishRequest(Status::OK()));
+      return;
+    }
+    auto status = ScheduleAdvance();
+    if (!status.ok()) {
+      FinishOnce(flight_context_.FinishRequest(status));
+    }
+  }
+
+  void OnCancel() override { cancelled_.store(true, std::memory_order_relaxed); }
+
+  void OnDone() override { ReleaseRef(); }
+
  private:
+  Status ScheduleAdvance() {
+    refs_.fetch_add(1, std::memory_order_relaxed);
+    auto maybe_future = executor_->Submit([this] {
+      if (cancelled_.load(std::memory_order_relaxed)) {
+        ReleaseRef();
+        return;
+      }
+
+      auto maybe_value = next_fn_();
+      if (!maybe_value.ok()) {
+        FinishOnce(flight_context_.FinishRequest(maybe_value.status()));
+        ReleaseRef();
+        return;
+      }
+
+      auto value = std::move(maybe_value).ValueUnsafe();
+      if (!value) {
+        FinishOnce(flight_context_.FinishRequest(Status::OK()));
+        ReleaseRef();
+        return;
+      }
+
+      Proto proto;
+      auto st = to_proto_(*value, &proto);
+      if (!st.ok()) {
+        FinishOnce(flight_context_.FinishRequest(st));
+        ReleaseRef();
+        return;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (finished_) {
+          ReleaseRef();
+          return;
+        }
+        current_write_ = std::move(proto);
+      }
+      this->StartWrite(&current_write_);
+      ReleaseRef();
+    });
+    if (!maybe_future.ok()) {
+      ReleaseRef();
+      return maybe_future.status();
+    }
+    return Status::OK();
+  }
+
+  void FinishOnce(::grpc::Status status) {
+    bool expected = false;
+    if (finished_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      this->Finish(std::move(status));
+    }
+  }
+
+  void ReleaseRef() {
+    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete this;
+    }
+  }
+
+  ::grpc::CallbackServerContext* context_;
+  arrow::internal::Executor* executor_;
   GrpcServerCallContext flight_context_;
   NextFn next_fn_;
   ToProtoFn to_proto_;
+  Proto current_write_;
+  std::mutex mutex_;
+  std::atomic<bool> cancelled_{false};
+  std::atomic<bool> finished_{false};
+  std::atomic<int> refs_{1};
 };
 
-class DoGetReactor : public FlightDataWriteReactorBase {
+class DoGetReactor : public ::grpc::ServerWriteReactor<pb::FlightData> {
  public:
   DoGetReactor(::grpc::CallbackServerContext* context, GrpcServerCallContext flight_context,
                std::unique_ptr<FlightDataStream> stream)
-      : FlightDataWriteReactorBase(context),
+      : context_(context),
+        executor_(GetAsyncGrpcWorkerPool()),
         flight_context_(std::move(flight_context)),
         stream_(std::move(stream)) {}
 
   void Start() {
-    auto status = this->StartWorker([this] {
-      if (!stream_) {
-        this->FinishFromWorker(
-            flight_context_.FinishRequest(Status::KeyError("No data in this flight")));
-        return;
-      }
-      auto maybe_schema = stream_->GetSchemaPayload();
-      if (!maybe_schema.ok()) {
-        this->FinishFromWorker(flight_context_.FinishRequest(maybe_schema.status()));
-        return;
-      }
-      auto maybe_wrote_schema =
-          this->WritePayloadOne(std::move(maybe_schema).MoveValueUnsafe());
-      if (!maybe_wrote_schema.ok()) {
-        this->FinishFromWorker(flight_context_.FinishRequest(maybe_wrote_schema.status()));
-        return;
-      }
-      if (!maybe_wrote_schema.MoveValueUnsafe()) {
-        this->FinishFromWorker(flight_context_.FinishRequest(Status::OK()));
-        return;
-      }
-      while (true) {
-        auto maybe_payload = stream_->Next();
-        if (!maybe_payload.ok()) {
-          this->FinishFromWorker(flight_context_.FinishRequest(maybe_payload.status()));
-          return;
-        }
-        auto payload = std::move(maybe_payload).MoveValueUnsafe();
-        if (payload.ipc_message.metadata == nullptr) break;
-        auto maybe_wrote_payload = this->WritePayloadOne(std::move(payload));
-        if (!maybe_wrote_payload.ok()) {
-          this->FinishFromWorker(
-              flight_context_.FinishRequest(maybe_wrote_payload.status()));
-          return;
-        }
-        if (!maybe_wrote_payload.MoveValueUnsafe()) break;
-      }
-      auto close_status = stream_->Close();
-      this->FinishFromWorker(flight_context_.FinishRequest(close_status));
-    });
+    auto status = ScheduleAdvance();
     if (!status.ok()) {
-      this->Finish(flight_context_.FinishRequest(status));
+      FinishOnce(flight_context_.FinishRequest(status));
     }
   }
 
+  void OnWriteDone(bool ok) override {
+    if (flight_data_registered_) {
+      transport::grpc::UnregisterGrpcFlightDataMessage(&current_write_);
+      flight_data_registered_ = false;
+    }
+    if (!ok) {
+      FinishOnce(flight_context_.FinishRequest(Status::OK()));
+      return;
+    }
+    auto status = ScheduleAdvance();
+    if (!status.ok()) {
+      FinishOnce(flight_context_.FinishRequest(status));
+    }
+  }
+
+  void OnCancel() override { cancelled_.store(true, std::memory_order_relaxed); }
+
+  void OnDone() override {
+    if (flight_data_registered_) {
+      transport::grpc::UnregisterGrpcFlightDataMessage(&current_write_);
+      flight_data_registered_ = false;
+    }
+    ReleaseRef();
+  }
+
  private:
+  enum class Stage { kSchema, kPayloads, kFinish };
+
+  Status ScheduleAdvance() {
+    refs_.fetch_add(1, std::memory_order_relaxed);
+    auto maybe_future = executor_->Submit([this] {
+      if (cancelled_.load(std::memory_order_relaxed)) {
+        ReleaseRef();
+        return;
+      }
+
+      if (!stream_) {
+        FinishOnce(flight_context_.FinishRequest(Status::KeyError("No data in this flight")));
+        ReleaseRef();
+        return;
+      }
+
+      if (stage_ == Stage::kSchema) {
+        auto maybe_schema = stream_->GetSchemaPayload();
+        if (!maybe_schema.ok()) {
+          FinishOnce(flight_context_.FinishRequest(maybe_schema.status()));
+          ReleaseRef();
+          return;
+        }
+        auto status = StartPayloadWrite(std::move(maybe_schema).MoveValueUnsafe());
+        if (!status.ok()) {
+          FinishOnce(flight_context_.FinishRequest(status));
+          ReleaseRef();
+          return;
+        }
+        stage_ = Stage::kPayloads;
+        ReleaseRef();
+        return;
+      }
+
+      if (stage_ == Stage::kPayloads) {
+        auto maybe_payload = stream_->Next();
+        if (!maybe_payload.ok()) {
+          FinishOnce(flight_context_.FinishRequest(maybe_payload.status()));
+          ReleaseRef();
+          return;
+        }
+        auto payload = std::move(maybe_payload).MoveValueUnsafe();
+        if (payload.ipc_message.metadata == nullptr) {
+          stage_ = Stage::kFinish;
+        } else {
+          auto status = StartPayloadWrite(std::move(payload));
+          if (!status.ok()) {
+            FinishOnce(flight_context_.FinishRequest(status));
+          }
+          ReleaseRef();
+          return;
+        }
+      }
+
+      auto close_status = stream_->Close();
+      FinishOnce(flight_context_.FinishRequest(close_status));
+      ReleaseRef();
+    });
+    if (!maybe_future.ok()) {
+      ReleaseRef();
+      return maybe_future.status();
+    }
+    return Status::OK();
+  }
+
+  Status StartPayloadWrite(FlightPayload payload) {
+    ARROW_ASSIGN_OR_RAISE(current_write_, SerializeFlightPayload(payload));
+    if (cancelled_.load(std::memory_order_relaxed)) {
+      return Status::OK();
+    }
+    transport::grpc::RegisterGrpcFlightDataMessage(&current_write_);
+    flight_data_registered_ = true;
+    this->StartWrite(&current_write_);
+    return Status::OK();
+  }
+
+  void FinishOnce(::grpc::Status status) {
+    bool expected = false;
+    if (finished_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      this->Finish(std::move(status));
+    }
+  }
+
+  void ReleaseRef() {
+    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete this;
+    }
+  }
+
+  ::grpc::CallbackServerContext* context_;
+  arrow::internal::Executor* executor_;
   GrpcServerCallContext flight_context_;
   std::unique_ptr<FlightDataStream> stream_;
+  pb::FlightData current_write_;
+  Stage stage_ = Stage::kSchema;
+  bool flight_data_registered_ = false;
+  std::atomic<bool> cancelled_{false};
+  std::atomic<bool> finished_{false};
+  std::atomic<int> refs_{1};
 };
 
 ::grpc::ServerBidiReactor<pb::HandshakeRequest, pb::HandshakeResponse>*
