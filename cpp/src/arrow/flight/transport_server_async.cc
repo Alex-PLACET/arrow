@@ -27,22 +27,4 @@ Status AsyncServerTransport::DoGet(const ServerCallContext& context, const Ticke
   return WriteDataStream(std::move(data_stream), stream);
 }
 
-Status AsyncServerTransport::DoPut(const ServerCallContext& context,
-                                   ServerDataStream* stream) {
-  ARROW_ASSIGN_OR_RAISE(auto reader, MakeMessageReader(stream));
-  auto writer = MakeMetadataWriter(stream);
-  RETURN_NOT_OK(base_->DoPut(context, std::move(reader), std::move(writer)).status());
-  RETURN_NOT_OK(stream->WritesDone());
-  return Status::OK();
-}
-
-Status AsyncServerTransport::DoExchange(const ServerCallContext& context,
-                                        ServerDataStream* stream) {
-  ARROW_ASSIGN_OR_RAISE(auto reader, MakeMessageReader(stream));
-  auto writer = MakeMessageWriter(stream);
-  RETURN_NOT_OK(base_->DoExchange(context, std::move(reader), std::move(writer)).status());
-  RETURN_NOT_OK(stream->WritesDone());
-  return Status::OK();
-}
-
 }  // namespace arrow::flight::internal

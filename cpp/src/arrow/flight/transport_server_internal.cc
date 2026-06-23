@@ -52,10 +52,17 @@ class TransportIpcMessageReader : public ipc::MessageReader {
  private:
   std::shared_ptr<PeekableFlightDataReader> peekable_reader_;
   std::shared_ptr<MemoryManager> memory_manager_;
+  // A reference to TransportDataStream.app_metadata_. That class
+  // can't access the app metadata because when it Peek()s the stream,
+  // it may be looking at a dictionary batch, not the record
+  // batch. Updating it here ensures the reader is always updated with
+  // the last metadata message read.
   std::shared_ptr<Buffer>* app_metadata_;
   bool stream_finished_ = false;
 };
 
+/// \brief Adapt TransportDataStream to the FlightMessageReader
+///   interface for DoPut.
 class TransportMessageReader final : public FlightMessageReader {
  public:
   TransportMessageReader(ServerDataStream* stream,
@@ -64,6 +71,7 @@ class TransportMessageReader final : public FlightMessageReader {
         memory_manager_(std::move(memory_manager)) {}
 
   Status Init() {
+    // Peek the first message to get the descriptor.
     FlightData* data;
     peekable_reader_->Peek(&data);
     if (!data) {
@@ -73,6 +81,7 @@ class TransportMessageReader final : public FlightMessageReader {
       return Status::IOError("Descriptor missing on first message");
     }
     descriptor_ = *data->descriptor;
+    // If there's a schema (=DoPut), also Open().
     if (data->metadata) {
       return EnsureDataStarted();
     }
@@ -98,6 +107,7 @@ class TransportMessageReader final : public FlightMessageReader {
     }
 
     if (!data->metadata) {
+      // Metadata-only (data->metadata is the IPC header)
       out.app_metadata = data->app_metadata;
       out.data = nullptr;
       peekable_reader_->Next(&data);
@@ -106,6 +116,7 @@ class TransportMessageReader final : public FlightMessageReader {
 
     if (!batch_reader_) {
       RETURN_NOT_OK(EnsureDataStarted());
+      // re-peek here since EnsureDataStarted() advances the stream
       return Next();
     }
     RETURN_NOT_OK(batch_reader_->ReadNext(&out.data));
@@ -121,13 +132,16 @@ class TransportMessageReader final : public FlightMessageReader {
   }
 
  private:
+  /// Ensure we are set up to read data.
   Status EnsureDataStarted() {
     if (!batch_reader_) {
+      // peek() until we find the first data message; discard metadata
       if (!peekable_reader_->SkipToData()) {
         return Status::IOError("Client never sent a data message");
       }
-      auto message_reader = std::unique_ptr<ipc::MessageReader>(
-          new TransportIpcMessageReader(peekable_reader_, memory_manager_, &app_metadata_));
+      auto message_reader =
+          std::unique_ptr<ipc::MessageReader>(new TransportIpcMessageReader(
+              peekable_reader_, memory_manager_, &app_metadata_));
       ARROW_ASSIGN_OR_RAISE(
           batch_reader_, ipc::RecordBatchStreamReader::Open(std::move(message_reader)));
     }
@@ -141,6 +155,11 @@ class TransportMessageReader final : public FlightMessageReader {
   std::shared_ptr<Buffer> app_metadata_;
 };
 
+/// \brief An IpcPayloadWriter for ServerDataStream.
+///
+/// To support app_metadata and reuse the existing IPC infrastructure,
+/// this takes a pointer to a buffer to be combined with the IPC
+/// payload when writing a Flight payload.
 class TransportMessagePayloadWriter : public ipc::internal::IpcPayloadWriter {
  public:
   TransportMessagePayloadWriter(ServerDataStream* stream,
@@ -157,13 +176,17 @@ class TransportMessagePayloadWriter : public ipc::internal::IpcPayloadWriter {
     }
     ARROW_ASSIGN_OR_RAISE(auto success, stream_->WriteData(payload));
     if (!success) {
-      return MakeFlightError(FlightStatusCode::Internal,
-                             "Could not write record batch to stream (client disconnect?)");
+      return MakeFlightError(
+          FlightStatusCode::Internal,
+          "Could not write record batch to stream (client disconnect?)");
     }
     return Status::OK();
   }
 
-  Status Close() override { return Status::OK(); }
+  Status Close() override {
+    // Closing is handled one layer up in TransportMessageWriter::Close
+    return Status::OK();
+  }
 
  private:
   ServerDataStream* stream_;
@@ -244,6 +267,8 @@ class TransportMessageWriter final : public FlightMessageWriter {
   ::arrow::ipc::IpcWriteOptions ipc_options_;
 };
 
+/// \brief Adapt TransportDataStream to the FlightMetadataWriter
+///   interface for DoPut.
 class TransportMetadataWriter final : public FlightMetadataWriter {
  public:
   explicit TransportMetadataWriter(ServerDataStream* stream) : stream_(stream) {}
@@ -277,12 +302,15 @@ void ServerSignalState::HandleSignal(int signum) {
 
 void ServerSignalState::DoHandleSignal(int signum) {
   got_signal_ = signum;
+  // Send dummy payload over self-pipe
   self_pipe_->Send(/*payload=*/0);
 }
 
 void ServerSignalState::WaitForSignals(
     std::shared_ptr<::arrow::internal::SelfPipe> self_pipe) {
+  // Wait for a signal handler to wake up the pipe
   auto st = self_pipe->Wait().status();
+  // Status::Invalid means the pipe was shutdown without any wakeup
   if (!st.ok() && !st.IsInvalid()) {
     ARROW_LOG(FATAL) << "Failed to wait on self-pipe: " << st.ToString();
   }
@@ -304,10 +332,10 @@ int PortFromLocation(const Location& location) {
   return maybe_uri.ValueUnsafe().port();
 }
 
-arrow::Result<std::unique_ptr<FlightMessageReader>> ServerTransportBase::MakeMessageReader(
-    ServerDataStream* stream) const {
-  auto reader =
-      std::unique_ptr<TransportMessageReader>(new TransportMessageReader(stream, memory_manager_));
+arrow::Result<std::unique_ptr<FlightMessageReader>>
+ServerTransportBase::MakeMessageReader(ServerDataStream* stream) const {
+  auto reader = std::unique_ptr<TransportMessageReader>(
+      new TransportMessageReader(stream, memory_manager_));
   RETURN_NOT_OK(reader->Init());
   return std::unique_ptr<FlightMessageReader>(std::move(reader));
 }
@@ -328,18 +356,23 @@ Status ServerTransportBase::WriteDataStream(std::unique_ptr<FlightDataStream> da
     return Status::KeyError("No data in this flight");
   }
 
+  // Write the schema as the first message in the stream
   ARROW_ASSIGN_OR_RAISE(auto schema_payload, data_stream->GetSchemaPayload());
   ARROW_ASSIGN_OR_RAISE(auto success, stream->WriteData(schema_payload));
+  // Connection terminated
   if (!success) {
     return Status::OK();
   }
 
+   // Consume data stream and write out payloads
   while (true) {
     ARROW_ASSIGN_OR_RAISE(FlightPayload payload, data_stream->Next());
+     // End of stream
     if (payload.ipc_message.metadata == nullptr) {
       break;
     }
     ARROW_ASSIGN_OR_RAISE(success, stream->WriteData(payload));
+    // Connection terminated
     if (!success) {
       return Status::OK();
     }

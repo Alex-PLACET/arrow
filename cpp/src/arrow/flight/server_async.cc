@@ -17,14 +17,12 @@
 
 #include "arrow/flight/server_async.h"
 
-#include <memory>
-#include <utility>
-
-#include "arrow/flight/platform.h"
 #include "arrow/flight/transport/grpc/grpc_server.h"
-#include "arrow/flight/transport_server_internal.h"
 #include "arrow/flight/transport_server_async.h"
+#include "arrow/flight/transport_server_internal.h"
 #include "arrow/status.h"
+
+#include <memory>
 
 namespace arrow::flight {
 
@@ -91,9 +89,9 @@ Status AsyncFlightServerBase::Shutdown(
       deadline);
 }
 
-Status AsyncFlightServerBase::Wait() { return impl_->signal_state_.Wait([this] {
-  return impl_->transport_->Wait();
-}); }
+Status AsyncFlightServerBase::Wait() {
+  return impl_->signal_state_.Wait([this] { return impl_->transport_->Wait(); });
+}
 
 Future<> AsyncFlightServerBase::Handshake(const ServerCallContext&,
                                           std::unique_ptr<ServerAuthSender>,
@@ -109,14 +107,12 @@ Future<std::unique_ptr<FlightListing>> AsyncFlightServerBase::ListFlights(
 
 Future<std::unique_ptr<FlightInfo>> AsyncFlightServerBase::GetFlightInfo(
     const ServerCallContext&, const FlightDescriptor&) {
-  return Future<std::unique_ptr<FlightInfo>>::MakeFinished(
-      Status::NotImplemented("NYI"));
+  return Future<std::unique_ptr<FlightInfo>>::MakeFinished(Status::NotImplemented("NYI"));
 }
 
 Future<std::unique_ptr<PollInfo>> AsyncFlightServerBase::PollFlightInfo(
     const ServerCallContext&, const FlightDescriptor&) {
-  return Future<std::unique_ptr<PollInfo>>::MakeFinished(
-      Status::NotImplemented("NYI"));
+  return Future<std::unique_ptr<PollInfo>>::MakeFinished(Status::NotImplemented("NYI"));
 }
 
 Future<std::unique_ptr<SchemaResult>> AsyncFlightServerBase::GetSchema(
@@ -137,10 +133,24 @@ Future<> AsyncFlightServerBase::DoPut(const ServerCallContext&,
   return Future<>::MakeFinished(Status::NotImplemented("NYI"));
 }
 
+Future<> AsyncFlightServerBase::DoPutAsync(const ServerCallContext&,
+                                           std::unique_ptr<AsyncFlightMessageReader>,
+                                           std::unique_ptr<AsyncFlightMetadataWriter>) {
+  return Future<>::MakeFinished(
+      Status::NotImplemented("DoPutAsync must be overridden explicitly"));
+}
+
 Future<> AsyncFlightServerBase::DoExchange(const ServerCallContext&,
                                            std::unique_ptr<FlightMessageReader>,
                                            std::unique_ptr<FlightMessageWriter>) {
   return Future<>::MakeFinished(Status::NotImplemented("NYI"));
+}
+
+Future<> AsyncFlightServerBase::DoExchangeAsync(
+    const ServerCallContext&, std::unique_ptr<AsyncFlightMessageReader>,
+    std::unique_ptr<AsyncFlightMessageWriter>) {
+  return Future<>::MakeFinished(
+      Status::NotImplemented("DoExchangeAsync must be overridden explicitly"));
 }
 
 Future<std::unique_ptr<ResultStream>> AsyncFlightServerBase::DoAction(

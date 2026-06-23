@@ -30,6 +30,8 @@
 #include <grpcpp/grpcpp.h>
 
 #include "arrow/buffer.h"
+#include "arrow/array.h"
+#include "arrow/array/data.h"
 #include "arrow/flight/protocol_internal.h"
 #include "arrow/flight/serialization_internal.h"
 #include "arrow/flight/server_middleware.h"
@@ -39,6 +41,11 @@
 #include "arrow/flight/transport/grpc/serialization_internal.h"
 #include "arrow/flight/transport/grpc/util_internal.h"
 #include "arrow/flight/types.h"
+#include "arrow/io/memory.h"
+#include "arrow/compare.h"
+#include "arrow/ipc/dictionary.h"
+#include "arrow/ipc/reader.h"
+#include "arrow/ipc/writer.h"
 #include "arrow/result.h"
 #include "arrow/status.h"
 #include "arrow/util/thread_pool.h"
@@ -92,9 +99,11 @@ using CallbackServiceHelper =
     transport::grpc::GrpcServerCallContextHelper<::grpc::CallbackServerContext>;
 
 arrow::internal::ThreadPool* GetAsyncGrpcWorkerPool() {
+  constexpr int kMaxAsyncGrpcWorkerThreads = 4;
   static std::shared_ptr<arrow::internal::ThreadPool> pool =
       arrow::internal::ThreadPool::MakeEternal(
-          arrow::internal::ThreadPool::DefaultCapacity())
+          std::min(kMaxAsyncGrpcWorkerThreads,
+                   arrow::internal::ThreadPool::DefaultCapacity()))
           .ValueOrDie();
   return pool.get();
 }
@@ -207,8 +216,12 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   }
 
   Status StartWorker(std::function<void()> fn) {
+    // For bidi RPCs the first read must be armed explicitly. After that, reads
+    // are re-armed only from OnReadDone() so the callback path owns the
+    // receive-side state machine.
     {
       std::unique_lock<std::mutex> lock(mutex_);
+      read_started_ = true;
       read_in_flight_ = true;
     }
     this->StartRead(&read_buffer_);
@@ -225,17 +238,58 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   }
 
   void OnReadDone(bool ok) override {
-    std::unique_lock<std::mutex> lock(mutex_);
-    read_in_flight_ = false;
-    if (ok) {
-      reads_.push_back(read_buffer_);
-    } else {
-      reads_done_ = true;
+    std::optional<Req> completed_read;
+    Future<std::optional<Req>> pending_future;
+    bool resolve_pending = false;
+    bool start_next_read = false;
+
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      read_in_flight_ = false;
+      if (ok) {
+        completed_read.emplace(read_buffer_);
+        if (!cancelled_) {
+          read_in_flight_ = true;
+          start_next_read = true;
+        }
+        if (pending_read_active_) {
+          pending_future = pending_read_;
+          pending_read_active_ = false;
+          pending_read_ = Future<std::optional<Req>>();
+          resolve_pending = true;
+        } else {
+          reads_.push_back(std::move(*completed_read));
+        }
+      } else {
+        reads_done_ = true;
+        if (pending_read_active_) {
+          pending_future = pending_read_;
+          pending_read_active_ = false;
+          pending_read_ = Future<std::optional<Req>>();
+          resolve_pending = true;
+        }
+      }
+    }
+
+    if (start_next_read) {
+      // Post the next read before resolving the waiting Future so EOF can race
+      // with user callbacks without stalling the receive loop.
+      this->StartRead(&read_buffer_);
+    }
+    if (resolve_pending) {
+      if (ok) {
+        pending_future.MarkFinished(std::move(completed_read));
+      } else {
+        pending_future.MarkFinished(std::optional<Req>{});
+      }
     }
     cv_.notify_all();
   }
 
   void OnWriteDone(bool ok) override {
+    Future<bool> pending_future;
+    bool resolve_pending = false;
+    bool finish_now = false;
     std::unique_lock<std::mutex> lock(mutex_);
     if constexpr (std::is_same_v<Resp, pb::FlightData>) {
       if (flight_data_registered_) {
@@ -245,7 +299,20 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     }
     write_in_flight_ = false;
     write_ok_ = ok;
+    if (pending_write_active_) {
+      pending_future = pending_write_;
+      pending_write_active_ = false;
+      pending_write_ = Future<bool>();
+      resolve_pending = true;
+    }
     if (finish_requested_) {
+      finish_now = true;
+    }
+    lock.unlock();
+    if (resolve_pending) {
+      pending_future.MarkFinished(!cancelled_ && write_ok_);
+    }
+    if (finish_now) {
       this->Finish(finish_status_);
     }
     cv_.notify_all();
@@ -254,6 +321,15 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   void OnCancel() override {
     std::unique_lock<std::mutex> lock(mutex_);
     cancelled_ = true;
+    if (pending_read_active_) {
+      auto future = pending_read_;
+      pending_read_active_ = false;
+      pending_read_ = Future<std::optional<Req>>();
+      lock.unlock();
+      future.MarkFinished(std::optional<Req>{});
+      cv_.notify_all();
+      return;
+    }
     cv_.notify_all();
   }
 
@@ -275,6 +351,72 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
 
   bool ReadOne(Req* out) { return PopRead(out); }
   bool WriteOnePublic(Resp message) { return WriteOne(std::move(message)); }
+  Future<std::optional<Req>> ReadOneAsync() {
+    bool start_initial_read = false;
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!reads_.empty()) {
+      Req out = std::move(reads_.front());
+      reads_.pop_front();
+      return Future<std::optional<Req>>::MakeFinished(std::optional<Req>(std::move(out)));
+    }
+    if (cancelled_ || reads_done_) {
+      return Future<std::optional<Req>>::MakeFinished(std::optional<Req>{});
+    }
+    if (pending_read_active_) {
+      return Future<std::optional<Req>>::MakeFinished(
+          Status::Invalid("Concurrent async reads are not supported"));
+    }
+    pending_read_ = Future<std::optional<Req>>::Make();
+    pending_read_active_ = true;
+    if (!read_started_ && !read_in_flight_) {
+      // DoPut/DoExchange do not call StartWorker(); their first consumer read
+      // is what arms the callback read loop.
+      read_started_ = true;
+      read_in_flight_ = true;
+      start_initial_read = true;
+    }
+    auto future = pending_read_;
+    lock.unlock();
+    if (start_initial_read) {
+      this->StartRead(&read_buffer_);
+    }
+    return future;
+  }
+  Future<bool> WriteOneAsync(Resp message) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (cancelled_) {
+      return Future<bool>::MakeFinished(false);
+    }
+    if (pending_write_active_ || write_in_flight_) {
+      return Future<bool>::MakeFinished(
+          Status::Invalid("Concurrent async writes are not supported"));
+    }
+    pending_write_ = Future<bool>::Make();
+    pending_write_active_ = true;
+    current_write_ = std::move(message);
+    write_in_flight_ = true;
+    this->StartWrite(&current_write_);
+    return pending_write_;
+  }
+  Future<bool> WritePayloadAsync(FlightPayload payload) {
+    static_assert(std::is_same_v<Resp, pb::FlightData>);
+    ARROW_ASSIGN_OR_RAISE(current_write_, SerializeFlightPayload(payload));
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (cancelled_) {
+      return Future<bool>::MakeFinished(false);
+    }
+    if (pending_write_active_ || write_in_flight_) {
+      return Future<bool>::MakeFinished(
+          Status::Invalid("Concurrent async writes are not supported"));
+    }
+    pending_write_ = Future<bool>::Make();
+    pending_write_active_ = true;
+    write_in_flight_ = true;
+    transport::grpc::RegisterGrpcFlightDataMessage(&current_write_);
+    flight_data_registered_ = true;
+    this->StartWrite(&current_write_);
+    return pending_write_;
+  }
   arrow::Result<bool> WritePayloadPublic(FlightPayload payload) {
     static_assert(std::is_same_v<Resp, pb::FlightData>);
     ARROW_ASSIGN_OR_RAISE(current_write_, SerializeFlightPayload(payload));
@@ -289,21 +431,16 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     return !cancelled_ && write_ok_;
   }
 
+  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
+  void ReleaseHold() { ReleaseRef(); }
+
  protected:
   bool PopRead(Req* out) {
-    bool start_next_read = false;
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [&] { return cancelled_ || reads_done_ || !reads_.empty(); });
     if (!reads_.empty()) {
       *out = std::move(reads_.front());
       reads_.pop_front();
-      if (!reads_done_ && !cancelled_ && !read_in_flight_) {
-        read_in_flight_ = true;
-        start_next_read = true;
-      }
-      if (start_next_read) {
-        this->StartRead(&read_buffer_);
-      }
       return true;
     }
     return false;
@@ -343,9 +480,14 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   std::mutex mutex_;
   std::condition_variable cv_;
   bool reads_done_ = false;
+  Future<std::optional<Req>> pending_read_;
+  bool pending_read_active_ = false;
   bool read_buffer_registered_ = false;
+  bool read_started_ = false;
   bool read_in_flight_ = false;
   bool cancelled_ = false;
+  Future<bool> pending_write_;
+  bool pending_write_active_ = false;
   bool write_in_flight_ = false;
   bool write_ok_ = true;
   bool flight_data_registered_ = false;
@@ -400,62 +542,491 @@ class HandshakeAuthWriter : public ServerAuthSender {
   BidiReactorBase<pb::HandshakeRequest, pb::HandshakeResponse>* reactor_;
 };
 
-template <typename Req, typename Resp>
-class BlockingDataStream : public internal::ServerDataStream {
- public:
-  explicit BlockingDataStream(BidiReactorBase<Req, Resp>* reactor) : reactor_(reactor) {}
-
- protected:
-  BidiReactorBase<Req, Resp>* reactor_;
-};
-
-class PutDataStream : public BlockingDataStream<pb::FlightData, pb::PutResult> {
- public:
-  using BlockingDataStream::BlockingDataStream;
-
-  bool ReadData(internal::FlightData* data) override {
-    pb::FlightData message;
-    if (!reactor_->ReadOne(&message)) {
-      return false;
-    }
-    auto maybe_data = DeserializeGrpcFlightData(message);
-    if (!maybe_data.ok()) {
-      return false;
-    }
-    *data = std::move(maybe_data).ValueUnsafe();
+bool HasNestedDictionary(const ArrayData& data) {
+  if (data.type->id() == Type::DICTIONARY) {
     return true;
   }
+  for (const auto& child : data.child_data) {
+    if (HasNestedDictionary(*child)) {
+      return true;
+    }
+  }
+  return false;
+}
 
-  Status WritePutMetadata(const Buffer& metadata) override {
-    pb::PutResult result;
-    result.set_app_metadata(metadata.data(), metadata.size());
-    if (!reactor_->WriteOnePublic(std::move(result))) {
-      return Status::IOError("Unknown error writing metadata.");
+arrow::Result<std::shared_ptr<Buffer>> SerializeIpcMessage(
+    internal::FlightData& data, const ipc::IpcWriteOptions& options) {
+  ARROW_ASSIGN_OR_RAISE(auto message, data.OpenMessage());
+  ARROW_ASSIGN_OR_RAISE(auto sink, io::BufferOutputStream::Create());
+  int64_t unused_size = 0;
+  RETURN_NOT_OK(message->SerializeTo(sink.get(), options, &unused_size));
+  return sink->Finish();
+}
+
+class NativeAsyncFlightMessageReader final : public AsyncFlightMessageReader {
+ public:
+  using ReadFn = std::function<Future<std::optional<pb::FlightData>>()>;
+  enum class ActiveOperation { kNone, kSchema, kNext };
+
+  NativeAsyncFlightMessageReader(FlightDescriptor descriptor, internal::FlightData first_message,
+                                 ReadFn read_fn,
+                                 std::shared_ptr<MemoryManager> memory_manager)
+      : descriptor_(std::move(descriptor)),
+        pending_message_(std::move(first_message)),
+        read_fn_(std::move(read_fn)),
+        memory_manager_(std::move(memory_manager)),
+        listener_(std::make_shared<ipc::CollectListener>()),
+        decoder_(listener_) {}
+
+  const FlightDescriptor& descriptor() const override { return descriptor_; }
+
+  Future<std::shared_ptr<Schema>> GetSchema() override {
+    if (listener_->schema()) {
+      return Future<std::shared_ptr<Schema>>::MakeFinished(listener_->schema());
+    }
+    int64_t token = 0;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (operation_in_flight_) {
+        return Future<std::shared_ptr<Schema>>::MakeFinished(
+            Status::Invalid("Concurrent async reads are not supported"));
+      }
+      operation_in_flight_ = true;
+      active_operation_ = ActiveOperation::kSchema;
+      token = ++active_token_;
+    }
+    auto out = Future<std::shared_ptr<Schema>>::Make();
+    PumpSchema(out, token);
+    return out;
+  }
+
+  Future<FlightStreamChunk> Next() override {
+    int64_t token = 0;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (!decoded_chunks_.empty()) {
+        auto chunk = std::move(decoded_chunks_.front());
+        decoded_chunks_.pop_front();
+        return Future<FlightStreamChunk>::MakeFinished(std::move(chunk));
+      }
+      if (finished_) {
+        return Future<FlightStreamChunk>::MakeFinished(FlightStreamChunk{});
+      }
+      if (operation_in_flight_) {
+        return Future<FlightStreamChunk>::MakeFinished(
+            Status::Invalid("Concurrent async reads are not supported"));
+      }
+      operation_in_flight_ = true;
+      active_operation_ = ActiveOperation::kNext;
+      token = ++active_token_;
+    }
+    auto out = Future<FlightStreamChunk>::Make();
+    PumpNext(out, token);
+    return out;
+  }
+
+  ipc::ReadStats stats() const override { return decoder_.stats(); }
+
+ private:
+  Future<std::shared_ptr<internal::FlightData>> ReadDataAsync() {
+    std::shared_ptr<internal::FlightData> pending;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (pending_message_) {
+        pending = std::make_shared<internal::FlightData>(std::move(*pending_message_));
+        pending_message_.reset();
+      }
+    }
+    if (pending) {
+      return Future<std::shared_ptr<internal::FlightData>>::MakeFinished(std::move(pending));
+    }
+    return read_fn_().Then(
+        [memory_manager = memory_manager_](std::optional<pb::FlightData> message)
+            -> ::arrow::Result<std::shared_ptr<internal::FlightData>> {
+      if (!message) {
+        return std::shared_ptr<internal::FlightData>{};
+      }
+      ARROW_ASSIGN_OR_RAISE(auto data, DeserializeGrpcFlightData(*message));
+      if (data.body) {
+        ARROW_ASSIGN_OR_RAISE(data.body, Buffer::ViewOrCopy(data.body, memory_manager));
+      }
+      return std::make_shared<internal::FlightData>(std::move(data));
+    });
+  }
+
+  Status ConsumeDataMessage(internal::FlightData& data) {
+    ARROW_ASSIGN_OR_RAISE(auto buffer,
+                          SerializeIpcMessage(data, ipc::IpcWriteOptions::Defaults()));
+    const auto previous_batches = listener_->num_record_batches();
+    RETURN_NOT_OK(decoder_.Consume(std::move(buffer)));
+    const auto new_batches = listener_->num_record_batches();
+    if (new_batches > previous_batches) {
+      auto batch = listener_->PopRecordBatch();
+      FlightStreamChunk chunk;
+      chunk.data = std::move(batch);
+      chunk.app_metadata = std::move(data.app_metadata);
+      decoded_chunks_.push_back(std::move(chunk));
     }
     return Status::OK();
   }
+
+  bool IsCurrentOperation(int64_t token, ActiveOperation operation) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return operation_in_flight_ && active_token_ == token && active_operation_ == operation;
+  }
+
+  void FinishSchema(Future<std::shared_ptr<Schema>> out,
+                    ::arrow::Result<std::shared_ptr<Schema>> result, int64_t token) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (active_token_ != token || active_operation_ != ActiveOperation::kSchema) {
+        return;
+      }
+      operation_in_flight_ = false;
+      active_operation_ = ActiveOperation::kNone;
+    }
+    out.MarkFinished(std::move(result));
+  }
+
+  void PumpSchema(Future<std::shared_ptr<Schema>> out, int64_t token) {
+    if (listener_->schema()) {
+      FinishSchema(out, listener_->schema(), token);
+      return;
+    }
+    ReadDataAsync().AddCallback(
+        [this, out, token](
+            const ::arrow::Result<std::shared_ptr<internal::FlightData>>& result) mutable {
+      if (!IsCurrentOperation(token, ActiveOperation::kSchema)) {
+        return;
+      }
+      if (!result.ok()) {
+        FinishSchema(out, result.status(), token);
+        return;
+      }
+      auto maybe_data = result.ValueUnsafe();
+      if (!maybe_data) {
+        FinishSchema(out, Status::IOError("Client never sent a data message"), token);
+        return;
+      }
+      if (!maybe_data->metadata) {
+        // Descriptor-only or metadata-only FlightData frames do not advance the
+        // IPC decoder toward a schema, so continue reading until an IPC message
+        // arrives or the stream ends.
+        PumpSchema(out, token);
+        return;
+      }
+      auto st = ConsumeDataMessage(*maybe_data);
+      if (!st.ok()) {
+        FinishSchema(out, st, token);
+        return;
+      }
+      PumpSchema(out, token);
+    });
+  }
+
+  void FinishNext(Future<FlightStreamChunk> out,
+                  ::arrow::Result<FlightStreamChunk> result, int64_t token) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (active_token_ != token || active_operation_ != ActiveOperation::kNext) {
+        return;
+      }
+      operation_in_flight_ = false;
+      active_operation_ = ActiveOperation::kNone;
+    }
+    out.MarkFinished(std::move(result));
+  }
+
+  void PumpNext(Future<FlightStreamChunk> out, int64_t token) {
+    std::optional<FlightStreamChunk> ready_chunk;
+    bool stream_finished = false;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (!decoded_chunks_.empty()) {
+        ready_chunk = std::move(decoded_chunks_.front());
+        decoded_chunks_.pop_front();
+      } else if (finished_) {
+        stream_finished = true;
+      }
+    }
+    if (ready_chunk.has_value()) {
+      FinishNext(out, std::move(*ready_chunk), token);
+      return;
+    }
+    if (stream_finished) {
+      FinishNext(out, FlightStreamChunk{}, token);
+      return;
+    }
+    ReadDataAsync().AddCallback(
+        [this, out, token](
+            const ::arrow::Result<std::shared_ptr<internal::FlightData>>& result) mutable {
+      if (!IsCurrentOperation(token, ActiveOperation::kNext)) {
+        return;
+      }
+      if (!result.ok()) {
+        FinishNext(out, result.status(), token);
+        return;
+      }
+      auto maybe_data = result.ValueUnsafe();
+      if (!maybe_data) {
+        {
+          std::lock_guard<std::mutex> guard(mutex_);
+          finished_ = true;
+        }
+        FinishNext(out, FlightStreamChunk{}, token);
+        return;
+      }
+      if (!maybe_data->metadata) {
+        if (!maybe_data->app_metadata) {
+          // The initial descriptor frame is visible here after
+          // MakeAsyncMessageReader() peels it off the stream. It is not a user
+          // chunk, so continue to the next FlightData message.
+          PumpNext(out, token);
+          return;
+        }
+        FlightStreamChunk chunk;
+        chunk.app_metadata = std::move(maybe_data->app_metadata);
+        FinishNext(out, std::move(chunk), token);
+        return;
+      }
+      auto st = ConsumeDataMessage(*maybe_data);
+      if (!st.ok()) {
+        FinishNext(out, st, token);
+        return;
+      }
+      PumpNext(out, token);
+    });
+  }
+
+  FlightDescriptor descriptor_;
+  std::optional<internal::FlightData> pending_message_;
+  ReadFn read_fn_;
+  std::shared_ptr<MemoryManager> memory_manager_;
+  std::shared_ptr<ipc::CollectListener> listener_;
+  ipc::StreamDecoder decoder_;
+  mutable std::mutex mutex_;
+  std::deque<FlightStreamChunk> decoded_chunks_;
+  bool finished_ = false;
+  bool operation_in_flight_ = false;
+  ActiveOperation active_operation_ = ActiveOperation::kNone;
+  int64_t active_token_ = 0;
 };
 
-class ExchangeDataStream : public BlockingDataStream<pb::FlightData, pb::FlightData> {
+class NativeAsyncFlightMetadataWriter final : public AsyncFlightMetadataWriter {
  public:
-  using BlockingDataStream::BlockingDataStream;
+  using WriteFn = std::function<Future<bool>(pb::PutResult)>;
 
-  bool ReadData(internal::FlightData* data) override {
-    pb::FlightData message;
-    if (!reactor_->ReadOne(&message)) {
-      return false;
-    }
-    auto maybe_data = DeserializeGrpcFlightData(message);
-    if (!maybe_data.ok()) {
-      return false;
-    }
-    *data = std::move(maybe_data).ValueUnsafe();
-    return true;
+  explicit NativeAsyncFlightMetadataWriter(WriteFn write_fn) : write_fn_(std::move(write_fn)) {}
+
+  Future<> WriteMetadata(const Buffer& app_metadata) override {
+    pb::PutResult result;
+    result.set_app_metadata(app_metadata.data(), app_metadata.size());
+    return write_fn_(std::move(result))
+        .Then([](bool ok) -> Status {
+          if (!ok) {
+            return Status::IOError("Unknown error writing metadata.");
+          }
+          return Status::OK();
+        });
   }
 
-  arrow::Result<bool> WriteData(const FlightPayload& payload) override {
-    return reactor_->WritePayloadPublic(payload);
+ private:
+  WriteFn write_fn_;
+};
+
+class NativeAsyncFlightMessageWriter final : public AsyncFlightMessageWriter {
+ public:
+  using WriteFn = std::function<Future<bool>(FlightPayload)>;
+
+  explicit NativeAsyncFlightMessageWriter(WriteFn write_fn) : write_fn_(std::move(write_fn)) {}
+
+  Future<> Begin(const std::shared_ptr<Schema>& schema,
+                 const ipc::IpcWriteOptions& options) override {
+    std::vector<FlightPayload> payloads;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (begun_) {
+        return Future<>::MakeFinished(Status::Invalid(
+            "This writer has already been started."));
+      }
+      options_ = options;
+      schema_ = schema;
+      mapper_ = std::make_unique<ipc::DictionaryFieldMapper>(*schema);
+      FlightPayload payload;
+      RETURN_NOT_OK(ipc::GetSchemaPayload(*schema_, options_, *mapper_, &payload.ipc_message));
+      begun_ = true;
+      payloads.push_back(std::move(payload));
+    }
+    return WritePayloads(std::move(payloads));
   }
+
+  Future<> WriteRecordBatch(const RecordBatch& batch) override {
+    return WriteWithMetadata(batch, nullptr);
+  }
+
+  Future<> WriteMetadata(std::shared_ptr<Buffer> app_metadata) override {
+    FlightPayload payload;
+    payload.app_metadata = std::move(app_metadata);
+    return WritePayloads({std::move(payload)});
+  }
+
+  Future<> WriteWithMetadata(const RecordBatch& batch,
+                             std::shared_ptr<Buffer> app_metadata) override {
+    std::vector<FlightPayload> payloads;
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      RETURN_NOT_OK(CheckStartedLocked());
+      RETURN_NOT_OK(BuildDictionaryPayloadsLocked(batch, &payloads));
+      FlightPayload batch_payload;
+      RETURN_NOT_OK(ipc::GetRecordBatchPayload(batch, options_, &batch_payload.ipc_message));
+      batch_payload.app_metadata = std::move(app_metadata);
+      payloads.push_back(std::move(batch_payload));
+      ++stats_.num_record_batches;
+      stats_.total_raw_body_size += payloads.back().ipc_message.raw_body_length;
+      stats_.total_serialized_body_size += payloads.back().ipc_message.body_length;
+    }
+    return WritePayloads(std::move(payloads));
+  }
+
+  Future<> Close() override {
+    std::lock_guard<std::mutex> guard(mutex_);
+    closed_ = true;
+    return Future<>::MakeFinished();
+  }
+
+  ipc::WriteStats stats() const override {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return stats_;
+  }
+
+ private:
+  Status CheckStartedLocked() const {
+    if (!begun_) {
+      return Status::Invalid("This writer is not started. Call Begin() with a schema");
+    }
+    if (closed_) {
+      return Status::Invalid("This writer is already closed");
+    }
+    return Status::OK();
+  }
+
+  Status BuildDictionaryPayloadsLocked(const RecordBatch& batch,
+                                       std::vector<FlightPayload>* payloads) {
+    ARROW_ASSIGN_OR_RAISE(const auto dictionaries, ipc::CollectDictionaries(batch, *mapper_));
+    const auto equal_options = EqualOptions().nans_equal(true);
+
+    for (const auto& pair : dictionaries) {
+      const int64_t dictionary_id = pair.first;
+      const auto& dictionary = pair.second;
+      auto* last_dictionary = &last_dictionaries_[dictionary_id];
+      const bool dictionary_exists = (*last_dictionary != nullptr);
+      int64_t delta_start = 0;
+      if (dictionary_exists) {
+        if ((*last_dictionary)->data() == dictionary->data()) {
+          continue;
+        }
+        const int64_t last_length = (*last_dictionary)->length();
+        const int64_t new_length = dictionary->length();
+        if (new_length == last_length &&
+            ((*last_dictionary)->Equals(dictionary, equal_options))) {
+          continue;
+        }
+        if (new_length > last_length && options_.emit_dictionary_deltas &&
+            !HasNestedDictionary(*dictionary->data()) &&
+            ((*last_dictionary)
+                 ->RangeEquals(dictionary, 0, last_length, 0, equal_options))) {
+          delta_start = last_length;
+        }
+      }
+
+      FlightPayload payload;
+      if (delta_start) {
+        RETURN_NOT_OK(ipc::GetDictionaryPayload(dictionary_id, /*is_delta=*/true,
+                                                dictionary->Slice(delta_start), options_,
+                                                &payload.ipc_message));
+      } else {
+        RETURN_NOT_OK(ipc::GetDictionaryPayload(dictionary_id, dictionary, options_,
+                                                &payload.ipc_message));
+      }
+      payloads->push_back(std::move(payload));
+      ++stats_.num_dictionary_batches;
+      if (dictionary_exists) {
+        if (delta_start) {
+          ++stats_.num_dictionary_deltas;
+        } else {
+          ++stats_.num_replaced_dictionaries;
+        }
+      }
+      *last_dictionary = dictionary;
+    }
+    return Status::OK();
+  }
+
+  Future<> WritePayloads(std::vector<FlightPayload> payloads) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (write_in_flight_) {
+        return Future<>::MakeFinished(
+            Status::Invalid("Concurrent async writes are not supported"));
+      }
+      write_in_flight_ = true;
+      stats_.num_messages += static_cast<int64_t>(payloads.size());
+    }
+    auto out = Future<>::Make();
+    auto state = std::make_shared<WriteState>();
+    state->payloads = std::move(payloads);
+    WritePayloadAt(state, 0, out);
+    return out;
+  }
+
+  struct WriteState {
+    std::vector<FlightPayload> payloads;
+  };
+
+  void WritePayloadAt(const std::shared_ptr<WriteState>& state, size_t index, Future<> out) {
+    if (index >= state->payloads.size()) {
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        write_in_flight_ = false;
+      }
+      out.MarkFinished();
+      return;
+    }
+    write_fn_(std::move(state->payloads[index]))
+        .AddCallback(
+            [this, state, index, out](const ::arrow::Result<bool>& result) mutable {
+          if (!result.ok()) {
+            {
+              std::lock_guard<std::mutex> guard(mutex_);
+              write_in_flight_ = false;
+            }
+            out.MarkFinished(result.status());
+            return;
+          }
+          if (!*result) {
+            {
+              std::lock_guard<std::mutex> guard(mutex_);
+              write_in_flight_ = false;
+            }
+            out.MarkFinished(MakeFlightError(
+                FlightStatusCode::Internal,
+                "Could not write record batch to stream (client disconnect?)"));
+            return;
+          }
+          WritePayloadAt(state, index + 1, out);
+        });
+  }
+
+  WriteFn write_fn_;
+  mutable std::mutex mutex_;
+  std::shared_ptr<Schema> schema_;
+  std::unique_ptr<ipc::DictionaryFieldMapper> mapper_;
+  std::unordered_map<int64_t, std::shared_ptr<Array>> last_dictionaries_;
+  ipc::IpcWriteOptions options_ = ipc::IpcWriteOptions::Defaults();
+  ipc::WriteStats stats_;
+  bool begun_ = false;
+  bool closed_ = false;
+  bool write_in_flight_ = false;
 };
 
 class AsyncGrpcServerTransport;
@@ -505,6 +1076,12 @@ class AsyncGrpcServerTransport : public internal::AsyncServerTransport {
     grpc_service_ = std::make_unique<CallbackFlightService>(this, *helper_);
 
     ::grpc::ServerBuilder builder;
+    // The callback API does not use the synchronous server completion queues.
+    // Leaving the sync server machinery at gRPC defaults adds idle polling
+    // threads that dominate the thread-scaling tests.
+    builder.SetSyncServerOption(::grpc::ServerBuilder::SyncServerOption::NUM_CQS, 0);
+    builder.SetSyncServerOption(::grpc::ServerBuilder::SyncServerOption::MIN_POLLERS, 1);
+    builder.SetSyncServerOption(::grpc::ServerBuilder::SyncServerOption::MAX_POLLERS, 1);
     int port = 0;
     RETURN_NOT_OK(
         transport::grpc::AddServerListeningPort(options, uri, &builder, &location_, &port));
@@ -534,6 +1111,39 @@ class AsyncGrpcServerTransport : public internal::AsyncServerTransport {
   Location location() const override { return location_; }
 
   const CallbackServiceHelper& helper() const { return *helper_; }
+
+  template <typename Resp>
+  Future<std::unique_ptr<AsyncFlightMessageReader>> MakeAsyncMessageReader(
+      BidiReactorBase<pb::FlightData, Resp>* reactor) {
+    return reactor->ReadOneAsync().Then(
+        [this, reactor](std::optional<pb::FlightData> message)
+            -> ::arrow::Result<std::unique_ptr<AsyncFlightMessageReader>> {
+          if (!message) {
+            return Status::IOError("Stream finished before first message sent");
+          }
+          ARROW_ASSIGN_OR_RAISE(auto data, DeserializeGrpcFlightData(*message));
+          if (!data.descriptor) {
+            return Status::IOError("Descriptor missing on first message");
+          }
+          auto descriptor = *data.descriptor;
+          return std::unique_ptr<AsyncFlightMessageReader>(
+              new NativeAsyncFlightMessageReader(
+                  std::move(descriptor), std::move(data),
+                  [reactor]() { return reactor->ReadOneAsync(); }, memory_manager_));
+        });
+  }
+
+  std::unique_ptr<AsyncFlightMetadataWriter> MakeAsyncMetadataWriter(
+      BidiReactorBase<pb::FlightData, pb::PutResult>* reactor) {
+    return std::unique_ptr<AsyncFlightMetadataWriter>(new NativeAsyncFlightMetadataWriter(
+        [reactor](pb::PutResult result) { return reactor->WriteOneAsync(std::move(result)); }));
+  }
+
+  std::unique_ptr<AsyncFlightMessageWriter> MakeAsyncMessageWriter(
+      BidiReactorBase<pb::FlightData, pb::FlightData>* reactor) {
+    return std::unique_ptr<AsyncFlightMessageWriter>(new NativeAsyncFlightMessageWriter(
+        [reactor](FlightPayload payload) { return reactor->WritePayloadAsync(std::move(payload)); }));
+  }
 
  private:
   std::unique_ptr<CallbackServiceHelper> helper_;
@@ -1006,14 +1616,28 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
         return;
       }
       helper_.AddMiddlewareHeaders(this->context_, &flight_context_);
-      auto status = this->StartWorker([this] {
-        PutDataStream stream(this);
-        auto status = impl_->DoPut(flight_context_, &stream);
-        this->FinishFromWorker(flight_context_.FinishRequest(status));
-      });
-      if (!status.ok()) {
-        this->Finish(flight_context_.FinishRequest(status));
-      }
+      this->Hold();
+      impl_->MakeAsyncMessageReader(this).AddCallback(
+          [this](const ::arrow::Result<std::unique_ptr<AsyncFlightMessageReader>>& maybe_reader)
+              mutable {
+            if (!maybe_reader.ok()) {
+              this->Finish(flight_context_.FinishRequest(maybe_reader.status()));
+              this->ReleaseHold();
+              return;
+            }
+            auto writer = impl_->MakeAsyncMetadataWriter(this);
+            auto reader = std::move(
+                const_cast<::arrow::Result<std::unique_ptr<AsyncFlightMessageReader>>&>(
+                    maybe_reader))
+                              .MoveValueUnsafe();
+            impl_->base()
+                ->DoPutAsync(flight_context_, std::move(reader), std::move(writer))
+                .AddCallback(
+                    [this](const ::arrow::Result<::arrow::internal::Empty>& result) mutable {
+                      this->Finish(flight_context_.FinishRequest(result.status()));
+                      this->ReleaseHold();
+                    });
+          });
     }
 
    private:
@@ -1041,14 +1665,28 @@ CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
         return;
       }
       helper_.AddMiddlewareHeaders(this->context_, &flight_context_);
-      auto status = this->StartWorker([this] {
-        ExchangeDataStream stream(this);
-        auto status = impl_->DoExchange(flight_context_, &stream);
-        this->FinishFromWorker(flight_context_.FinishRequest(status));
-      });
-      if (!status.ok()) {
-        this->Finish(flight_context_.FinishRequest(status));
-      }
+      this->Hold();
+      impl_->MakeAsyncMessageReader(this).AddCallback(
+          [this](const ::arrow::Result<std::unique_ptr<AsyncFlightMessageReader>>& maybe_reader)
+              mutable {
+            if (!maybe_reader.ok()) {
+              this->Finish(flight_context_.FinishRequest(maybe_reader.status()));
+              this->ReleaseHold();
+              return;
+            }
+            auto writer = impl_->MakeAsyncMessageWriter(this);
+            auto reader = std::move(
+                const_cast<::arrow::Result<std::unique_ptr<AsyncFlightMessageReader>>&>(
+                    maybe_reader))
+                              .MoveValueUnsafe();
+            impl_->base()
+                ->DoExchangeAsync(flight_context_, std::move(reader), std::move(writer))
+                .AddCallback(
+                    [this](const ::arrow::Result<::arrow::internal::Empty>& result) mutable {
+                      this->Finish(flight_context_.FinishRequest(result.status()));
+                      this->ReleaseHold();
+                    });
+          });
     }
 
    private:

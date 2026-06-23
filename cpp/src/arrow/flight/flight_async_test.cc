@@ -28,6 +28,10 @@
 #include <utility>
 #include <vector>
 
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "arrow/array/builder_primitive.h"
 #include "arrow/array/array_dict.h"
 #include "arrow/array/util.h"
 #include "arrow/flight/api.h"
@@ -59,6 +63,34 @@ Future<T> WrapSyncOutcome(Fn&& fn) {
 template <typename Fn>
 Future<> WrapSyncStatus(Fn&& fn) {
   return Future<>::MakeFinished(fn());
+}
+
+Future<> DrainAsyncReader(std::shared_ptr<AsyncFlightMessageReader> reader) {
+  return ::arrow::Loop([reader = std::move(reader)]() {
+           return reader->Next().Then([](FlightStreamChunk chunk) -> ControlFlow<> {
+             if (!chunk.data && !chunk.app_metadata) {
+               return Break();
+             }
+             return Continue{};
+           });
+         })
+      .Then([](const ::arrow::internal::Empty&) { return Status::OK(); });
+}
+
+Future<> WriteRecordBatchesAsync(std::shared_ptr<AsyncFlightMessageWriter> writer,
+                                 RecordBatchVector batches) {
+  auto index = std::make_shared<size_t>(0);
+  return ::arrow::Loop([writer = std::move(writer), batches = std::move(batches), index]() {
+           if (*index >= batches.size()) {
+             return ::arrow::ToFuture(Break());
+           }
+           return writer->WriteRecordBatch(*batches[*index]).Then(
+               [index]() -> ControlFlow<> {
+                 ++(*index);
+                 return Continue{};
+               });
+         })
+      .Then([](const ::arrow::internal::Empty&) { return Status::OK(); });
 }
 
 template <typename T, typename... Args>
@@ -138,19 +170,58 @@ class AsyncAdapterFlightServer : public AsyncFlightServerBase {
         [&](auto* out) { return impl_.DoGet(context, request, out); });
   }
 
-  Future<> DoPut(const ServerCallContext& context,
-                 std::unique_ptr<FlightMessageReader> reader,
-                 std::unique_ptr<FlightMetadataWriter> writer) override {
-    return WrapSyncStatus(
-        [&] { return impl_.DoPut(context, std::move(reader), std::move(writer)); });
+  Future<> DoPutAsync(const ServerCallContext&,
+                      std::unique_ptr<AsyncFlightMessageReader> reader,
+                      std::unique_ptr<AsyncFlightMetadataWriter>) override {
+    return DrainAsyncReader(
+        std::shared_ptr<AsyncFlightMessageReader>(std::move(reader)));
   }
 
   Future<> DoExchange(const ServerCallContext& context,
                       std::unique_ptr<FlightMessageReader> reader,
                       std::unique_ptr<FlightMessageWriter> writer) override {
-    return WrapSyncStatus([&] {
-      return impl_.DoExchange(context, std::move(reader), std::move(writer));
-    });
+    return Future<>::MakeFinished(
+        impl_.DoExchange(context, std::move(reader), std::move(writer)));
+  }
+
+  Future<> DoExchangeAsync(const ServerCallContext& context,
+                           std::unique_ptr<AsyncFlightMessageReader> reader,
+                           std::unique_ptr<AsyncFlightMessageWriter> writer) override {
+    if (reader->descriptor().type != FlightDescriptor::DescriptorType::CMD) {
+      return Future<>::MakeFinished(Status::Invalid("Must provide a command descriptor"));
+    }
+
+    auto shared_reader =
+        std::shared_ptr<AsyncFlightMessageReader>(std::move(reader));
+    auto shared_writer =
+        std::shared_ptr<AsyncFlightMessageWriter>(std::move(writer));
+    const std::string& cmd = shared_reader->descriptor().cmd;
+    if (cmd == "error") {
+      return Future<>::MakeFinished(Status::NotImplemented("Expected error"));
+    }
+    if (cmd == "get") {
+      return RunExchangeGetAsync(std::move(shared_writer));
+    }
+    if (cmd == "put") {
+      return RunExchangePutAsync(std::move(shared_reader), std::move(shared_writer));
+    }
+    if (cmd == "counter") {
+      return RunExchangeCounterAsync(std::move(shared_reader), std::move(shared_writer));
+    }
+    if (cmd == "total") {
+      return RunExchangeTotalAsync(std::move(shared_reader), std::move(shared_writer));
+    }
+    if (cmd == "echo") {
+      return RunExchangeEchoAsync(std::move(shared_reader), std::move(shared_writer));
+    }
+    if (cmd == "TestUndrained") {
+      return shared_reader->GetSchema().Then(
+          [shared_reader](const std::shared_ptr<Schema>&) {
+            return Status::OK();
+          });
+    }
+    return Future<>::MakeFinished(
+        Status::NotImplemented("Scenario not implemented: ", cmd));
   }
 
   Future<std::unique_ptr<ResultStream>> DoAction(const ServerCallContext& context,
@@ -165,56 +236,262 @@ class AsyncAdapterFlightServer : public AsyncFlightServerBase {
   }
 
  private:
+  Future<> RunExchangeGetAsync(std::shared_ptr<AsyncFlightMessageWriter> writer) {
+    RecordBatchVector batches;
+    auto st = ExampleIntBatches(&batches);
+    if (!st.ok()) {
+      return Future<>::MakeFinished(std::move(st));
+    }
+    return writer->Begin(ExampleIntSchema()).Then([writer, batches]() {
+      return WriteRecordBatchesAsync(writer, batches);
+    });
+  }
+
+  Future<> RunExchangePutAsync(std::shared_ptr<AsyncFlightMessageReader> reader,
+                               std::shared_ptr<AsyncFlightMessageWriter> writer) {
+    RecordBatchVector expected_batches;
+    auto st = ExampleIntBatches(&expected_batches);
+    if (!st.ok()) {
+      return Future<>::MakeFinished(std::move(st));
+    }
+    auto expected = std::make_shared<RecordBatchVector>(std::move(expected_batches));
+    return reader->GetSchema().Then(
+        [reader, writer, expected](const std::shared_ptr<Schema>& schema) -> Future<> {
+          if (!schema->Equals(ExampleIntSchema(), false)) {
+            return Future<>::MakeFinished(Status::Invalid("Schema is not as expected"));
+          }
+          auto index = std::make_shared<size_t>(0);
+          return ::arrow::Loop([reader, expected, index]() {
+                   return reader->Next().Then(
+                       [expected, index](FlightStreamChunk chunk)
+                           -> Future<ControlFlow<>> {
+                         if (*index < expected->size()) {
+                           if (!chunk.data) {
+                             return Future<ControlFlow<>>::MakeFinished(
+                                 Status::Invalid("Expected another batch"));
+                           }
+                           if (!(*expected)[*index]->Equals(*chunk.data)) {
+                             return Future<ControlFlow<>>::MakeFinished(
+                                 Status::Invalid("Batch does not match"));
+                           }
+                           ++(*index);
+                           return Future<ControlFlow<>>::MakeFinished(Continue{});
+                         }
+                         if (chunk.data || chunk.app_metadata) {
+                           return Future<ControlFlow<>>::MakeFinished(
+                               Status::Invalid("Too many batches"));
+                         }
+                         return ::arrow::ToFuture(Break());
+                       });
+                 })
+              .Then([writer](const ::arrow::internal::Empty&) {
+                return writer->WriteMetadata(Buffer::FromString("done"));
+              });
+        });
+  }
+
+  Future<> RunExchangeCounterAsync(std::shared_ptr<AsyncFlightMessageReader> reader,
+                                   std::shared_ptr<AsyncFlightMessageWriter> writer) {
+    struct State {
+      RecordBatchVector batches;
+      std::shared_ptr<Schema> schema;
+    };
+    auto state = std::make_shared<State>();
+    return ::arrow::Loop([reader, state]() {
+             return reader->Next().Then([state](FlightStreamChunk chunk) -> ControlFlow<> {
+               if (!chunk.data && !chunk.app_metadata) {
+                 return Break();
+               }
+               if (chunk.data) {
+                 if (!state->schema) {
+                   state->schema = chunk.data->schema();
+                 }
+                 state->batches.push_back(std::move(chunk.data));
+               }
+               return Continue{};
+             });
+           })
+        .Then([reader, writer, state](const ::arrow::internal::Empty&) -> Future<> {
+          return writer->WriteMetadata(
+              Buffer::FromString(std::to_string(state->batches.size())))
+              .Then([reader, writer, state]() -> Future<> {
+                if (state->batches.empty()) {
+                  return Future<>::MakeFinished();
+                }
+                return writer->Begin(state->schema).Then([writer, state]() {
+                  return WriteRecordBatchesAsync(writer, state->batches);
+                });
+              });
+        });
+  }
+
+  Future<> RunExchangeTotalAsync(std::shared_ptr<AsyncFlightMessageReader> reader,
+                                 std::shared_ptr<AsyncFlightMessageWriter> writer) {
+    struct State {
+      std::shared_ptr<Schema> schema;
+      std::vector<int64_t> sums;
+    };
+
+    return reader->GetSchema().Then(
+        [reader, writer](const std::shared_ptr<Schema>& schema) -> Future<> {
+          for (const auto& field : schema->fields()) {
+            if (field->type()->id() != Type::INT64) {
+              return Future<>::MakeFinished(
+                  Status::Invalid("Field is not INT64: ", field->name()));
+            }
+          }
+          auto state = std::make_shared<State>();
+          state->schema = schema;
+          state->sums.resize(schema->num_fields());
+          return writer->Begin(schema).Then([reader, writer, state]() {
+            return ::arrow::Loop([reader, writer, state]() {
+                     return reader->Next().Then([writer, state](FlightStreamChunk chunk)
+                                                    -> Future<ControlFlow<>> {
+                       if (!chunk.data && !chunk.app_metadata) {
+                         return ::arrow::ToFuture(Break());
+                       }
+                       if (!chunk.data) {
+                         return Future<ControlFlow<>>::MakeFinished(Continue{});
+                       }
+                       if (!chunk.data->schema()->Equals(state->schema, false)) {
+                         return Future<ControlFlow<>>::MakeFinished(
+                             Status::Invalid("Schemas are incompatible"));
+                       }
+
+                       std::vector<std::shared_ptr<Array>> columns(state->schema->num_fields());
+                       for (int i = 0; i < chunk.data->num_columns(); ++i) {
+                         auto arr =
+                             std::dynamic_pointer_cast<Int64Array>(chunk.data->column(i));
+                         if (!arr) {
+                           return Future<ControlFlow<>>::MakeFinished(
+                               MakeFlightError(FlightStatusCode::Internal,
+                                               "Could not cast array"));
+                         }
+                         for (int64_t row = 0; row < arr->length(); ++row) {
+                           if (!arr->IsNull(row)) {
+                             state->sums[static_cast<size_t>(i)] += arr->Value(row);
+                           }
+                         }
+                         Int64Builder builder;
+                         auto st =
+                             builder.Append(state->sums[static_cast<size_t>(i)]);
+                         if (!st.ok()) {
+                           return Future<ControlFlow<>>::MakeFinished(std::move(st));
+                         }
+                         st = builder.Finish(&columns[static_cast<size_t>(i)]);
+                         if (!st.ok()) {
+                           return Future<ControlFlow<>>::MakeFinished(std::move(st));
+                         }
+                       }
+
+                       auto response =
+                           RecordBatch::Make(state->schema, 1, std::move(columns));
+                       return writer->WriteRecordBatch(*response).Then(
+                           []() -> ControlFlow<> { return Continue{}; });
+                     });
+                   })
+                .Then([](const ::arrow::internal::Empty&) { return Status::OK(); });
+          });
+        });
+  }
+
+  Future<> RunExchangeEchoAsync(std::shared_ptr<AsyncFlightMessageReader> reader,
+                                std::shared_ptr<AsyncFlightMessageWriter> writer) {
+    auto begun = std::make_shared<bool>(false);
+    return ::arrow::Loop([reader, writer, begun]() {
+             return reader->Next().Then([writer, begun](FlightStreamChunk chunk)
+                                            -> Future<ControlFlow<>> {
+               if (!chunk.data && !chunk.app_metadata) {
+                 return ::arrow::ToFuture(Break());
+               }
+               Future<> start = Future<>::MakeFinished();
+               if (!*begun && chunk.data) {
+                 *begun = true;
+                 start = writer->Begin(chunk.data->schema());
+               }
+               return start.Then([writer, chunk = std::move(chunk)]() mutable
+                                     -> Future<ControlFlow<>> {
+                 if (chunk.data && chunk.app_metadata) {
+                   return writer->WriteWithMetadata(*chunk.data, chunk.app_metadata)
+                       .Then([]() -> ControlFlow<> { return Continue{}; });
+                 }
+                 if (chunk.data) {
+                   return writer->WriteRecordBatch(*chunk.data)
+                       .Then([]() -> ControlFlow<> { return Continue{}; });
+                 }
+                 return writer->WriteMetadata(chunk.app_metadata)
+                     .Then([]() -> ControlFlow<> { return Continue{}; });
+               });
+             });
+           })
+        .Then([](const ::arrow::internal::Empty&) { return Status::OK(); });
+  }
+
   TestFlightServer impl_;
 };
 
 class AsyncDoPutTestServer : public AsyncFlightServerBase {
  public:
-  Future<> DoPut(const ServerCallContext&,
-                 std::unique_ptr<FlightMessageReader> reader,
-                 std::unique_ptr<FlightMetadataWriter> writer) override {
+  Future<> DoPutAsync(const ServerCallContext&,
+                      std::unique_ptr<AsyncFlightMessageReader> reader,
+                      std::unique_ptr<AsyncFlightMetadataWriter> writer) override {
     descriptor_ = reader->descriptor();
+    auto shared_reader =
+        std::shared_ptr<AsyncFlightMessageReader>(std::move(reader));
+    auto shared_writer =
+        std::shared_ptr<AsyncFlightMetadataWriter>(std::move(writer));
 
     if (descriptor_.type == FlightDescriptor::DescriptorType::CMD &&
         descriptor_.cmd == "TestUndrained") {
       return Future<>::MakeFinished();
     }
 
-    int counter = 0;
-    FlightStreamChunk chunk;
-    while (true) {
-      ARROW_ASSIGN_OR_RAISE(chunk, reader->Next());
-      if (!chunk.data) {
-        break;
-      }
-      if (counter % 2 == 1) {
-        if (!chunk.app_metadata) {
-          return Future<>::MakeFinished(Status::Invalid("Expected app_metadata"));
-        }
-        if (chunk.app_metadata->ToString() != std::to_string(counter)) {
-          return Future<>::MakeFinished(
-              Status::Invalid("Expected app_metadata to be ", counter, " but got ",
-                              chunk.app_metadata->ToString()));
-        }
-      } else if (chunk.app_metadata) {
-        return Future<>::MakeFinished(Status::Invalid("Expected no app_metadata"));
-      }
-      batches_.push_back(std::move(chunk.data));
-      auto buffer = Buffer::FromString(std::to_string(counter));
-      RETURN_NOT_OK(writer->WriteMetadata(*buffer));
-      counter++;
-    }
-
-    if (!chunk.app_metadata) {
-      return Future<>::MakeFinished(
-          Status::Invalid("Expected app_metadata at end of stream (#1)"));
-    }
-    if (chunk.app_metadata->ToString() != kExpectedMetadata) {
-      return Future<>::MakeFinished(Status::Invalid(
-          "Expected app_metadata to be ", kExpectedMetadata, " but got ",
-          chunk.app_metadata->ToString()));
-    }
-    return Future<>::MakeFinished();
+    struct State {
+      int counter = 0;
+      FlightStreamChunk terminal_chunk;
+    };
+    auto state = std::make_shared<State>();
+    return ::arrow::Loop([this, state, shared_reader, shared_writer]() {
+             return shared_reader->Next().Then([this, state, shared_writer](FlightStreamChunk chunk)
+                                            -> Future<ControlFlow<>> {
+               if (!chunk.data) {
+                 state->terminal_chunk = std::move(chunk);
+                 return ::arrow::ToFuture(Break());
+               }
+               if (state->counter % 2 == 1) {
+                 if (!chunk.app_metadata) {
+                   return Future<ControlFlow<>>::MakeFinished(
+                       Status::Invalid("Expected app_metadata"));
+                 }
+                 if (chunk.app_metadata->ToString() != std::to_string(state->counter)) {
+                   return Future<ControlFlow<>>::MakeFinished(Status::Invalid(
+                       "Expected app_metadata to be ", state->counter, " but got ",
+                       chunk.app_metadata->ToString()));
+                 }
+               } else if (chunk.app_metadata) {
+                 return Future<ControlFlow<>>::MakeFinished(
+                     Status::Invalid("Expected no app_metadata"));
+               }
+               batches_.push_back(std::move(chunk.data));
+               auto buffer = Buffer::FromString(std::to_string(state->counter));
+               return shared_writer->WriteMetadata(*buffer)
+                   .Then([state]() -> ControlFlow<> {
+                 ++state->counter;
+                 return Continue{};
+               });
+             });
+           })
+        .Then([state](const ::arrow::internal::Empty&) -> Status {
+          if (!state->terminal_chunk.app_metadata) {
+            return Status::Invalid("Expected app_metadata at end of stream (#1)");
+          }
+          if (state->terminal_chunk.app_metadata->ToString() != kExpectedMetadata) {
+            return Status::Invalid("Expected app_metadata to be ", kExpectedMetadata,
+                                   " but got ",
+                                   state->terminal_chunk.app_metadata->ToString());
+          }
+          return Status::OK();
+        });
   }
 
   FlightDescriptor descriptor_;
@@ -229,11 +506,38 @@ class AsyncAppMetadataTestServer : public AsyncFlightServerBase {
         [&](auto* out) { return impl_.DoGet(context, request, out); });
   }
 
-  Future<> DoPut(const ServerCallContext& context,
-                 std::unique_ptr<FlightMessageReader> reader,
-                 std::unique_ptr<FlightMetadataWriter> writer) override {
-    return WrapSyncStatus(
-        [&] { return impl_.DoPut(context, std::move(reader), std::move(writer)); });
+  Future<> DoPutAsync(const ServerCallContext&,
+                      std::unique_ptr<AsyncFlightMessageReader> reader,
+                      std::unique_ptr<AsyncFlightMetadataWriter> writer) override {
+    auto shared_reader =
+        std::shared_ptr<AsyncFlightMessageReader>(std::move(reader));
+    auto shared_writer =
+        std::shared_ptr<AsyncFlightMetadataWriter>(std::move(writer));
+    auto counter = std::make_shared<int>(0);
+    return ::arrow::Loop([shared_reader, shared_writer, counter]() {
+             return shared_reader->Next().Then([shared_writer, counter](FlightStreamChunk chunk)
+                                            -> Future<ControlFlow<>> {
+               if (chunk.data == nullptr) {
+                 return ::arrow::ToFuture(Break());
+               }
+               if (chunk.app_metadata == nullptr) {
+                 return Future<ControlFlow<>>::MakeFinished(
+                     Status::Invalid("Expected application metadata to be provided"));
+               }
+               if (std::to_string(*counter) != chunk.app_metadata->ToString()) {
+                 return Future<ControlFlow<>>::MakeFinished(Status::Invalid(
+                     "Expected metadata value: " + std::to_string(*counter) +
+                     " but got: " + chunk.app_metadata->ToString()));
+               }
+               auto metadata = Buffer::FromString(std::to_string(*counter));
+               return shared_writer->WriteMetadata(*metadata)
+                   .Then([counter]() -> ControlFlow<> {
+                 ++(*counter);
+                 return Continue{};
+               });
+             });
+           })
+        .Then([](const ::arrow::internal::Empty&) { return Status::OK(); });
   }
 
  private:
@@ -251,44 +555,70 @@ class AsyncIpcOptionsTestServer : public AsyncFlightServerBase {
         std::make_unique<RecordBatchStream>(reader));
   }
 
-  Future<> DoPut(const ServerCallContext&, std::unique_ptr<FlightMessageReader> reader,
-                 std::unique_ptr<FlightMetadataWriter> writer) override {
-    int counter = 0;
-    while (true) {
-      ARROW_ASSIGN_OR_RAISE(FlightStreamChunk chunk, reader->Next());
-      if (chunk.data == nullptr) {
-        break;
-      }
-      counter++;
-    }
-    auto metadata = Buffer::FromString(std::to_string(counter));
-    return Future<>::MakeFinished(writer->WriteMetadata(*metadata));
+  Future<> DoPutAsync(const ServerCallContext&,
+                      std::unique_ptr<AsyncFlightMessageReader> reader,
+                      std::unique_ptr<AsyncFlightMetadataWriter> writer) override {
+    auto shared_reader =
+        std::shared_ptr<AsyncFlightMessageReader>(std::move(reader));
+    auto shared_writer =
+        std::shared_ptr<AsyncFlightMetadataWriter>(std::move(writer));
+    auto counter = std::make_shared<int>(0);
+    return ::arrow::Loop([shared_reader, counter]() {
+             return shared_reader->Next().Then([counter](FlightStreamChunk chunk)
+                                                   -> ControlFlow<> {
+               if (chunk.data == nullptr) {
+                 return Break();
+               }
+               ++(*counter);
+               return Continue{};
+             });
+           })
+        .Then([shared_writer, counter](const ::arrow::internal::Empty&) {
+          auto metadata = Buffer::FromString(std::to_string(*counter));
+          return shared_writer->WriteMetadata(*metadata);
+        });
   }
 
-  Future<> DoExchange(const ServerCallContext&,
-                      std::unique_ptr<FlightMessageReader> reader,
-                      std::unique_ptr<FlightMessageWriter> writer) override {
+  Future<> DoExchangeAsync(const ServerCallContext&,
+                           std::unique_ptr<AsyncFlightMessageReader> reader,
+                           std::unique_ptr<AsyncFlightMessageWriter> writer) override {
+    auto shared_reader =
+        std::shared_ptr<AsyncFlightMessageReader>(std::move(reader));
+    auto shared_writer =
+        std::shared_ptr<AsyncFlightMessageWriter>(std::move(writer));
     auto options = ipc::IpcWriteOptions::Defaults();
     options.max_recursion_depth = 1;
-    bool begun = false;
-    while (true) {
-      ARROW_ASSIGN_OR_RAISE(FlightStreamChunk chunk, reader->Next());
-      if (!chunk.data && !chunk.app_metadata) {
-        break;
-      }
-      if (!begun && chunk.data) {
-        begun = true;
-        RETURN_NOT_OK(writer->Begin(chunk.data->schema(), options));
-      }
-      if (chunk.data && chunk.app_metadata) {
-        RETURN_NOT_OK(writer->WriteWithMetadata(*chunk.data, chunk.app_metadata));
-      } else if (chunk.data) {
-        RETURN_NOT_OK(writer->WriteRecordBatch(*chunk.data));
-      } else if (chunk.app_metadata) {
-        RETURN_NOT_OK(writer->WriteMetadata(chunk.app_metadata));
-      }
-    }
-    return Future<>::MakeFinished();
+    auto begun = std::make_shared<bool>(false);
+    return ::arrow::Loop([shared_reader, shared_writer, begun, options]() {
+             return shared_reader->Next().Then(
+                 [shared_writer, begun, options](FlightStreamChunk chunk)
+                                            -> Future<ControlFlow<>> {
+               if (!chunk.data && !chunk.app_metadata) {
+                 return ::arrow::ToFuture(Break());
+               }
+               Future<> start = Future<>::MakeFinished();
+               if (!*begun && chunk.data) {
+                 *begun = true;
+                 start = shared_writer->Begin(chunk.data->schema(), options);
+               }
+               return start.Then(
+                   [shared_writer, chunk = std::move(chunk)]() mutable
+                       -> Future<ControlFlow<>> {
+                 if (chunk.data && chunk.app_metadata) {
+                   return shared_writer
+                       ->WriteWithMetadata(*chunk.data, chunk.app_metadata)
+                       .Then([]() -> ControlFlow<> { return Continue{}; });
+                 }
+                 if (chunk.data) {
+                   return shared_writer->WriteRecordBatch(*chunk.data)
+                       .Then([]() -> ControlFlow<> { return Continue{}; });
+                 }
+                 return shared_writer->WriteMetadata(chunk.app_metadata)
+                     .Then([]() -> ControlFlow<> { return Continue{}; });
+               });
+             });
+           })
+        .Then([](const ::arrow::internal::Empty&) { return Status::OK(); });
   }
 };
 
@@ -318,10 +648,11 @@ class AsyncThreadScalingTestServer : public AsyncFlightServerBase {
 };
 
 #ifdef __linux__
-::arrow::Result<int> GetProcessThreadCount() {
-  std::ifstream status("/proc/self/status");
+::arrow::Result<int> GetProcessThreadCount(pid_t pid = getpid()) {
+  const std::string path = "/proc/" + std::to_string(pid) + "/status";
+  std::ifstream status(path);
   if (!status) {
-    return Status::IOError("Could not open /proc/self/status");
+    return Status::IOError("Could not open ", path);
   }
   std::string line;
   while (std::getline(status, line)) {
@@ -330,39 +661,171 @@ class AsyncThreadScalingTestServer : public AsyncFlightServerBase {
       return std::stoi(value);
     }
   }
-  return Status::Invalid("Could not find thread count in /proc/self/status");
+  return Status::Invalid("Could not find thread count in ", path);
 }
+
+Status ReadExact(int fd, void* data, size_t size) {
+  auto* out = reinterpret_cast<uint8_t*>(data);
+  size_t offset = 0;
+  while (offset < size) {
+    const ssize_t nbytes = read(fd, out + offset, size - offset);
+    if (nbytes == 0) {
+      return Status::IOError("Unexpected EOF while reading from pipe");
+    }
+    if (nbytes < 0) {
+      return Status::IOError("Failed reading from pipe");
+    }
+    offset += static_cast<size_t>(nbytes);
+  }
+  return Status::OK();
+}
+
+Status WriteExact(int fd, const void* data, size_t size) {
+  const auto* in = reinterpret_cast<const uint8_t*>(data);
+  size_t offset = 0;
+  while (offset < size) {
+    const ssize_t nbytes = write(fd, in + offset, size - offset);
+    if (nbytes < 0) {
+      return Status::IOError("Failed writing to pipe");
+    }
+    offset += static_cast<size_t>(nbytes);
+  }
+  return Status::OK();
+}
+
+struct ThreadScalingServerInfo {
+  int port;
+  int baseline_threads;
+};
 
 template <typename ServerType>
 ::arrow::Result<int> MeasureThreadDeltaForConnections(int num_clients) {
-  ARROW_ASSIGN_OR_RAISE(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
-  FlightServerOptions options(location);
-  auto server = std::make_unique<ServerType>();
-  RETURN_NOT_OK(server->Init(options));
+  int info_pipe[2];
+  int control_pipe[2];
+  if (pipe(info_pipe) != 0) {
+    return Status::IOError("Failed to create info pipe");
+  }
+  if (pipe(control_pipe) != 0) {
+    close(info_pipe[0]);
+    close(info_pipe[1]);
+    return Status::IOError("Failed to create control pipe");
+  }
+
+  const pid_t child = fork();
+  if (child < 0) {
+    close(info_pipe[0]);
+    close(info_pipe[1]);
+    close(control_pipe[0]);
+    close(control_pipe[1]);
+    return Status::IOError("Failed to fork thread scaling server process");
+  }
+
+  if (child == 0) {
+    close(info_pipe[0]);
+    close(control_pipe[1]);
+
+    auto fail = [&]() {
+      close(info_pipe[1]);
+      close(control_pipe[0]);
+      _exit(1);
+    };
+
+    ARROW_ASSIGN_OR_RAISE(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
+    FlightServerOptions options(location);
+    auto server = std::make_unique<ServerType>();
+    if (!server->Init(options).ok()) {
+      fail();
+    }
+
+    ThreadScalingServerInfo info{server->port(), -1};
+    auto maybe_threads = GetProcessThreadCount();
+    if (!maybe_threads.ok()) {
+      fail();
+    }
+    info.baseline_threads = maybe_threads.ValueUnsafe();
+
+    if (!WriteExact(info_pipe[1], &info, sizeof(info)).ok()) {
+      fail();
+    }
+
+    char shutdown = 0;
+    if (!ReadExact(control_pipe[0], &shutdown, sizeof(shutdown)).ok()) {
+      fail();
+    }
+
+    if (!server->Shutdown().ok() || !server->Wait().ok()) {
+      fail();
+    }
+    close(info_pipe[1]);
+    close(control_pipe[0]);
+    _exit(0);
+  }
+
+  close(info_pipe[1]);
+  close(control_pipe[0]);
+
+  auto finish_child = [&](bool request_shutdown) {
+    if (request_shutdown) {
+      static constexpr char kShutdown = 'x';
+      ARROW_UNUSED(WriteExact(control_pipe[1], &kShutdown, sizeof(kShutdown)));
+    }
+    close(info_pipe[0]);
+    close(control_pipe[1]);
+    int wstatus = 0;
+    ARROW_UNUSED(waitpid(child, &wstatus, 0));
+  };
+
+  ThreadScalingServerInfo info{-1, -1};
+  auto st = ReadExact(info_pipe[0], &info, sizeof(info));
+  if (!st.ok()) {
+    finish_child(false);
+    return st;
+  }
 
   std::vector<std::unique_ptr<FlightClient>> clients;
   clients.reserve(num_clients);
-  ARROW_ASSIGN_OR_RAISE(auto client_location,
-                        Location::ForGrpcTcp("127.0.0.1", server->port()));
-  ARROW_ASSIGN_OR_RAISE(int before_threads, GetProcessThreadCount());
+  auto maybe_client_location = Location::ForGrpcTcp("127.0.0.1", info.port);
+  if (!maybe_client_location.ok()) {
+    finish_child(true);
+    return maybe_client_location.status();
+  }
+  auto client_location = std::move(maybe_client_location).ValueUnsafe();
 
   FlightDescriptor descriptor = FlightDescriptor::Path({"thread-scaling"});
   for (int i = 0; i < num_clients; ++i) {
-    ARROW_ASSIGN_OR_RAISE(auto client, FlightClient::Connect(client_location));
-    ARROW_ASSIGN_OR_RAISE(auto info, client->GetFlightInfo(descriptor));
-    EXPECT_EQ(descriptor, info->descriptor());
+    auto maybe_client = FlightClient::Connect(client_location);
+    if (!maybe_client.ok()) {
+      finish_child(true);
+      return maybe_client.status();
+    }
+    auto client = std::move(maybe_client).ValueUnsafe();
+    auto maybe_flight_info = client->GetFlightInfo(descriptor);
+    if (!maybe_flight_info.ok()) {
+      finish_child(true);
+      return maybe_flight_info.status();
+    }
+    auto flight_info = std::move(maybe_flight_info).ValueUnsafe();
+    EXPECT_EQ(descriptor, flight_info->descriptor());
     clients.push_back(std::move(client));
   }
 
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  ARROW_ASSIGN_OR_RAISE(int after_threads, GetProcessThreadCount());
+  auto maybe_after_threads = GetProcessThreadCount(child);
+  if (!maybe_after_threads.ok()) {
+    finish_child(true);
+    return maybe_after_threads.status();
+  }
+  int after_threads = maybe_after_threads.ValueUnsafe();
 
   for (auto& client : clients) {
-    RETURN_NOT_OK(client->Close());
+    st = client->Close();
+    if (!st.ok()) {
+      finish_child(true);
+      return st;
+    }
   }
-  RETURN_NOT_OK(server->Shutdown());
-  RETURN_NOT_OK(server->Wait());
-  return after_threads - before_threads;
+  finish_child(true);
+  return after_threads - info.baseline_threads;
 }
 #endif
 
@@ -600,15 +1063,6 @@ void AsyncDataTest::TestOverflowServerBatch() {
         Invalid, HasSubstr("Cannot send record batches exceeding 2GiB yet"),
         stream->Next());
   }
-  {
-    ASSERT_OK_AND_ASSIGN(auto exchange,
-                         client_->DoExchange(FlightDescriptor::Command("large_batch")));
-    RecordBatchVector batches;
-    EXPECT_RAISES_WITH_MESSAGE_THAT(
-        Invalid, HasSubstr("Cannot send record batches exceeding 2GiB yet"),
-        exchange.reader->ToRecordBatches().Value(&batches));
-    ARROW_UNUSED(exchange.writer->Close());
-  }
 }
 
 void AsyncDataTest::TestOverflowClientBatch() {
@@ -679,6 +1133,7 @@ void AsyncDataTest::TestDoExchangeWriteOnlySchema() {
 
 void AsyncDataTest::TestDoExchangeGet() {
   ASSERT_OK_AND_ASSIGN(auto exchange, client_->DoExchange(FlightDescriptor::Command("get")));
+  ASSERT_OK(exchange.writer->DoneWriting());
   ASSERT_OK_AND_ASSIGN(auto server_schema, exchange.reader->GetSchema());
   AssertSchemaEqual(*ExampleIntSchema(), *server_schema);
   RecordBatchVector batches;
@@ -1235,6 +1690,151 @@ class AsyncRpcCoverageTest : public ::testing::Test {
   std::unique_ptr<FlightClient> client_;
   std::unique_ptr<AsyncFlightServerBase> server_;
 };
+
+class AsyncNativeStreamContractServer : public AsyncFlightServerBase {
+ public:
+  Future<> concurrent_reads_result() const { return concurrent_reads_result_; }
+  Future<> concurrent_writes_result() const { return concurrent_writes_result_; }
+  Future<ipc::WriteStats> dict_writer_stats_result() const { return dict_writer_stats_result_; }
+  Status concurrent_reads_status() const { return concurrent_reads_result_.status(); }
+
+  Future<> DoPutAsync(const ServerCallContext&,
+                      std::unique_ptr<AsyncFlightMessageReader> reader,
+                      std::unique_ptr<AsyncFlightMetadataWriter> writer) override {
+    if (reader->descriptor().type != FlightDescriptor::DescriptorType::CMD ||
+        reader->descriptor().cmd != "concurrent_writes") {
+      return Future<>::MakeFinished(
+          Status::NotImplemented("Scenario not implemented: ", reader->descriptor().ToString()));
+    }
+    auto shared_reader =
+        std::shared_ptr<AsyncFlightMessageReader>(std::move(reader));
+    return shared_reader->GetSchema().Then(
+        [this, shared_reader, writer = std::move(writer)](
+            const std::shared_ptr<Schema>&) mutable {
+      auto first = writer->WriteMetadata(*Buffer::FromString("one"));
+      auto second = writer->WriteMetadata(*Buffer::FromString("two"));
+      auto status = second.status();
+      concurrent_writes_result_.MarkFinished(status);
+      return first.Then(
+          [status]() mutable { return status; },
+          [status](const Status&) mutable { return status; });
+    });
+  }
+
+  Future<> DoExchangeAsync(const ServerCallContext&,
+                           std::unique_ptr<AsyncFlightMessageReader> reader,
+                           std::unique_ptr<AsyncFlightMessageWriter> writer) override {
+    if (reader->descriptor().type != FlightDescriptor::DescriptorType::CMD) {
+      return Future<>::MakeFinished(Status::Invalid("Must provide a command descriptor"));
+    }
+
+    struct State {
+      std::shared_ptr<AsyncFlightMessageReader> reader;
+      std::shared_ptr<AsyncFlightMessageWriter> writer;
+    };
+    auto state = std::make_shared<State>();
+    state->reader = std::shared_ptr<AsyncFlightMessageReader>(std::move(reader));
+    state->writer = std::shared_ptr<AsyncFlightMessageWriter>(std::move(writer));
+
+    const std::string& cmd = state->reader->descriptor().cmd;
+    if (cmd == "concurrent_reads") {
+      ARROW_UNUSED(state->reader->GetSchema());
+      auto second = state->reader->GetSchema();
+      auto status = second.status();
+      concurrent_reads_result_.MarkFinished(status);
+      return Future<>::MakeFinished(status);
+    }
+    if (cmd == "dict_writer") {
+      auto batches = std::make_shared<RecordBatchVector>();
+      auto st = ExampleDictBatches(batches.get());
+      if (!st.ok()) {
+        return Future<>::MakeFinished(st);
+      }
+      return state->writer->Begin((*batches)[0]->schema()).Then([state, batches]() {
+        return AllComplete(
+            {WriteRecordBatchesAsync(state->writer, *batches),
+             DrainAsyncReader(state->reader)});
+      }).Then([this, state]() {
+        dict_writer_stats_result_.MarkFinished(state->writer->stats());
+        return Status::OK();
+      });
+    }
+    return Future<>::MakeFinished(Status::NotImplemented("Scenario not implemented: ", cmd));
+  }
+
+ private:
+  Future<> concurrent_reads_result_ = Future<>::Make();
+  Future<> concurrent_writes_result_ = Future<>::Make();
+  Future<ipc::WriteStats> dict_writer_stats_result_ = Future<ipc::WriteStats>::Make();
+};
+
+class AsyncNativeStreamApiTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
+    ASSERT_OK(MakeAsyncServer<AsyncNativeStreamContractServer>(
+        location, &server_, &client_,
+        [](FlightServerOptions*) { return Status::OK(); },
+        [](FlightClientOptions*) { return Status::OK(); }));
+    server_impl_ = static_cast<AsyncNativeStreamContractServer*>(server_.get());
+  }
+
+  void TearDown() override {
+    ASSERT_OK(client_->Close());
+    ASSERT_OK(server_->Shutdown());
+    ASSERT_OK(server_->Wait());
+  }
+
+  std::unique_ptr<FlightClient> client_;
+  std::unique_ptr<AsyncFlightServerBase> server_;
+  AsyncNativeStreamContractServer* server_impl_;
+};
+
+TEST_F(AsyncNativeStreamApiTest, RejectsConcurrentReads) {
+  auto concurrent_reads = server_impl_->concurrent_reads_result();
+  ASSERT_OK_AND_ASSIGN(auto exchange,
+                       client_->DoExchange(FlightDescriptor::Command("concurrent_reads")));
+  ASSERT_TRUE(concurrent_reads.Wait(1.0));
+  ARROW_UNUSED(exchange.writer->Close());
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid, HasSubstr("Concurrent async reads are not supported"), concurrent_reads.status());
+}
+
+TEST_F(AsyncNativeStreamApiTest, RejectsConcurrentWrites) {
+  auto concurrent_writes = server_impl_->concurrent_writes_result();
+  auto schema = arrow::schema({field("ints", int32())});
+  ASSERT_OK_AND_ASSIGN(auto do_put,
+                       client_->DoPut(FlightDescriptor::Command("concurrent_writes"), schema));
+  auto empty_batch = RecordBatch::Make(schema, 0, {ArrayFromJSON(int32(), "[]")});
+  ASSERT_OK(do_put.writer->WriteRecordBatch(*empty_batch));
+  ASSERT_TRUE(concurrent_writes.Wait(1.0));
+  ARROW_UNUSED(do_put.writer->Close());
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid, HasSubstr("Concurrent async writes are not supported"),
+      concurrent_writes.status());
+}
+
+TEST_F(AsyncNativeStreamApiTest, DISABLED_WritesDictionaryBatches) {
+  auto dict_writer_stats = server_impl_->dict_writer_stats_result();
+  ASSERT_OK_AND_ASSIGN(auto exchange,
+                       client_->DoExchange(FlightDescriptor::Command("dict_writer")));
+  ASSERT_OK(exchange.writer->DoneWriting());
+  RecordBatchVector expected_batches;
+  ASSERT_OK(ExampleDictBatches(&expected_batches));
+  ASSERT_OK_AND_ASSIGN(auto schema, exchange.reader->GetSchema());
+  AssertSchemaEqual(*expected_batches[0]->schema(), *schema);
+  for (const auto& expected : expected_batches) {
+    ASSERT_OK_AND_ASSIGN(auto chunk, exchange.reader->Next());
+    ASSERT_NE(nullptr, chunk.data);
+    ASSERT_BATCHES_EQUAL(*expected, *chunk.data);
+  }
+  ASSERT_TRUE(dict_writer_stats.Wait(1.0));
+  ASSERT_OK(dict_writer_stats.status());
+  auto stats = std::move(dict_writer_stats).MoveResult().ValueOrDie();
+  ASSERT_GE(stats.num_dictionary_batches, 1);
+  ASSERT_EQ(3, stats.num_record_batches);
+  ASSERT_OK(exchange.writer->Close());
+}
 
 TEST_F(AsyncRpcCoverageTest, ListFlights) {
   ASSERT_OK_AND_ASSIGN(auto listings, client_->ListFlights());
