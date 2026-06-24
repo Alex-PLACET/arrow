@@ -90,7 +90,12 @@ Status AsyncFlightServerBase::Shutdown(
 }
 
 Status AsyncFlightServerBase::Wait() {
-  return impl_->signal_state_.Wait([this] { return impl_->transport_->Wait(); });
+  return impl_->signal_state_.Wait([this] {
+    if (!impl_->transport_) {
+      return Status::Invalid("Wait() on uninitialized AsyncFlightServerBase");
+    }
+    return impl_->transport_->Wait();
+  });
 }
 
 Future<> AsyncFlightServerBase::Handshake(const ServerCallContext&,

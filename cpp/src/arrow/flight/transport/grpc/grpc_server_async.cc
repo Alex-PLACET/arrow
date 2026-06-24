@@ -98,14 +98,47 @@ using GrpcServerCallContext =
 using CallbackServiceHelper =
     transport::grpc::GrpcServerCallContextHelper<::grpc::CallbackServerContext>;
 
-arrow::internal::ThreadPool* GetAsyncGrpcWorkerPool() {
-  constexpr int kMaxAsyncGrpcWorkerThreads = 4;
-  static std::shared_ptr<arrow::internal::ThreadPool> pool =
-      arrow::internal::ThreadPool::MakeEternal(
-          std::min(kMaxAsyncGrpcWorkerThreads,
-                   arrow::internal::ThreadPool::DefaultCapacity()))
-          .ValueOrDie();
-  return pool.get();
+constexpr int kMaxAsyncGrpcWorkerThreads = 4;
+
+arrow::Result<std::shared_ptr<arrow::internal::ThreadPool>> MakeAsyncGrpcExecutor() {
+  return arrow::internal::ThreadPool::MakeEternal(
+      std::min(kMaxAsyncGrpcWorkerThreads,
+               arrow::internal::ThreadPool::DefaultCapacity()));
+}
+
+::grpc::Status PrepareAuthenticatedCall(const CallbackServiceHelper& helper,
+                                        FlightMethod method,
+                                        ::grpc::CallbackServerContext* context,
+                                        GrpcServerCallContext* flight_context) {
+  auto st = helper.CheckAuth(method, context, flight_context);
+  if (!st.ok()) {
+    return st;
+  }
+  helper.AddMiddlewareHeaders(context, flight_context);
+  return ::grpc::Status::OK;
+}
+
+template <typename ProtoRequest, typename ArrowRequest>
+Status ParseRequiredRequest(const ProtoRequest* request, const char* request_name,
+                            ArrowRequest* out) {
+  if (request == nullptr) {
+    return Status::Invalid(request_name, " cannot be null");
+  }
+  return internal::FromProto(*request, out);
+}
+
+template <typename ArrowResponse, typename ProtoResponse, typename ToProtoFn>
+void FinishUnaryResult(::grpc::ServerUnaryReactor* reactor, ProtoResponse* response,
+                       GrpcServerCallContext flight_context,
+                       const arrow::Result<std::unique_ptr<ArrowResponse>>& result,
+                       const char* not_found_message, ToProtoFn&& to_proto) {
+  if (result.ok() && result.ValueUnsafe()) {
+    reactor->Finish(
+        flight_context.FinishRequest(to_proto(*result.ValueUnsafe(), response)));
+    return;
+  }
+  reactor->Finish(flight_context.FinishRequest(
+      result.ok() ? Status::KeyError(not_found_message) : result.status()));
 }
 
 template <typename Proto>
@@ -115,100 +148,12 @@ class ImmediateWriteReactor final : public ::grpc::ServerWriteReactor<Proto> {
   void OnDone() override { delete this; }
 };
 
-class FlightDataWriteReactorBase : public ::grpc::ServerWriteReactor<pb::FlightData> {
- public:
-  explicit FlightDataWriteReactorBase(::grpc::CallbackServerContext* context)
-      : context_(context), executor_(GetAsyncGrpcWorkerPool()) {}
-
-  void OnWriteDone(bool ok) override {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (flight_data_registered_) {
-      transport::grpc::UnregisterGrpcFlightDataMessage(&current_write_);
-      flight_data_registered_ = false;
-    }
-    write_in_flight_ = false;
-    write_ok_ = ok;
-    if (finish_requested_) {
-      this->Finish(finish_status_);
-    }
-    cv_.notify_all();
-  }
-
-  void OnCancel() override {
-    std::unique_lock<std::mutex> lock(mutex_);
-    cancelled_ = true;
-    cv_.notify_all();
-  }
-
-  void OnDone() override {
-    if (flight_data_registered_) {
-      transport::grpc::UnregisterGrpcFlightDataMessage(&current_write_);
-      flight_data_registered_ = false;
-    }
-    ReleaseRef();
-  }
-
- protected:
-  Status StartWorker(std::function<void()> fn) {
-    refs_.fetch_add(1, std::memory_order_relaxed);
-    auto maybe_future = executor_->Submit([this, fn = std::move(fn)]() mutable {
-      fn();
-      ReleaseRef();
-    });
-    if (!maybe_future.ok()) {
-      ReleaseRef();
-      return maybe_future.status();
-    }
-    return Status::OK();
-  }
-
-  void ReleaseRef() {
-    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      delete this;
-    }
-  }
-
-  arrow::Result<bool> WritePayloadOne(FlightPayload payload) {
-    ARROW_ASSIGN_OR_RAISE(current_write_, SerializeFlightPayload(payload));
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (cancelled_) return false;
-    write_in_flight_ = true;
-    write_ok_ = true;
-    transport::grpc::RegisterGrpcFlightDataMessage(&current_write_);
-    flight_data_registered_ = true;
-    this->StartWrite(&current_write_);
-    cv_.wait(lock, [&] { return !write_in_flight_ || cancelled_; });
-    return !cancelled_ && write_ok_;
-  }
-
-  void FinishFromWorker(::grpc::Status status) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    finish_requested_ = true;
-    finish_status_ = std::move(status);
-    if (!write_in_flight_) {
-      this->Finish(finish_status_);
-    }
-  }
-
-  ::grpc::CallbackServerContext* context_;
-  arrow::internal::Executor* executor_;
-  std::mutex mutex_;
-  std::condition_variable cv_;
-  pb::FlightData current_write_;
-  bool write_in_flight_ = false;
-  bool write_ok_ = true;
-  bool cancelled_ = false;
-  bool finish_requested_ = false;
-  bool flight_data_registered_ = false;
-  ::grpc::Status finish_status_;
-  std::atomic<int> refs_{1};
-};
-
 template <typename Req, typename Resp>
 class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
  public:
-  explicit BidiReactorBase(::grpc::CallbackServerContext* context)
-      : context_(context), executor_(GetAsyncGrpcWorkerPool()) {
+  BidiReactorBase(::grpc::CallbackServerContext* context,
+                  std::shared_ptr<arrow::internal::ThreadPool> executor)
+      : context_(context), executor_(std::move(executor)) {
     if constexpr (std::is_same_v<Req, pb::FlightData>) {
       transport::grpc::RegisterGrpcFlightDataMessage(&read_buffer_);
       read_buffer_registered_ = true;
@@ -473,7 +418,7 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   }
 
   ::grpc::CallbackServerContext* context_;
-  arrow::internal::Executor* executor_;
+  std::shared_ptr<arrow::internal::ThreadPool> executor_;
   Req read_buffer_;
   std::deque<Req> reads_;
   Resp current_write_;
@@ -1072,6 +1017,10 @@ class AsyncGrpcServerTransport : public internal::AsyncServerTransport {
       : internal::AsyncServerTransport(base, std::move(memory_manager)) {}
 
   Status Init(const FlightServerOptions& options, const arrow::util::Uri& uri) override {
+    // Callback handlers should stay non-blocking; Arrow work runs on a small
+    // transport-owned pool so multiple async servers do not share hidden
+    // process-global state or oversubscribe threads under load.
+    ARROW_ASSIGN_OR_RAISE(executor_pool_, MakeAsyncGrpcExecutor());
     helper_ = std::make_unique<CallbackServiceHelper>(options.auth_handler, options.middleware);
     grpc_service_ = std::make_unique<CallbackFlightService>(this, *helper_);
 
@@ -1111,6 +1060,7 @@ class AsyncGrpcServerTransport : public internal::AsyncServerTransport {
   Location location() const override { return location_; }
 
   const CallbackServiceHelper& helper() const { return *helper_; }
+  std::shared_ptr<arrow::internal::ThreadPool> executor() const { return executor_pool_; }
 
   template <typename Resp>
   Future<std::unique_ptr<AsyncFlightMessageReader>> MakeAsyncMessageReader(
@@ -1146,96 +1096,48 @@ class AsyncGrpcServerTransport : public internal::AsyncServerTransport {
   }
 
  private:
+  std::shared_ptr<arrow::internal::ThreadPool> executor_pool_;
   std::unique_ptr<CallbackServiceHelper> helper_;
   std::unique_ptr<CallbackFlightService> grpc_service_;
   std::unique_ptr<::grpc::Server> grpc_server_;
   Location location_;
 };
 
-template <typename Proto, typename UserType>
-class IteratorReactor : public ::grpc::ServerWriteReactor<Proto> {
+template <typename Proto>
+class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
  public:
-  using NextFn = std::function<arrow::Result<std::unique_ptr<UserType>>()>;
-  using ToProtoFn = std::function<Status(const UserType&, Proto*)>;
-
-  IteratorReactor(::grpc::CallbackServerContext* context, GrpcServerCallContext flight_context,
-                  NextFn next_fn, ToProtoFn to_proto)
+  AsyncWriteReactorBase(::grpc::CallbackServerContext* context,
+                        std::shared_ptr<arrow::internal::ThreadPool> executor,
+                        GrpcServerCallContext flight_context)
       : context_(context),
-        executor_(GetAsyncGrpcWorkerPool()),
-        flight_context_(std::move(flight_context)),
-        next_fn_(std::move(next_fn)),
-        to_proto_(std::move(to_proto)) {}
-
-  void Start() {
-    auto status = ScheduleAdvance();
-    if (!status.ok()) {
-      FinishOnce(flight_context_.FinishRequest(status));
-    }
-  }
-
-  void OnWriteDone(bool ok) override {
-    if (!ok) {
-      FinishOnce(flight_context_.FinishRequest(Status::OK()));
-      return;
-    }
-    auto status = ScheduleAdvance();
-    if (!status.ok()) {
-      FinishOnce(flight_context_.FinishRequest(status));
-    }
-  }
+        executor_(std::move(executor)),
+        flight_context_(std::move(flight_context)) {}
 
   void OnCancel() override { cancelled_.store(true, std::memory_order_relaxed); }
 
   void OnDone() override { ReleaseRef(); }
 
- private:
-  Status ScheduleAdvance() {
+ protected:
+  // Reactor instances are self-owned: the gRPC callback path holds one
+  // reference and each in-flight background task adds one more until its
+  // callback completes. This keeps callback-thread work minimal while making
+  // teardown deterministic.
+  template <typename Fn>
+  Status StartBackgroundWork(Fn&& fn) {
     refs_.fetch_add(1, std::memory_order_relaxed);
-    auto maybe_future = executor_->Submit([this] {
-      if (cancelled_.load(std::memory_order_relaxed)) {
-        ReleaseRef();
-        return;
-      }
-
-      auto maybe_value = next_fn_();
-      if (!maybe_value.ok()) {
-        FinishOnce(flight_context_.FinishRequest(maybe_value.status()));
-        ReleaseRef();
-        return;
-      }
-
-      auto value = std::move(maybe_value).ValueUnsafe();
-      if (!value) {
-        FinishOnce(flight_context_.FinishRequest(Status::OK()));
-        ReleaseRef();
-        return;
-      }
-
-      Proto proto;
-      auto st = to_proto_(*value, &proto);
-      if (!st.ok()) {
-        FinishOnce(flight_context_.FinishRequest(st));
-        ReleaseRef();
-        return;
-      }
-
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (finished_) {
+    auto maybe_future = executor_->Submit(
+        [this, fn = std::forward<Fn>(fn)]() mutable {
+          fn();
           ReleaseRef();
-          return;
-        }
-        current_write_ = std::move(proto);
-      }
-      this->StartWrite(&current_write_);
-      ReleaseRef();
-    });
+        });
     if (!maybe_future.ok()) {
       ReleaseRef();
       return maybe_future.status();
     }
     return Status::OK();
   }
+
+  bool cancelled() const { return cancelled_.load(std::memory_order_relaxed); }
 
   void FinishOnce(::grpc::Status status) {
     bool expected = false;
@@ -1244,105 +1146,170 @@ class IteratorReactor : public ::grpc::ServerWriteReactor<Proto> {
     }
   }
 
+  ::grpc::CallbackServerContext* context_;
+  std::shared_ptr<arrow::internal::ThreadPool> executor_;
+  GrpcServerCallContext flight_context_;
+  Proto current_write_;
+  std::mutex mutex_;
+
+ private:
   void ReleaseRef() {
     if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       delete this;
     }
   }
 
-  ::grpc::CallbackServerContext* context_;
-  arrow::internal::Executor* executor_;
-  GrpcServerCallContext flight_context_;
-  NextFn next_fn_;
-  ToProtoFn to_proto_;
-  Proto current_write_;
-  std::mutex mutex_;
   std::atomic<bool> cancelled_{false};
   std::atomic<bool> finished_{false};
   std::atomic<int> refs_{1};
 };
 
-class DoGetReactor : public ::grpc::ServerWriteReactor<pb::FlightData> {
+template <typename Proto, typename UserType>
+class IteratorReactor : public AsyncWriteReactorBase<Proto> {
  public:
-  DoGetReactor(::grpc::CallbackServerContext* context, GrpcServerCallContext flight_context,
-               std::unique_ptr<FlightDataStream> stream)
-      : context_(context),
-        executor_(GetAsyncGrpcWorkerPool()),
-        flight_context_(std::move(flight_context)),
+  using NextFn = std::function<arrow::Result<std::unique_ptr<UserType>>()>;
+  using ToProtoFn = std::function<Status(const UserType&, Proto*)>;
+
+  IteratorReactor(::grpc::CallbackServerContext* context,
+                  std::shared_ptr<arrow::internal::ThreadPool> executor,
+                  GrpcServerCallContext flight_context, NextFn next_fn, ToProtoFn to_proto)
+      : AsyncWriteReactorBase<Proto>(context, std::move(executor),
+                                     std::move(flight_context)),
+        next_fn_(std::move(next_fn)),
+        to_proto_(std::move(to_proto)) {}
+
+  void Start() {
+    auto status = ScheduleAdvance();
+    if (!status.ok()) {
+      this->FinishOnce(this->flight_context_.FinishRequest(status));
+    }
+  }
+
+  void OnWriteDone(bool ok) override {
+    if (!ok) {
+      this->FinishOnce(this->flight_context_.FinishRequest(Status::OK()));
+      return;
+    }
+    auto status = ScheduleAdvance();
+    if (!status.ok()) {
+      this->FinishOnce(this->flight_context_.FinishRequest(status));
+    }
+  }
+
+ private:
+  Status ScheduleAdvance() {
+    return this->StartBackgroundWork([this] {
+      if (this->cancelled()) {
+        return;
+      }
+
+      auto maybe_value = next_fn_();
+      if (!maybe_value.ok()) {
+        this->FinishOnce(this->flight_context_.FinishRequest(maybe_value.status()));
+        return;
+      }
+
+      auto value = std::move(maybe_value).ValueUnsafe();
+      if (!value) {
+        this->FinishOnce(this->flight_context_.FinishRequest(Status::OK()));
+        return;
+      }
+
+      Proto proto;
+      auto st = to_proto_(*value, &proto);
+      if (!st.ok()) {
+        this->FinishOnce(this->flight_context_.FinishRequest(st));
+        return;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        if (this->cancelled()) {
+          return;
+        }
+        this->current_write_ = std::move(proto);
+      }
+      this->StartWrite(&this->current_write_);
+    });
+  }
+
+  NextFn next_fn_;
+  ToProtoFn to_proto_;
+};
+
+class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
+ public:
+  DoGetReactor(::grpc::CallbackServerContext* context,
+               std::shared_ptr<arrow::internal::ThreadPool> executor,
+               GrpcServerCallContext flight_context, std::unique_ptr<FlightDataStream> stream)
+      : AsyncWriteReactorBase<pb::FlightData>(context, std::move(executor),
+                                              std::move(flight_context)),
         stream_(std::move(stream)) {}
 
   void Start() {
     auto status = ScheduleAdvance();
     if (!status.ok()) {
-      FinishOnce(flight_context_.FinishRequest(status));
+      this->FinishOnce(this->flight_context_.FinishRequest(status));
     }
   }
 
   void OnWriteDone(bool ok) override {
     if (flight_data_registered_) {
-      transport::grpc::UnregisterGrpcFlightDataMessage(&current_write_);
+      transport::grpc::UnregisterGrpcFlightDataMessage(&this->current_write_);
       flight_data_registered_ = false;
     }
     if (!ok) {
-      FinishOnce(flight_context_.FinishRequest(Status::OK()));
+      this->FinishOnce(this->flight_context_.FinishRequest(Status::OK()));
       return;
     }
     auto status = ScheduleAdvance();
     if (!status.ok()) {
-      FinishOnce(flight_context_.FinishRequest(status));
+      this->FinishOnce(this->flight_context_.FinishRequest(status));
     }
   }
 
-  void OnCancel() override { cancelled_.store(true, std::memory_order_relaxed); }
-
   void OnDone() override {
     if (flight_data_registered_) {
-      transport::grpc::UnregisterGrpcFlightDataMessage(&current_write_);
+      transport::grpc::UnregisterGrpcFlightDataMessage(&this->current_write_);
       flight_data_registered_ = false;
     }
-    ReleaseRef();
+    AsyncWriteReactorBase<pb::FlightData>::OnDone();
   }
 
  private:
   enum class Stage { kSchema, kPayloads, kFinish };
 
   Status ScheduleAdvance() {
-    refs_.fetch_add(1, std::memory_order_relaxed);
-    auto maybe_future = executor_->Submit([this] {
-      if (cancelled_.load(std::memory_order_relaxed)) {
-        ReleaseRef();
+    return this->StartBackgroundWork([this] {
+      if (this->cancelled()) {
         return;
       }
 
       if (!stream_) {
-        FinishOnce(flight_context_.FinishRequest(Status::KeyError("No data in this flight")));
-        ReleaseRef();
+        this->FinishOnce(
+            this->flight_context_.FinishRequest(Status::KeyError("No data in this flight")));
         return;
       }
 
       if (stage_ == Stage::kSchema) {
         auto maybe_schema = stream_->GetSchemaPayload();
         if (!maybe_schema.ok()) {
-          FinishOnce(flight_context_.FinishRequest(maybe_schema.status()));
-          ReleaseRef();
+          this->FinishOnce(this->flight_context_.FinishRequest(maybe_schema.status()));
           return;
         }
         auto status = StartPayloadWrite(std::move(maybe_schema).MoveValueUnsafe());
         if (!status.ok()) {
-          FinishOnce(flight_context_.FinishRequest(status));
-          ReleaseRef();
+          this->FinishOnce(this->flight_context_.FinishRequest(status));
           return;
         }
         stage_ = Stage::kPayloads;
-        ReleaseRef();
         return;
       }
 
       if (stage_ == Stage::kPayloads) {
         auto maybe_payload = stream_->Next();
         if (!maybe_payload.ok()) {
-          FinishOnce(flight_context_.FinishRequest(maybe_payload.status()));
-          ReleaseRef();
+          this->FinishOnce(this->flight_context_.FinishRequest(maybe_payload.status()));
           return;
         }
         auto payload = std::move(maybe_payload).MoveValueUnsafe();
@@ -1351,58 +1318,30 @@ class DoGetReactor : public ::grpc::ServerWriteReactor<pb::FlightData> {
         } else {
           auto status = StartPayloadWrite(std::move(payload));
           if (!status.ok()) {
-            FinishOnce(flight_context_.FinishRequest(status));
+            this->FinishOnce(this->flight_context_.FinishRequest(status));
           }
-          ReleaseRef();
           return;
         }
       }
 
       auto close_status = stream_->Close();
-      FinishOnce(flight_context_.FinishRequest(close_status));
-      ReleaseRef();
+      this->FinishOnce(this->flight_context_.FinishRequest(close_status));
     });
-    if (!maybe_future.ok()) {
-      ReleaseRef();
-      return maybe_future.status();
-    }
-    return Status::OK();
   }
 
   Status StartPayloadWrite(FlightPayload payload) {
-    ARROW_ASSIGN_OR_RAISE(current_write_, SerializeFlightPayload(payload));
-    if (cancelled_.load(std::memory_order_relaxed)) {
+    ARROW_ASSIGN_OR_RAISE(this->current_write_, SerializeFlightPayload(payload));
+    if (this->cancelled()) {
       return Status::OK();
     }
-    transport::grpc::RegisterGrpcFlightDataMessage(&current_write_);
+    transport::grpc::RegisterGrpcFlightDataMessage(&this->current_write_);
     flight_data_registered_ = true;
-    this->StartWrite(&current_write_);
+    this->StartWrite(&this->current_write_);
     return Status::OK();
   }
-
-  void FinishOnce(::grpc::Status status) {
-    bool expected = false;
-    if (finished_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-      this->Finish(std::move(status));
-    }
-  }
-
-  void ReleaseRef() {
-    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      delete this;
-    }
-  }
-
-  ::grpc::CallbackServerContext* context_;
-  arrow::internal::Executor* executor_;
-  GrpcServerCallContext flight_context_;
   std::unique_ptr<FlightDataStream> stream_;
-  pb::FlightData current_write_;
   Stage stage_ = Stage::kSchema;
   bool flight_data_registered_ = false;
-  std::atomic<bool> cancelled_{false};
-  std::atomic<bool> finished_{false};
-  std::atomic<int> refs_{1};
 };
 
 ::grpc::ServerBidiReactor<pb::HandshakeRequest, pb::HandshakeResponse>*
@@ -1411,11 +1350,14 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
    public:
     Reactor(::grpc::CallbackServerContext* context, AsyncGrpcServerTransport* impl,
             const CallbackServiceHelper& helper)
-        : BidiReactorBase(context), impl_(impl), helper_(helper), flight_context_(context) {}
+        : BidiReactorBase(context, impl->executor()),
+          impl_(impl),
+          helper_(helper),
+          flight_context_(context) {}
 
     void Start() {
-      auto st = helper_.MakeCallContext(FlightMethod::Handshake, this->context_,
-                                        &flight_context_);
+      auto st =
+          helper_.MakeCallContext(FlightMethod::Handshake, this->context_, &flight_context_);
       if (!st.ok()) {
         this->Finish(st);
         return;
@@ -1456,11 +1398,11 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
 ::grpc::ServerWriteReactor<pb::FlightInfo>* CallbackFlightService::ListFlights(
     ::grpc::CallbackServerContext* context, const pb::Criteria* request) {
   GrpcServerCallContext flight_context(context);
-  auto st = helper_.CheckAuth(FlightMethod::ListFlights, context, &flight_context);
+  auto st =
+      PrepareAuthenticatedCall(helper_, FlightMethod::ListFlights, context, &flight_context);
   if (!st.ok()) {
     return FinishWriteNow<pb::FlightInfo>(st);
   }
-  helper_.AddMiddlewareHeaders(context, &flight_context);
 
   Criteria criteria;
   if (request) {
@@ -1475,7 +1417,7 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
       std::make_shared<std::unique_ptr<FlightListing>>(
           std::move(maybe_listing).MoveResult().ValueUnsafe());
   auto* reactor = new IteratorReactor<pb::FlightInfo, FlightInfo>(
-      context, std::move(flight_context),
+      context, impl_->executor(), std::move(flight_context),
       [listing]() mutable {
         return *listing ? (*listing)->Next()
                        : arrow::Result<std::unique_ptr<FlightInfo>>(
@@ -1491,27 +1433,20 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
     pb::FlightInfo* response) {
   auto* reactor = context->DefaultReactor();
   GrpcServerCallContext flight_context(context);
-  auto st = helper_.CheckAuth(FlightMethod::GetFlightInfo, context, &flight_context);
+  auto st = PrepareAuthenticatedCall(helper_, FlightMethod::GetFlightInfo, context,
+                                     &flight_context);
   if (!st.ok()) return FinishNow(reactor, st);
-  if (request == nullptr) {
-    return FinishNow(reactor, flight_context.FinishRequest(
-                                  Status::Invalid("FlightDescriptor cannot be null")));
-  }
   FlightDescriptor descr;
-  auto arrow_st = internal::FromProto(*request, &descr);
+  auto arrow_st = ParseRequiredRequest(request, "FlightDescriptor", &descr);
   if (!arrow_st.ok()) return FinishNow(reactor, flight_context.FinishRequest(arrow_st));
-  helper_.AddMiddlewareHeaders(context, &flight_context);
   impl_->base()->GetFlightInfo(flight_context, descr).AddCallback(
       [reactor, response, flight_context = std::move(flight_context)](
           const arrow::Result<std::unique_ptr<FlightInfo>>& result) mutable {
-        if (result.ok() && result.ValueUnsafe()) {
-          auto st = internal::ToProto(*result.ValueUnsafe(), response);
-          reactor->Finish(flight_context.FinishRequest(st));
-          return;
-        }
-        reactor->Finish(flight_context.FinishRequest(result.ok()
-                                                         ? Status::KeyError("Flight not found")
-                                                         : result.status()));
+        FinishUnaryResult(
+            reactor, response, std::move(flight_context), result, "Flight not found",
+            [](const FlightInfo& info, pb::FlightInfo* out) {
+              return internal::ToProto(info, out);
+            });
       });
   return reactor;
 }
@@ -1521,27 +1456,20 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
     pb::PollInfo* response) {
   auto* reactor = context->DefaultReactor();
   GrpcServerCallContext flight_context(context);
-  auto st = helper_.CheckAuth(FlightMethod::PollFlightInfo, context, &flight_context);
+  auto st = PrepareAuthenticatedCall(helper_, FlightMethod::PollFlightInfo, context,
+                                     &flight_context);
   if (!st.ok()) return FinishNow(reactor, st);
-  if (request == nullptr) {
-    return FinishNow(reactor, flight_context.FinishRequest(
-                                  Status::Invalid("FlightDescriptor cannot be null")));
-  }
   FlightDescriptor descr;
-  auto arrow_st = internal::FromProto(*request, &descr);
+  auto arrow_st = ParseRequiredRequest(request, "FlightDescriptor", &descr);
   if (!arrow_st.ok()) return FinishNow(reactor, flight_context.FinishRequest(arrow_st));
-  helper_.AddMiddlewareHeaders(context, &flight_context);
   impl_->base()->PollFlightInfo(flight_context, descr).AddCallback(
       [reactor, response, flight_context = std::move(flight_context)](
           const arrow::Result<std::unique_ptr<PollInfo>>& result) mutable {
-        if (result.ok() && result.ValueUnsafe()) {
-          auto st = internal::ToProto(*result.ValueUnsafe(), response);
-          reactor->Finish(flight_context.FinishRequest(st));
-          return;
-        }
-        reactor->Finish(flight_context.FinishRequest(result.ok()
-                                                         ? Status::KeyError("Flight not found")
-                                                         : result.status()));
+        FinishUnaryResult(
+            reactor, response, std::move(flight_context), result, "Flight not found",
+            [](const PollInfo& info, pb::PollInfo* out) {
+              return internal::ToProto(info, out);
+            });
       });
   return reactor;
 }
@@ -1551,27 +1479,20 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
     pb::SchemaResult* response) {
   auto* reactor = context->DefaultReactor();
   GrpcServerCallContext flight_context(context);
-  auto st = helper_.CheckAuth(FlightMethod::GetSchema, context, &flight_context);
+  auto st =
+      PrepareAuthenticatedCall(helper_, FlightMethod::GetSchema, context, &flight_context);
   if (!st.ok()) return FinishNow(reactor, st);
-  if (request == nullptr) {
-    return FinishNow(reactor, flight_context.FinishRequest(
-                                  Status::Invalid("FlightDescriptor cannot be null")));
-  }
   FlightDescriptor descr;
-  auto arrow_st = internal::FromProto(*request, &descr);
+  auto arrow_st = ParseRequiredRequest(request, "FlightDescriptor", &descr);
   if (!arrow_st.ok()) return FinishNow(reactor, flight_context.FinishRequest(arrow_st));
-  helper_.AddMiddlewareHeaders(context, &flight_context);
   impl_->base()->GetSchema(flight_context, descr).AddCallback(
       [reactor, response, flight_context = std::move(flight_context)](
           const arrow::Result<std::unique_ptr<SchemaResult>>& result) mutable {
-        if (result.ok() && result.ValueUnsafe()) {
-          auto st = internal::ToProto(*result.ValueUnsafe(), response);
-          reactor->Finish(flight_context.FinishRequest(st));
-          return;
-        }
-        reactor->Finish(flight_context.FinishRequest(result.ok()
-                                                         ? Status::KeyError("Flight not found")
-                                                         : result.status()));
+        FinishUnaryResult(
+            reactor, response, std::move(flight_context), result, "Flight not found",
+            [](const SchemaResult& schema, pb::SchemaResult* out) {
+              return internal::ToProto(schema, out);
+            });
       });
   return reactor;
 }
@@ -1579,23 +1500,18 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
 ::grpc::ServerWriteReactor<pb::FlightData>* CallbackFlightService::DoGet(
     ::grpc::CallbackServerContext* context, const pb::Ticket* request) {
   GrpcServerCallContext flight_context(context);
-  auto st = helper_.CheckAuth(FlightMethod::DoGet, context, &flight_context);
+  auto st = PrepareAuthenticatedCall(helper_, FlightMethod::DoGet, context, &flight_context);
   if (!st.ok()) return FinishWriteNow<pb::FlightData>(st);
-  if (request == nullptr) {
-    return FinishWriteNow<pb::FlightData>(
-        flight_context.FinishRequest(Status::Invalid("ticket cannot be null")));
-  }
   Ticket ticket;
-  auto arrow_st = internal::FromProto(*request, &ticket);
+  auto arrow_st = ParseRequiredRequest(request, "ticket", &ticket);
   if (!arrow_st.ok()) {
     return FinishWriteNow<pb::FlightData>(flight_context.FinishRequest(arrow_st));
   }
-  helper_.AddMiddlewareHeaders(context, &flight_context);
   auto maybe_stream = impl_->base()->DoGet(flight_context, ticket);
   if (!maybe_stream.status().ok()) {
     return FinishWriteNow<pb::FlightData>(flight_context.FinishRequest(maybe_stream.status()));
   }
-  auto* reactor = new DoGetReactor(context, std::move(flight_context),
+  auto* reactor = new DoGetReactor(context, impl_->executor(), std::move(flight_context),
                                    std::move(maybe_stream).MoveResult().ValueUnsafe());
   reactor->Start();
   return reactor;
@@ -1607,15 +1523,18 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
    public:
     Reactor(::grpc::CallbackServerContext* context, AsyncGrpcServerTransport* impl,
             const CallbackServiceHelper& helper)
-        : BidiReactorBase(context), impl_(impl), helper_(helper), flight_context_(context) {}
+        : BidiReactorBase(context, impl->executor()),
+          impl_(impl),
+          helper_(helper),
+          flight_context_(context) {}
 
     void Start() {
-      auto st = helper_.CheckAuth(FlightMethod::DoPut, this->context_, &flight_context_);
+      auto st = PrepareAuthenticatedCall(helper_, FlightMethod::DoPut, this->context_,
+                                         &flight_context_);
       if (!st.ok()) {
         this->Finish(st);
         return;
       }
-      helper_.AddMiddlewareHeaders(this->context_, &flight_context_);
       this->Hold();
       impl_->MakeAsyncMessageReader(this).AddCallback(
           [this](const ::arrow::Result<std::unique_ptr<AsyncFlightMessageReader>>& maybe_reader)
@@ -1656,15 +1575,18 @@ CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
    public:
     Reactor(::grpc::CallbackServerContext* context, AsyncGrpcServerTransport* impl,
             const CallbackServiceHelper& helper)
-        : BidiReactorBase(context), impl_(impl), helper_(helper), flight_context_(context) {}
+        : BidiReactorBase(context, impl->executor()),
+          impl_(impl),
+          helper_(helper),
+          flight_context_(context) {}
 
     void Start() {
-      auto st = helper_.CheckAuth(FlightMethod::DoExchange, this->context_, &flight_context_);
+      auto st = PrepareAuthenticatedCall(helper_, FlightMethod::DoExchange,
+                                         this->context_, &flight_context_);
       if (!st.ok()) {
         this->Finish(st);
         return;
       }
-      helper_.AddMiddlewareHeaders(this->context_, &flight_context_);
       this->Hold();
       impl_->MakeAsyncMessageReader(this).AddCallback(
           [this](const ::arrow::Result<std::unique_ptr<AsyncFlightMessageReader>>& maybe_reader)
@@ -1702,9 +1624,9 @@ CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
 ::grpc::ServerWriteReactor<pb::ActionType>* CallbackFlightService::ListActions(
     ::grpc::CallbackServerContext* context, const pb::Empty*) {
   GrpcServerCallContext flight_context(context);
-  auto st = helper_.CheckAuth(FlightMethod::ListActions, context, &flight_context);
+  auto st =
+      PrepareAuthenticatedCall(helper_, FlightMethod::ListActions, context, &flight_context);
   if (!st.ok()) return FinishWriteNow<pb::ActionType>(st);
-  helper_.AddMiddlewareHeaders(context, &flight_context);
   auto maybe_actions = impl_->base()->ListActions(flight_context);
   if (!maybe_actions.status().ok()) {
     return FinishWriteNow<pb::ActionType>(
@@ -1717,7 +1639,7 @@ CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
     return std::make_unique<ActionType>(actions[index++]);
   };
   auto* reactor = new IteratorReactor<pb::ActionType, ActionType>(
-      context, std::move(flight_context), std::move(next),
+      context, impl_->executor(), std::move(flight_context), std::move(next),
       [](const ActionType& action, pb::ActionType* out) {
         return internal::ToProto(action, out);
       });
@@ -1728,18 +1650,13 @@ CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
 ::grpc::ServerWriteReactor<pb::Result>* CallbackFlightService::DoAction(
     ::grpc::CallbackServerContext* context, const pb::Action* request) {
   GrpcServerCallContext flight_context(context);
-  auto st = helper_.CheckAuth(FlightMethod::DoAction, context, &flight_context);
+  auto st = PrepareAuthenticatedCall(helper_, FlightMethod::DoAction, context, &flight_context);
   if (!st.ok()) return FinishWriteNow<pb::Result>(st);
-  if (request == nullptr) {
-    return FinishWriteNow<pb::Result>(
-        flight_context.FinishRequest(Status::Invalid("Action cannot be null")));
-  }
   Action action;
-  auto arrow_st = internal::FromProto(*request, &action);
+  auto arrow_st = ParseRequiredRequest(request, "Action", &action);
   if (!arrow_st.ok()) {
     return FinishWriteNow<pb::Result>(flight_context.FinishRequest(arrow_st));
   }
-  helper_.AddMiddlewareHeaders(context, &flight_context);
   auto maybe_results = impl_->base()->DoAction(flight_context, action);
   if (!maybe_results.status().ok()) {
     return FinishWriteNow<pb::Result>(flight_context.FinishRequest(maybe_results.status()));
@@ -1752,7 +1669,7 @@ CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
         flight_context.FinishRequest(::grpc::Status::CANCELLED));
   }
   auto* reactor = new IteratorReactor<pb::Result, Result>(
-      context, std::move(flight_context),
+      context, impl_->executor(), std::move(flight_context),
       [results]() mutable {
         return *results ? (*results)->Next()
                        : arrow::Result<std::unique_ptr<arrow::flight::Result>>(

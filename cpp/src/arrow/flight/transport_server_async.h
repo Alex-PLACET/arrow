@@ -36,6 +36,11 @@ class AsyncServerTransport;
 ///
 /// \param[in] base The async Flight server whose RPC methods will be called.
 /// \param[in] memory_manager The memory manager for buffer allocations.
+///
+/// The current implementation uses the gRPC callback transport explicitly. It
+/// keeps gRPC reactor details transport-internal and exposes only
+/// AsyncFlightServerBase and the Arrow-native async stream interfaces to
+/// applications.
 ARROW_FLIGHT_EXPORT
 arrow::Result<std::unique_ptr<internal::AsyncServerTransport>>
 MakeGrpcCallbackServerTransport(AsyncFlightServerBase* base,

@@ -41,14 +41,16 @@ class ARROW_FLIGHT_EXPORT AsyncFlightMessageReader {
   ///
   /// This may require consuming inbound Flight data and dictionary messages.
   /// It is safe to call multiple times after the schema has been decoded.
-  /// Concurrent calls to GetSchema() and/or Next() are not supported.
+  /// Concurrent calls to GetSchema() and/or Next() are not supported. Callers
+  /// should wait for the returned Future to finish before issuing another read.
   virtual Future<std::shared_ptr<Schema>> GetSchema() = 0;
 
   /// \brief Read the next logical Flight stream chunk.
   ///
   /// A returned chunk may contain a record batch, application metadata only,
   /// or both fields set to null to indicate end-of-stream.
-  /// Concurrent calls to Next() and/or GetSchema() are not supported.
+  /// Concurrent calls to Next() and/or GetSchema() are not supported. Chunks
+  /// are ordered exactly as they arrive on the Flight stream.
   virtual Future<FlightStreamChunk> Next() = 0;
 
   virtual arrow::ipc::ReadStats stats() const = 0;
@@ -60,7 +62,8 @@ class ARROW_FLIGHT_EXPORT AsyncFlightMetadataWriter {
 
   /// \brief Send a DoPut application metadata message to the client.
   ///
-  /// Calls are ordered. Concurrent writes are not supported.
+  /// Calls are ordered. Concurrent writes are not supported, so each returned
+  /// Future should finish before the next write is issued.
   virtual Future<> WriteMetadata(const Buffer& app_metadata) = 0;
 };
 
@@ -97,11 +100,28 @@ class ARROW_FLIGHT_EXPORT AsyncFlightMessageWriter {
 };
 
 /// \brief Skeleton asynchronous RPC server implementation.
+///
+/// AsyncFlightServerBase is a parallel server model to FlightServerBase. It
+/// preserves the same Flight RPC surface and lifecycle methods, but RPC hooks
+/// return Futures and can use async-native stream reader/writer interfaces for
+/// bidirectional data movement.
+///
+/// The public API is transport-agnostic: subclasses do not interact with gRPC
+/// reactor types directly. Transport adapters are responsible for bridging
+/// between the callback transport and these Arrow-native interfaces.
+///
+/// There is intentionally no automatic bridge between the synchronous and
+/// asynchronous server hooks. In particular, subclasses that need async DoPut
+/// or DoExchange support must override DoPutAsync() and DoExchangeAsync()
+/// explicitly.
 class ARROW_FLIGHT_EXPORT AsyncFlightServerBase {
  public:
   AsyncFlightServerBase();
   virtual ~AsyncFlightServerBase();
 
+  /// \brief Initialize the underlying server transport.
+  ///
+  /// Init() must be called before Serve(), Shutdown(), or Wait().
   Status Init(const FlightServerOptions& options);
   int port() const;
   Location location() const;
@@ -111,18 +131,26 @@ class ARROW_FLIGHT_EXPORT AsyncFlightServerBase {
   Status Shutdown(const std::chrono::system_clock::time_point* deadline = NULLPTR);
   Status Wait();
 
+  /// \brief Authenticate the client handshake stream.
+  ///
+  /// The default implementation returns NotImplemented.
   virtual Future<> Handshake(const ServerCallContext& context,
                              std::unique_ptr<ServerAuthSender> outgoing,
                              std::unique_ptr<ServerAuthReader> incoming);
 
+  /// \brief Enumerate available flights.
   virtual Future<std::unique_ptr<FlightListing>> ListFlights(
       const ServerCallContext& context, const Criteria* criteria);
+  /// \brief Resolve FlightInfo for a descriptor.
   virtual Future<std::unique_ptr<FlightInfo>> GetFlightInfo(
       const ServerCallContext& context, const FlightDescriptor& request);
+  /// \brief Resolve PollInfo for a descriptor.
   virtual Future<std::unique_ptr<PollInfo>> PollFlightInfo(
       const ServerCallContext& context, const FlightDescriptor& request);
+  /// \brief Resolve schema metadata for a descriptor.
   virtual Future<std::unique_ptr<SchemaResult>> GetSchema(
       const ServerCallContext& context, const FlightDescriptor& request);
+  /// \brief Create a server-to-client data stream.
   virtual Future<std::unique_ptr<FlightDataStream>> DoGet(
       const ServerCallContext& context, const Ticket& request);
   /// \brief Handle DoPut using the async-native stream API.

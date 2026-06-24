@@ -118,9 +118,14 @@ Status FlightServerBase::Shutdown(const std::chrono::system_clock::time_point* d
       deadline);
 }
 
-Status FlightServerBase::Wait() { return impl_->signal_state_.Wait([this] {
-  return impl_->transport_->Wait();
-}); }
+Status FlightServerBase::Wait() {
+  return impl_->signal_state_.Wait([this] {
+    if (!impl_->transport_) {
+      return Status::Invalid("Wait() on uninitialized FlightServerBase");
+    }
+    return impl_->transport_->Wait();
+  });
+}
 
 Status FlightServerBase::ListFlights(const ServerCallContext& context,
                                      const Criteria* criteria,
