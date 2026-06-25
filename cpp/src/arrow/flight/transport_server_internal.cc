@@ -329,4 +329,39 @@ Status WriteDataStream(std::unique_ptr<FlightDataStream> data_stream,
   return data_stream->Close();
 }
 
+arrow::Result<arrow::util::Uri> ParseLocationUri(const Location& location) {
+  return arrow::util::Uri::FromString(location.ToString());
+}
+
+int PortFromLocation(const Location& location) {
+  auto maybe_uri = ParseLocationUri(location);
+  if (!maybe_uri.ok()) {
+    return -1;
+  }
+  return maybe_uri.ValueUnsafe().port();
+}
+
+arrow::Result<std::unique_ptr<FlightMessageReader>>
+ServerTransportBase::MakeMessageReader(ServerDataStream* stream) const {
+  auto reader = std::unique_ptr<TransportMessageReader>(
+      new TransportMessageReader(stream, memory_manager_));
+  RETURN_NOT_OK(reader->Init());
+  return std::unique_ptr<FlightMessageReader>(std::move(reader));
+}
+
+std::unique_ptr<FlightMetadataWriter> ServerTransportBase::MakeMetadataWriter(
+    ServerDataStream* stream) const {
+  return std::unique_ptr<FlightMetadataWriter>(new TransportMetadataWriter(stream));
+}
+
+std::unique_ptr<FlightMessageWriter> ServerTransportBase::MakeMessageWriter(
+    ServerDataStream* stream) const {
+  return std::unique_ptr<FlightMessageWriter>(new TransportMessageWriter(stream));
+}
+
+Status ServerTransportBase::WriteDataStream(std::unique_ptr<FlightDataStream> data_stream,
+                                            ServerDataStream* stream) const {
+  return arrow::flight::internal::WriteDataStream(std::move(data_stream), stream);
+}
+
 }  // namespace arrow::flight::internal

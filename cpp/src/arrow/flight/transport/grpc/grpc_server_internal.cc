@@ -19,7 +19,19 @@
 
 #include <sstream>
 
+#include <grpcpp/support/server_callback.h>
+
 namespace arrow::flight::transport::grpc {
+
+::grpc::Status FinishGrpcServerStatus(const Status& arrow_status,
+                                      ::grpc::ServerContext* context) {
+  return ToGrpcStatus(arrow_status, context);
+}
+
+::grpc::Status FinishGrpcServerStatus(const Status& arrow_status,
+                                      ::grpc::CallbackServerContext* context) {
+  return ToGrpcStatus(arrow_status, context);
+}
 
 arrow::Result<GrpcServerEndpoint> ParseServerEndpoint(const FlightServerOptions& options,
                                                       const arrow::util::Uri& uri) {
@@ -70,6 +82,36 @@ void ConfigureServerBuilderOptions(const FlightServerOptions& options,
   if (options.builder_hook) {
     options.builder_hook(builder);
   }
+}
+
+Status StartFlightGrpcServer(const FlightServerOptions& options,
+                             const arrow::util::Uri& uri, ::grpc::Service* service,
+                             std::unique_ptr<::grpc::Server>* server,
+                             Location* location) {
+  ::grpc::ServerBuilder builder;
+  int port = 0;
+  ARROW_ASSIGN_OR_RAISE(auto endpoint, ParseServerEndpoint(options, uri));
+  *location = endpoint.location;
+  if (uri.scheme() == kSchemeGrpcUnix) {
+    builder.AddListeningPort(endpoint.address, endpoint.credentials);
+  } else {
+    builder.AddListeningPort(endpoint.address, endpoint.credentials, &port);
+  }
+
+  builder.RegisterService(service);
+  ConfigureServerBuilderOptions(options, &builder);
+  *server = builder.BuildAndStart();
+  if (!*server) {
+    return Status::UnknownError("Server did not start properly");
+  }
+  if (uri.scheme() == kSchemeGrpcTls) {
+    ARROW_ASSIGN_OR_RAISE(
+        *location, Location::ForGrpcTls(arrow::util::UriEncodeHost(uri.host()), port));
+  } else if (uri.scheme() == kSchemeGrpc || uri.scheme() == kSchemeGrpcTcp) {
+    ARROW_ASSIGN_OR_RAISE(
+        *location, Location::ForGrpcTcp(arrow::util::UriEncodeHost(uri.host()), port));
+  }
+  return Status::OK();
 }
 
 }  // namespace arrow::flight::transport::grpc
