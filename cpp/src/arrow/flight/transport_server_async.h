@@ -30,6 +30,10 @@ namespace arrow::flight {
 
 namespace internal {
 class AsyncServerTransport;
+
+arrow::Result<std::unique_ptr<AsyncServerTransport>> MakeAsyncServerTransport(
+    const std::string& scheme, AsyncFlightServerBase* base,
+    std::shared_ptr<MemoryManager> memory_manager);
 }
 
 /// \brief Create an async server transport backed by gRPC callback API.

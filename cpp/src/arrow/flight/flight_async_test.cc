@@ -648,6 +648,14 @@ class AsyncPollFlightInfoTestServer : public AsyncFlightServerBase {
  public:
   Future<std::unique_ptr<PollInfo>> PollFlightInfo(
       const ServerCallContext&, const FlightDescriptor& descriptor) override {
+    if (descriptor == FlightDescriptor::Command("missing")) {
+      return Future<std::unique_ptr<PollInfo>>::MakeFinished(
+          std::unique_ptr<PollInfo>{});
+    }
+    if (descriptor == FlightDescriptor::Command("error")) {
+      return Future<std::unique_ptr<PollInfo>>::MakeFinished(
+          Status::KeyError("Expected missing flight"));
+    }
     auto schema = arrow::schema({arrow::field("number", arrow::uint32(), false)});
     std::vector<FlightEndpoint> endpoints = {
         FlightEndpoint{{"long-running query"}, {}, std::nullopt, ""}};
@@ -767,12 +775,16 @@ class AsyncHeaderRecordingClientMiddlewareFactory : public ClientMiddlewareFacto
 class AsyncMiddlewareContextTestServer : public AsyncFlightServerBase {
  public:
   Future<std::unique_ptr<ResultStream>> DoAction(const ServerCallContext& context,
-                                                 const Action&) override {
+                                                 const Action& action) override {
     const auto* middleware = context.GetMiddleware("request_counter");
     if (!middleware ||
         middleware->name() != "AsyncCountingServerMiddleware") {
       return Future<std::unique_ptr<ResultStream>>::MakeFinished(
           Status::Invalid("Could not find middleware"));
+    }
+    if (action.type == "middleware-error") {
+      return Future<std::unique_ptr<ResultStream>>::MakeFinished(
+          Status::Invalid("Expected middleware error"));
     }
     std::vector<Result> results = {
         Result{Buffer::FromString("middleware-ok")},
@@ -804,6 +816,18 @@ class AsyncThreadScalingTestServer : public AsyncFlightServerBase {
     auto info = std::move(maybe_info).ValueUnsafe();
     return Future<std::unique_ptr<FlightInfo>>::MakeFinished(
         std::make_unique<FlightInfo>(std::move(info)));
+  }
+};
+
+class AsyncTlsTestServer : public AsyncFlightServerBase {
+ public:
+  Future<std::unique_ptr<ResultStream>> DoAction(const ServerCallContext&,
+                                                 const Action&) override {
+    std::vector<Result> results = {
+        Result{Buffer::FromString("Hello, async TLS!")},
+    };
+    return Future<std::unique_ptr<ResultStream>>::MakeFinished(
+        std::make_unique<SimpleResultStream>(std::move(results)));
   }
 };
 
@@ -1043,6 +1067,31 @@ class AsyncConnectivityTest : public ::testing::Test {
     ASSERT_OK(server->Wait());
   }
 
+  void TestShutdownWithActiveExchange() {
+    auto server = std::make_unique<AsyncAdapterFlightServer>();
+    ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
+    FlightServerOptions options(location);
+    ASSERT_OK(server->Init(options));
+    ASSERT_OK_AND_ASSIGN(location, Location::ForGrpcTcp("127.0.0.1", server->port()));
+    ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(location));
+
+    ASSERT_OK_AND_ASSIGN(auto exchange, client->DoExchange(FlightDescriptor::Command("echo")));
+    ASSERT_OK(exchange.writer->Begin(ExampleIntSchema()));
+    RecordBatchVector batches;
+    ASSERT_OK(ExampleIntBatches(&batches));
+    ASSERT_OK(exchange.writer->WriteRecordBatch(*batches[0]));
+    ASSERT_OK_AND_ASSIGN(auto chunk, exchange.reader->Next());
+    ASSERT_NE(nullptr, chunk.data);
+    ASSERT_BATCHES_EQUAL(*batches[0], *chunk.data);
+
+    auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(10);
+    ASSERT_OK(server->Shutdown(&deadline));
+    ASSERT_OK(server->Wait());
+
+    ARROW_UNUSED(exchange.writer->Close());
+    ASSERT_OK(client->Close());
+  }
+
   void TestBrokenConnection() {
     auto server = std::make_unique<AsyncAdapterFlightServer>();
     ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
@@ -1070,6 +1119,9 @@ class AsyncConnectivityTest : public ::testing::Test {
   TEST_F(FIXTURE, ShutdownWithDeadline) {             \
     TestShutdownWithDeadline();                       \
   }                                                   \
+  TEST_F(FIXTURE, ShutdownWithActiveExchange) {       \
+    TestShutdownWithActiveExchange();                 \
+  }                                                   \
   TEST_F(FIXTURE, BrokenConnection) { TestBrokenConnection(); }
 
 class AsyncDataTest : public ::testing::Test {
@@ -1083,9 +1135,13 @@ class AsyncDataTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    ASSERT_OK(client_->Close());
-    ASSERT_OK(server_->Shutdown());
-    ASSERT_OK(server_->Wait());
+    if (client_) {
+      ASSERT_OK(client_->Close());
+    }
+    if (server_) {
+      ASSERT_OK(server_->Shutdown());
+      ASSERT_OK(server_->Wait());
+    }
   }
 
   Status ConnectClient() {
@@ -1634,9 +1690,13 @@ class AsyncAppMetadataTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    ASSERT_OK(client_->Close());
-    ASSERT_OK(server_->Shutdown());
-    ASSERT_OK(server_->Wait());
+    if (client_) {
+      ASSERT_OK(client_->Close());
+    }
+    if (server_) {
+      ASSERT_OK(server_->Shutdown());
+      ASSERT_OK(server_->Wait());
+    }
   }
 
   void TestDoGet();
@@ -1925,6 +1985,46 @@ class AsyncMiddlewareTest : public ::testing::Test {
   std::unique_ptr<AsyncFlightServerBase> server_;
 };
 
+class AsyncTlsTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    server_ = std::make_unique<AsyncTlsTestServer>();
+    ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTls("localhost", 0));
+    FlightServerOptions server_options(location);
+    auto st = ExampleTlsCertificates(&server_options.tls_certificates);
+    if (!st.ok()) {
+      GTEST_SKIP() << st.message();
+    }
+    ASSERT_OK(server_->Init(server_options));
+    server_initialized_ = true;
+
+    ASSERT_OK_AND_ASSIGN(location_, Location::ForGrpcTls("localhost", server_->port()));
+    FlightClientOptions client_options = FlightClientOptions::Defaults();
+    CertKeyPair root_cert;
+    st = ExampleTlsCertificateRoot(&root_cert);
+    if (!st.ok()) {
+      GTEST_SKIP() << st.message();
+    }
+    client_options.tls_root_certs = root_cert.pem_cert;
+    ASSERT_OK_AND_ASSIGN(client_, FlightClient::Connect(location_, client_options));
+  }
+
+  void TearDown() override {
+    if (client_) {
+      ASSERT_OK(client_->Close());
+    }
+    if (server_initialized_) {
+      ASSERT_OK(server_->Shutdown());
+      ASSERT_OK(server_->Wait());
+    }
+  }
+
+  Location location_;
+  std::unique_ptr<FlightClient> client_;
+  std::unique_ptr<AsyncFlightServerBase> server_;
+  bool server_initialized_ = false;
+};
+
 class AsyncNativeStreamContractServer : public AsyncFlightServerBase {
  public:
   Future<> concurrent_reads_result() const { return concurrent_reads_result_; }
@@ -2044,14 +2144,11 @@ TEST_F(AsyncNativeStreamApiTest, RejectsConcurrentWrites) {
   ASSERT_TRUE(concurrent_writes.Wait(1.0));
   ARROW_UNUSED(do_put.writer->Close());
   const auto status = concurrent_writes.status();
-  if (status.IsInvalid()) {
-    ASSERT_THAT(status.message(), HasSubstr("Concurrent async writes are not supported"));
-  } else {
-    ASSERT_OK(status);
-  }
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid, HasSubstr("Concurrent async writes are not supported"), status);
 }
 
-TEST_F(AsyncNativeStreamApiTest, DISABLED_WritesDictionaryBatches) {
+TEST_F(AsyncNativeStreamApiTest, WritesDictionaryBatches) {
   auto dict_writer_stats = server_impl_->dict_writer_stats_result();
   ASSERT_OK_AND_ASSIGN(auto exchange,
                        client_->DoExchange(FlightDescriptor::Command("dict_writer")));
@@ -2112,6 +2209,18 @@ TEST_F(AsyncPollFlightInfoTest, PollFlightInfoRoundTrip) {
   ASSERT_EQ(1.0, *completed->progress);
 }
 
+TEST_F(AsyncPollFlightInfoTest, PollFlightInfoNullResultMapsToNotFound) {
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      KeyError, HasSubstr("Flight not found"),
+      client_->PollFlightInfo(FlightDescriptor::Command("missing")));
+}
+
+TEST_F(AsyncPollFlightInfoTest, PollFlightInfoErrorPropagates) {
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      KeyError, HasSubstr("Expected missing flight"),
+      client_->PollFlightInfo(FlightDescriptor::Command("error")));
+}
+
 TEST_F(AsyncMiddlewareTest, MiddlewareRunsAndSendsHeaders) {
   client_middleware_->Reset();
 
@@ -2132,6 +2241,32 @@ TEST_F(AsyncMiddlewareTest, MiddlewareRunsAndSendsHeaders) {
   ASSERT_EQ(FlightMethod::DoAction, client_middleware_->recorded_calls_[0]);
   ASSERT_EQ(1U, client_middleware_->recorded_status_.size());
   ASSERT_TRUE(client_middleware_->recorded_status_[0].ok());
+}
+
+TEST_F(AsyncMiddlewareTest, MiddlewareRecordsFailedCalls) {
+  client_middleware_->Reset();
+
+  Action action{"middleware-error", Buffer::FromString("")};
+  ASSERT_OK_AND_ASSIGN(auto results, client_->DoAction(action));
+  EXPECT_RAISES_WITH_MESSAGE_THAT(Invalid, HasSubstr("Expected middleware error"),
+                                  results->Next());
+
+  ASSERT_EQ(0, request_counter_->successful_.load());
+  ASSERT_EQ(1, request_counter_->failed_.load());
+  ASSERT_GE(request_counter_->headers_sent_.load(), 1);
+  ASSERT_TRUE(client_middleware_->saw_expected_header_.load());
+  ASSERT_EQ(1U, client_middleware_->recorded_calls_.size());
+  ASSERT_EQ(FlightMethod::DoAction, client_middleware_->recorded_calls_[0]);
+  ASSERT_EQ(1U, client_middleware_->recorded_status_.size());
+  ASSERT_RAISES(Invalid, client_middleware_->recorded_status_[0]);
+}
+
+TEST_F(AsyncTlsTest, DoAction) {
+  Action action{"tls", Buffer::FromString("")};
+  ASSERT_OK_AND_ASSIGN(auto results, client_->DoAction(action));
+  ASSERT_OK_AND_ASSIGN(auto first, results->Next());
+  ASSERT_NE(nullptr, first);
+  ASSERT_EQ("Hello, async TLS!", first->body->ToString());
 }
 
 TEST_F(AsyncRpcCoverageTest, ListFlights) {
@@ -2156,9 +2291,15 @@ TEST_F(AsyncRpcCoverageTest, ListActions) {
 TEST_F(AsyncRpcCoverageTest, DoAction) {
   Action action{"action1", Buffer::FromString("hello")};
   ASSERT_OK_AND_ASSIGN(auto results, client_->DoAction(action));
-  ASSERT_OK_AND_ASSIGN(auto first, results->Next());
-  ASSERT_NE(nullptr, first);
-  ASSERT_EQ("hello-part0", first->body->ToString());
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_OK_AND_ASSIGN(auto result, results->Next());
+    ASSERT_NE(nullptr, result);
+    ASSERT_EQ("hello-part" + std::to_string(i), result->body->ToString());
+  }
+
+  ASSERT_OK_AND_ASSIGN(auto terminal, results->Next());
+  ASSERT_EQ(nullptr, terminal);
 }
 
 class GrpcAsyncServerConnectivityTest : public AsyncConnectivityTest {};

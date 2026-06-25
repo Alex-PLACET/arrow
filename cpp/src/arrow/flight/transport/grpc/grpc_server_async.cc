@@ -58,41 +58,6 @@ namespace {
 namespace pb = arrow::flight::protocol;
 using FlightService = pb::FlightService;
 
-template <typename GrpcMessage>
-arrow::Result<std::shared_ptr<Buffer>> SerializeGrpcMessage(const GrpcMessage& message) {
-  std::string serialized;
-  if (!message.SerializeToString(&serialized)) {
-    return Status::Invalid("Could not serialize gRPC message");
-  }
-  return Buffer::FromString(std::move(serialized));
-}
-
-arrow::Result<internal::FlightData> DeserializeGrpcFlightData(
-    const pb::FlightData& message) {
-  ARROW_ASSIGN_OR_RAISE(auto buffer, SerializeGrpcMessage(message));
-  return internal::DeserializeFlightData(buffer);
-}
-
-arrow::Result<pb::FlightData> SerializeFlightPayload(const FlightPayload& payload) {
-  RETURN_NOT_OK(payload.Validate());
-  ARROW_ASSIGN_OR_RAISE(auto buffers, internal::SerializePayloadToBuffers(payload));
-  int64_t size = 0;
-  for (const auto& buffer : buffers) {
-    size += buffer->size();
-  }
-  std::string serialized;
-  serialized.reserve(static_cast<size_t>(size));
-  for (const auto& buffer : buffers) {
-    serialized.append(reinterpret_cast<const char*>(buffer->data()),
-                      static_cast<size_t>(buffer->size()));
-  }
-  pb::FlightData message;
-  if (!message.ParseFromArray(serialized.data(), static_cast<int>(serialized.size()))) {
-    return Status::Invalid("Could not parse serialized FlightData");
-  }
-  return message;
-}
-
 using GrpcServerCallContext =
     transport::grpc::GrpcServerCallContext<::grpc::CallbackServerContext>;
 using CallbackServiceHelper =
@@ -151,14 +116,17 @@ class ImmediateWriteReactor final : public ::grpc::ServerWriteReactor<Proto> {
 template <typename Req, typename Resp>
 class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
  public:
+  using ReadValue =
+      std::conditional_t<std::is_same_v<Req, pb::FlightData>, internal::FlightData, Req>;
+  using WriteValue =
+      std::conditional_t<std::is_same_v<Resp, pb::FlightData>, FlightPayload, Resp>;
+  using AsyncReadValue =
+      std::conditional_t<std::is_same_v<Req, pb::FlightData>,
+                         std::shared_ptr<internal::FlightData>, std::optional<Req>>;
+
   BidiReactorBase(::grpc::CallbackServerContext* context,
                   std::shared_ptr<arrow::internal::ThreadPool> executor)
-      : context_(context), executor_(std::move(executor)) {
-    if constexpr (std::is_same_v<Req, pb::FlightData>) {
-      transport::grpc::RegisterGrpcFlightDataMessage(&read_buffer_);
-      read_buffer_registered_ = true;
-    }
-  }
+      : context_(context), executor_(std::move(executor)) {}
 
   Status StartWorker(std::function<void()> fn) {
     // For bidi RPCs the first read must be armed explicitly. After that, reads
@@ -169,7 +137,7 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
       read_started_ = true;
       read_in_flight_ = true;
     }
-    this->StartRead(&read_buffer_);
+    this->StartRead(GrpcReadBuffer());
     refs_.fetch_add(1, std::memory_order_relaxed);
     auto maybe_future = executor_->Submit([this, fn = std::move(fn)]() mutable {
       fn();
@@ -183,8 +151,8 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   }
 
   void OnReadDone(bool ok) override {
-    std::optional<Req> completed_read;
-    Future<std::optional<Req>> pending_future;
+    std::optional<ReadValue> completed_read;
+    Future<AsyncReadValue> pending_future;
     bool resolve_pending = false;
     bool start_next_read = false;
 
@@ -192,7 +160,7 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
       std::unique_lock<std::mutex> lock(mutex_);
       read_in_flight_ = false;
       if (ok) {
-        completed_read.emplace(read_buffer_);
+        completed_read.emplace(std::move(read_buffer_));
         if (!cancelled_) {
           read_in_flight_ = true;
           start_next_read = true;
@@ -200,7 +168,7 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
         if (pending_read_active_) {
           pending_future = pending_read_;
           pending_read_active_ = false;
-          pending_read_ = Future<std::optional<Req>>();
+          pending_read_ = Future<AsyncReadValue>();
           resolve_pending = true;
         } else {
           reads_.push_back(std::move(*completed_read));
@@ -210,7 +178,7 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
         if (pending_read_active_) {
           pending_future = pending_read_;
           pending_read_active_ = false;
-          pending_read_ = Future<std::optional<Req>>();
+          pending_read_ = Future<AsyncReadValue>();
           resolve_pending = true;
         }
       }
@@ -219,13 +187,13 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     if (start_next_read) {
       // Post the next read before resolving the waiting Future so EOF can race
       // with user callbacks without stalling the receive loop.
-      this->StartRead(&read_buffer_);
+      this->StartRead(GrpcReadBuffer());
     }
     if (resolve_pending) {
       if (ok) {
-        pending_future.MarkFinished(std::move(completed_read));
+        pending_future.MarkFinished(MakeAsyncReadValue(std::move(*completed_read)));
       } else {
-        pending_future.MarkFinished(std::optional<Req>{});
+        pending_future.MarkFinished(EndAsyncReadValue());
       }
     }
     cv_.notify_all();
@@ -235,13 +203,9 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     Future<bool> pending_future;
     bool resolve_pending = false;
     bool finish_now = false;
+    bool cancelled = false;
+    ::grpc::Status finish_status;
     std::unique_lock<std::mutex> lock(mutex_);
-    if constexpr (std::is_same_v<Resp, pb::FlightData>) {
-      if (flight_data_registered_) {
-        transport::grpc::UnregisterGrpcFlightDataMessage(&current_write_);
-        flight_data_registered_ = false;
-      }
-    }
     write_in_flight_ = false;
     write_ok_ = ok;
     if (pending_write_active_) {
@@ -252,13 +216,15 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     }
     if (finish_requested_) {
       finish_now = true;
+      finish_status = finish_status_;
     }
+    cancelled = cancelled_;
     lock.unlock();
     if (resolve_pending) {
-      pending_future.MarkFinished(!cancelled_ && write_ok_);
+      pending_future.MarkFinished(!cancelled && ok);
     }
     if (finish_now) {
-      this->Finish(finish_status_);
+      this->Finish(finish_status);
     }
     cv_.notify_all();
   }
@@ -269,49 +235,35 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     if (pending_read_active_) {
       auto future = pending_read_;
       pending_read_active_ = false;
-      pending_read_ = Future<std::optional<Req>>();
+      pending_read_ = Future<AsyncReadValue>();
       lock.unlock();
-      future.MarkFinished(std::optional<Req>{});
+      future.MarkFinished(EndAsyncReadValue());
       cv_.notify_all();
       return;
     }
     cv_.notify_all();
   }
 
-  void OnDone() override {
-    if constexpr (std::is_same_v<Req, pb::FlightData>) {
-      if (read_buffer_registered_) {
-        transport::grpc::UnregisterGrpcFlightDataMessage(&read_buffer_);
-        read_buffer_registered_ = false;
-      }
-    }
-    if constexpr (std::is_same_v<Resp, pb::FlightData>) {
-      if (flight_data_registered_) {
-        transport::grpc::UnregisterGrpcFlightDataMessage(&current_write_);
-        flight_data_registered_ = false;
-      }
-    }
-    ReleaseRef();
-  }
+  void OnDone() override { ReleaseRef(); }
 
   bool ReadOne(Req* out) { return PopRead(out); }
   bool WriteOnePublic(Resp message) { return WriteOne(std::move(message)); }
-  Future<std::optional<Req>> ReadOneAsync() {
+  Future<AsyncReadValue> ReadOneAsync() {
     bool start_initial_read = false;
     std::unique_lock<std::mutex> lock(mutex_);
     if (!reads_.empty()) {
-      Req out = std::move(reads_.front());
+      ReadValue out = std::move(reads_.front());
       reads_.pop_front();
-      return Future<std::optional<Req>>::MakeFinished(std::optional<Req>(std::move(out)));
+      return Future<AsyncReadValue>::MakeFinished(MakeAsyncReadValue(std::move(out)));
     }
     if (cancelled_ || reads_done_) {
-      return Future<std::optional<Req>>::MakeFinished(std::optional<Req>{});
+      return Future<AsyncReadValue>::MakeFinished(EndAsyncReadValue());
     }
     if (pending_read_active_) {
-      return Future<std::optional<Req>>::MakeFinished(
+      return Future<AsyncReadValue>::MakeFinished(
           Status::Invalid("Concurrent async reads are not supported"));
     }
-    pending_read_ = Future<std::optional<Req>>::Make();
+    pending_read_ = Future<AsyncReadValue>::Make();
     pending_read_active_ = true;
     if (!read_started_ && !read_in_flight_) {
       // DoPut/DoExchange do not call StartWorker(); their first consumer read
@@ -323,7 +275,7 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     auto future = pending_read_;
     lock.unlock();
     if (start_initial_read) {
-      this->StartRead(&read_buffer_);
+      this->StartRead(GrpcReadBuffer());
     }
     return future;
   }
@@ -340,12 +292,12 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     pending_write_active_ = true;
     current_write_ = std::move(message);
     write_in_flight_ = true;
-    this->StartWrite(&current_write_);
+    this->StartWrite(GrpcWriteBuffer());
     return pending_write_;
   }
   Future<bool> WritePayloadAsync(FlightPayload payload) {
     static_assert(std::is_same_v<Resp, pb::FlightData>);
-    ARROW_ASSIGN_OR_RAISE(current_write_, SerializeFlightPayload(payload));
+    RETURN_NOT_OK(payload.Validate());
     std::unique_lock<std::mutex> lock(mutex_);
     if (cancelled_) {
       return Future<bool>::MakeFinished(false);
@@ -356,22 +308,20 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     }
     pending_write_ = Future<bool>::Make();
     pending_write_active_ = true;
+    current_write_ = std::move(payload);
     write_in_flight_ = true;
-    transport::grpc::RegisterGrpcFlightDataMessage(&current_write_);
-    flight_data_registered_ = true;
-    this->StartWrite(&current_write_);
+    this->StartWrite(GrpcWriteBuffer());
     return pending_write_;
   }
   arrow::Result<bool> WritePayloadPublic(FlightPayload payload) {
     static_assert(std::is_same_v<Resp, pb::FlightData>);
-    ARROW_ASSIGN_OR_RAISE(current_write_, SerializeFlightPayload(payload));
+    RETURN_NOT_OK(payload.Validate());
     std::unique_lock<std::mutex> lock(mutex_);
     if (cancelled_) return false;
+    current_write_ = std::move(payload);
     write_in_flight_ = true;
     write_ok_ = true;
-    transport::grpc::RegisterGrpcFlightDataMessage(&current_write_);
-    flight_data_registered_ = true;
-    this->StartWrite(&current_write_);
+    this->StartWrite(GrpcWriteBuffer());
     cv_.wait(lock, [&] { return !write_in_flight_ || cancelled_; });
     return !cancelled_ && write_ok_;
   }
@@ -397,17 +347,24 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     current_write_ = std::move(message);
     write_in_flight_ = true;
     write_ok_ = true;
-    this->StartWrite(&current_write_);
+    this->StartWrite(GrpcWriteBuffer());
     cv_.wait(lock, [&] { return !write_in_flight_ || cancelled_; });
     return !cancelled_ && write_ok_;
   }
 
   void FinishFromWorker(::grpc::Status status) {
+    bool finish_now = false;
+    ::grpc::Status finish_status;
     std::unique_lock<std::mutex> lock(mutex_);
     finish_requested_ = true;
     finish_status_ = std::move(status);
     if (!write_in_flight_) {
-      this->Finish(finish_status_);
+      finish_now = true;
+      finish_status = finish_status_;
+    }
+    lock.unlock();
+    if (finish_now) {
+      this->Finish(finish_status);
     }
   }
 
@@ -417,17 +374,48 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     }
   }
 
+  Req* GrpcReadBuffer() {
+    if constexpr (std::is_same_v<Req, pb::FlightData>) {
+      return reinterpret_cast<Req*>(&read_buffer_);
+    } else {
+      return &read_buffer_;
+    }
+  }
+
+  Resp* GrpcWriteBuffer() {
+    if constexpr (std::is_same_v<Resp, pb::FlightData>) {
+      return reinterpret_cast<Resp*>(&current_write_);
+    } else {
+      return &current_write_;
+    }
+  }
+
+  AsyncReadValue MakeAsyncReadValue(ReadValue value) {
+    if constexpr (std::is_same_v<Req, pb::FlightData>) {
+      return std::make_shared<internal::FlightData>(std::move(value));
+    } else {
+      return std::optional<Req>(std::move(value));
+    }
+  }
+
+  AsyncReadValue EndAsyncReadValue() {
+    if constexpr (std::is_same_v<Req, pb::FlightData>) {
+      return nullptr;
+    } else {
+      return std::optional<Req>{};
+    }
+  }
+
   ::grpc::CallbackServerContext* context_;
   std::shared_ptr<arrow::internal::ThreadPool> executor_;
-  Req read_buffer_;
-  std::deque<Req> reads_;
-  Resp current_write_;
+  ReadValue read_buffer_;
+  std::deque<ReadValue> reads_;
+  WriteValue current_write_;
   std::mutex mutex_;
   std::condition_variable cv_;
   bool reads_done_ = false;
-  Future<std::optional<Req>> pending_read_;
+  Future<AsyncReadValue> pending_read_;
   bool pending_read_active_ = false;
-  bool read_buffer_registered_ = false;
   bool read_started_ = false;
   bool read_in_flight_ = false;
   bool cancelled_ = false;
@@ -435,7 +423,6 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   bool pending_write_active_ = false;
   bool write_in_flight_ = false;
   bool write_ok_ = true;
-  bool flight_data_registered_ = false;
   bool finish_requested_ = false;
   ::grpc::Status finish_status_;
   std::atomic<int> refs_{1};
@@ -510,7 +497,7 @@ arrow::Result<std::shared_ptr<Buffer>> SerializeIpcMessage(
 
 class NativeAsyncFlightMessageReader final : public AsyncFlightMessageReader {
  public:
-  using ReadFn = std::function<Future<std::optional<pb::FlightData>>()>;
+  using ReadFn = std::function<Future<std::shared_ptr<internal::FlightData>>()>;
   enum class ActiveOperation { kNone, kSchema, kNext };
 
   NativeAsyncFlightMessageReader(FlightDescriptor descriptor, internal::FlightData first_message,
@@ -586,12 +573,12 @@ class NativeAsyncFlightMessageReader final : public AsyncFlightMessageReader {
       return Future<std::shared_ptr<internal::FlightData>>::MakeFinished(std::move(pending));
     }
     return read_fn_().Then(
-        [memory_manager = memory_manager_](std::optional<pb::FlightData> message)
+        [memory_manager = memory_manager_](std::shared_ptr<internal::FlightData> message)
             -> ::arrow::Result<std::shared_ptr<internal::FlightData>> {
       if (!message) {
         return std::shared_ptr<internal::FlightData>{};
       }
-      ARROW_ASSIGN_OR_RAISE(auto data, DeserializeGrpcFlightData(*message));
+      auto data = std::move(*message);
       if (data.body) {
         ARROW_ASSIGN_OR_RAISE(data.body, Buffer::ViewOrCopy(data.body, memory_manager));
       }
@@ -1066,12 +1053,15 @@ class AsyncGrpcServerTransport : public internal::AsyncServerTransport {
   Future<std::unique_ptr<AsyncFlightMessageReader>> MakeAsyncMessageReader(
       BidiReactorBase<pb::FlightData, Resp>* reactor) {
     return reactor->ReadOneAsync().Then(
-        [this, reactor](std::optional<pb::FlightData> message)
+        [this, reactor](std::shared_ptr<internal::FlightData> message)
             -> ::arrow::Result<std::unique_ptr<AsyncFlightMessageReader>> {
           if (!message) {
             return Status::IOError("Stream finished before first message sent");
           }
-          ARROW_ASSIGN_OR_RAISE(auto data, DeserializeGrpcFlightData(*message));
+          auto data = std::move(*message);
+          if (data.body) {
+            ARROW_ASSIGN_OR_RAISE(data.body, Buffer::ViewOrCopy(data.body, memory_manager_));
+          }
           if (!data.descriptor) {
             return Status::IOError("Descriptor missing on first message");
           }
@@ -1106,6 +1096,9 @@ class AsyncGrpcServerTransport : public internal::AsyncServerTransport {
 template <typename Proto>
 class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
  public:
+  using WriteValue =
+      std::conditional_t<std::is_same_v<Proto, pb::FlightData>, FlightPayload, Proto>;
+
   AsyncWriteReactorBase(::grpc::CallbackServerContext* context,
                         std::shared_ptr<arrow::internal::ThreadPool> executor,
                         GrpcServerCallContext flight_context)
@@ -1146,10 +1139,18 @@ class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
     }
   }
 
+  Proto* GrpcWriteBuffer() {
+    if constexpr (std::is_same_v<Proto, pb::FlightData>) {
+      return reinterpret_cast<Proto*>(&current_write_);
+    } else {
+      return &current_write_;
+    }
+  }
+
   ::grpc::CallbackServerContext* context_;
   std::shared_ptr<arrow::internal::ThreadPool> executor_;
   GrpcServerCallContext flight_context_;
-  Proto current_write_;
+  WriteValue current_write_;
   std::mutex mutex_;
 
  private:
@@ -1229,7 +1230,7 @@ class IteratorReactor : public AsyncWriteReactorBase<Proto> {
         }
         this->current_write_ = std::move(proto);
       }
-      this->StartWrite(&this->current_write_);
+      this->StartWrite(this->GrpcWriteBuffer());
     });
   }
 
@@ -1254,10 +1255,6 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
   }
 
   void OnWriteDone(bool ok) override {
-    if (flight_data_registered_) {
-      transport::grpc::UnregisterGrpcFlightDataMessage(&this->current_write_);
-      flight_data_registered_ = false;
-    }
     if (!ok) {
       this->FinishOnce(this->flight_context_.FinishRequest(Status::OK()));
       return;
@@ -1269,10 +1266,6 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
   }
 
   void OnDone() override {
-    if (flight_data_registered_) {
-      transport::grpc::UnregisterGrpcFlightDataMessage(&this->current_write_);
-      flight_data_registered_ = false;
-    }
     AsyncWriteReactorBase<pb::FlightData>::OnDone();
   }
 
@@ -1330,18 +1323,20 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
   }
 
   Status StartPayloadWrite(FlightPayload payload) {
-    ARROW_ASSIGN_OR_RAISE(this->current_write_, SerializeFlightPayload(payload));
-    if (this->cancelled()) {
-      return Status::OK();
+    RETURN_NOT_OK(payload.Validate());
+    {
+      std::lock_guard<std::mutex> lock(this->mutex_);
+      if (this->cancelled()) {
+        return Status::OK();
+      }
+      this->current_write_ = std::move(payload);
     }
-    transport::grpc::RegisterGrpcFlightDataMessage(&this->current_write_);
-    flight_data_registered_ = true;
-    this->StartWrite(&this->current_write_);
+    this->StartWrite(this->GrpcWriteBuffer());
     return Status::OK();
   }
+
   std::unique_ptr<FlightDataStream> stream_;
   Stage stage_ = Stage::kSchema;
-  bool flight_data_registered_ = false;
 };
 
 ::grpc::ServerBidiReactor<pb::HandshakeRequest, pb::HandshakeResponse>*

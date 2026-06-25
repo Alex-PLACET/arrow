@@ -37,15 +37,22 @@ AsyncFlightServerBase::~AsyncFlightServerBase() = default;
 
 Status AsyncFlightServerBase::Init(const FlightServerOptions& options) {
   flight::transport::grpc::InitializeFlightGrpcServer();
+  const auto scheme = options.location.scheme();
   ARROW_ASSIGN_OR_RAISE(impl_->transport_,
-                        MakeGrpcCallbackServerTransport(this, options.memory_manager));
+                        internal::MakeAsyncServerTransport(scheme, this,
+                                                           options.memory_manager));
   ARROW_ASSIGN_OR_RAISE(auto uri, internal::ParseLocationUri(options.location));
   return impl_->transport_->Init(options, uri);
 }
 
 int AsyncFlightServerBase::port() const { return internal::PortFromLocation(location()); }
 
-Location AsyncFlightServerBase::location() const { return impl_->transport_->location(); }
+Location AsyncFlightServerBase::location() const {
+  if (!impl_->transport_) {
+    return Location{};
+  }
+  return impl_->transport_->location();
+}
 
 Status AsyncFlightServerBase::SetShutdownOnSignals(const std::vector<int> sigs) {
   return impl_->signal_state_.SetShutdownOnSignals(sigs);

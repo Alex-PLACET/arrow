@@ -21,6 +21,16 @@
 
 namespace arrow::flight::internal {
 
+arrow::Result<std::unique_ptr<AsyncServerTransport>> MakeAsyncServerTransport(
+    const std::string& scheme, AsyncFlightServerBase* base,
+    std::shared_ptr<MemoryManager> memory_manager) {
+  if (scheme == kSchemeGrpc || scheme == kSchemeGrpcTcp || scheme == kSchemeGrpcTls ||
+      scheme == kSchemeGrpcUnix) {
+    return MakeGrpcCallbackServerTransport(base, std::move(memory_manager));
+  }
+  return Status::KeyError("No async server transport implementation for ", scheme);
+}
+
 Status AsyncServerTransport::DoGet(const ServerCallContext& context, const Ticket& ticket,
                                    ServerDataStream* stream) {
   ARROW_ASSIGN_OR_RAISE(auto data_stream, base_->DoGet(context, ticket).MoveResult());
