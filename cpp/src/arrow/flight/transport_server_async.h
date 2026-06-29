@@ -20,50 +20,60 @@
 #include <chrono>
 #include <memory>
 
-#include "arrow/flight/transport.h"
+#include "arrow/flight/server_async.h"
+#include "arrow/flight/transport_server.h"
 #include "arrow/flight/transport_server_internal.h"
 #include "arrow/flight/type_fwd.h"
 #include "arrow/flight/visibility.h"
-#include "arrow/type_fwd.h"
 
-namespace arrow {
-namespace ipc {
-class Message;
-}
-namespace flight {
+namespace arrow::flight {
+
 namespace internal {
+class AsyncServerTransport;
 
-/// \brief A transport-specific interface for reading/writing Arrow
-///   data for a server.
-class ARROW_FLIGHT_EXPORT ServerDataStream : public TransportDataStream {
- public:
-  /// \brief Attempt to write a non-data message.
-  ///
-  /// Only implemented for DoPut; mutually exclusive with
-  /// WriteData(const FlightPayload&).
-  virtual Status WritePutMetadata(const Buffer& payload);
-};
+arrow::Result<std::unique_ptr<AsyncServerTransport>> MakeAsyncServerTransport(
+    const std::string& scheme, AsyncFlightServerBase* base,
+    std::shared_ptr<MemoryManager> memory_manager);
+}
 
-/// \brief An implementation of a Flight server for a particular
-/// transport.
+/// \brief Create an async server transport backed by gRPC callback API.
+///
+/// \param[in] base The async Flight server whose RPC methods will be called.
+/// \param[in] memory_manager The memory manager for buffer allocations.
+///
+/// The current implementation uses the gRPC callback transport explicitly. It
+/// keeps gRPC reactor details transport-internal and exposes only
+/// AsyncFlightServerBase and the Arrow-native async stream interfaces to
+/// applications.
+ARROW_FLIGHT_EXPORT
+arrow::Result<std::unique_ptr<internal::AsyncServerTransport>>
+MakeGrpcCallbackServerTransport(AsyncFlightServerBase* base,
+                                std::shared_ptr<MemoryManager> memory_manager);
+
+}  // namespace arrow::flight
+
+namespace arrow::flight::internal {
+
+/// \brief An implementation of an async Flight server for a particular transport.
 ///
 /// This class (the transport implementation) implements the underlying
-/// server and handles connections/incoming RPC calls. It should forward RPC
-/// calls to the RPC handlers defined on this class, which work in terms of
-/// the generic interfaces above. The RPC handlers here then forward calls
-/// to the underlying FlightServerBase instance that contains the actual
+/// async server and handles connections/incoming RPC calls. It should forward
+/// RPC calls to the RPC handlers defined on this class, which work in terms of
+/// the generic ServerDataStream interfaces. The RPC handlers then forward calls
+/// to the underlying AsyncFlightServerBase instance that contains the actual
 /// application RPC method handlers.
 ///
-/// Used by FlightServerBase to manage the server lifecycle.
-class ARROW_FLIGHT_EXPORT ServerTransport : public ServerTransportBase {
+/// Used by AsyncFlightServerBase to manage the server lifecycle.
+class ARROW_FLIGHT_EXPORT AsyncServerTransport : public ServerTransportBase {
  public:
-  ServerTransport(FlightServerBase* base, std::shared_ptr<MemoryManager> memory_manager)
+  AsyncServerTransport(AsyncFlightServerBase* base,
+                       std::shared_ptr<MemoryManager> memory_manager)
       : ServerTransportBase(std::move(memory_manager)), base_(base) {}
-  virtual ~ServerTransport() = default;
+  virtual ~AsyncServerTransport() = default;
 
   /// \name Server Lifecycle Methods
   /// Transports implement these methods to start/shutdown the underlying
-  /// server.
+  /// async server.
   /// @{
   /// \brief Initialize the server.
   ///
@@ -89,45 +99,26 @@ class ARROW_FLIGHT_EXPORT ServerTransport : public ServerTransportBase {
   virtual Location location() const = 0;
   ///@}
 
-  /// \name RPC Handlers
-  /// Implementations of RPC handlers for Flight methods using the common
-  /// interfaces here. Transports should call these methods from their
-  /// server implementation to handle the actual RPC calls.
-  ///@{
-  /// \brief Get the FlightServerBase.
+  /// \brief Get the AsyncFlightServerBase.
   ///
   /// Intended as an escape hatch for now since not all methods have been
   /// factored into a transport-agnostic interface.
-  FlightServerBase* base() const { return base_; }
+  AsyncFlightServerBase* base() const { return base_; }
+
   /// \brief Implement DoGet in terms of a transport-level stream.
+  ///
+  /// Adapts the Arrow-native async server surface to the transport-facing
+  /// ServerDataStream helpers shared with the synchronous transport.
   ///
   /// \param[in] context The server context.
   /// \param[in] request The request payload.
   /// \param[in] stream The transport-specific data stream
-  ///   implementation. Must implement WriteData(const
-  ///   FlightPayload&).
+  ///   implementation. Must implement WriteData(const FlightPayload&).
   Status DoGet(const ServerCallContext& context, const Ticket& request,
                ServerDataStream* stream);
-  /// \brief Implement DoPut in terms of a transport-level stream.
-  ///
-  /// \param[in] context The server context.
-  /// \param[in] stream The transport-specific data stream
-  ///   implementation. Must implement ReadData(FlightData*)
-  ///   and WritePutMetadata(const Buffer&).
-  Status DoPut(const ServerCallContext& context, ServerDataStream* stream);
-  /// \brief Implement DoExchange in terms of a transport-level stream.
-  ///
-  /// \param[in] context The server context.
-  /// \param[in] stream The transport-specific data stream
-  ///   implementation. Must implement ReadData(FlightData*)
-  ///   and WriteData(const FlightPayload&).
-  Status DoExchange(const ServerCallContext& context, ServerDataStream* stream);
-  ///@}
 
  protected:
-  FlightServerBase* base_;
+  AsyncFlightServerBase* base_;
 };
 
-}  // namespace internal
-}  // namespace flight
-}  // namespace arrow
+}  // namespace arrow::flight::internal
