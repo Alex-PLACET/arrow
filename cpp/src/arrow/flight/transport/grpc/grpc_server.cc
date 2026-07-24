@@ -75,44 +75,6 @@ using ServerWriter = ::grpc::ServerWriter<T>;
   } while (false)
 
 namespace {
-class GrpcServerAuthReader : public ServerAuthReader {
- public:
-  explicit GrpcServerAuthReader(
-      ::grpc::ServerReaderWriter<pb::HandshakeResponse, pb::HandshakeRequest>* stream)
-      : stream_(stream) {}
-
-  Status Read(std::string* token) override {
-    pb::HandshakeRequest request;
-    if (stream_->Read(&request)) {
-      *token = std::move(*request.mutable_payload());
-      return Status::OK();
-    }
-    return Status::IOError("Stream is closed.");
-  }
-
- private:
-  ::grpc::ServerReaderWriter<pb::HandshakeResponse, pb::HandshakeRequest>* stream_;
-};
-
-class GrpcServerAuthSender : public ServerAuthSender {
- public:
-  explicit GrpcServerAuthSender(
-      ::grpc::ServerReaderWriter<pb::HandshakeResponse, pb::HandshakeRequest>* stream)
-      : stream_(stream) {}
-
-  Status Write(const std::string& token) override {
-    pb::HandshakeResponse response;
-    response.set_payload(token);
-    if (stream_->Write(response)) {
-      return Status::OK();
-    }
-    return Status::IOError("Stream was closed.");
-  }
-
- private:
-  ::grpc::ServerReaderWriter<pb::HandshakeResponse, pb::HandshakeRequest>* stream_;
-};
-
 using GrpcServerCallContext = transport::grpc::GrpcServerCallContext<ServerContext>;
 using GrpcContextHelper = transport::grpc::GrpcServerCallContextHelper<ServerContext>;
 
@@ -234,8 +196,10 @@ class GrpcServiceHandler final : public FlightService::Service {
               ::grpc::StatusCode::UNIMPLEMENTED,
               "This service does not have an authentication mechanism enabled."));
     }
-    GrpcServerAuthSender outgoing{stream};
-    GrpcServerAuthReader incoming{stream};
+    GrpcServerAuthSender<pb::HandshakeResponse> outgoing(
+        [stream](pb::HandshakeResponse response) { return stream->Write(response); });
+    GrpcServerAuthReader<pb::HandshakeRequest> incoming(
+        [stream](pb::HandshakeRequest* request) { return stream->Read(request); });
     RETURN_WITH_MIDDLEWARE(flight_context, helper_.auth_handler()->Authenticate(
                                                flight_context, &outgoing, &incoming));
   }
@@ -440,19 +404,8 @@ class GrpcServerTransport : public internal::ServerTransport {
   Status Init(const FlightServerOptions& options, const arrow::util::Uri& uri) override {
     grpc_service_.reset(
         new GrpcServiceHandler(options.auth_handler, options.middleware, this));
-
-    ::grpc::ServerBuilder builder;
-    int port = 0;
-    RETURN_NOT_OK(AddServerListeningPort(options, uri, &builder, &location_, &port));
-
-    builder.RegisterService(grpc_service_.get());
-    ConfigureServerBuilderOptions(options, &builder);
-
-    grpc_server_ = builder.BuildAndStart();
-    if (!grpc_server_) {
-      return Status::UnknownError("Server did not start properly");
-    }
-    return SetServerLocationFromUri(uri, port, &location_);
+    return StartFlightGrpcServer(options, uri, grpc_service_.get(),
+                                 /*callback_api=*/false, &grpc_server_, &location_);
   }
   Status Shutdown() override {
     grpc_server_->Shutdown();

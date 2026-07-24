@@ -567,6 +567,7 @@ struct ARROW_FLIGHT_EXPORT Location : public internal::BaseType<Location> {
  private:
   friend class FlightClient;
   friend class FlightServerBase;
+  friend class AsyncFlightServerBase;
   std::shared_ptr<arrow::util::Uri> uri_;
 };
 

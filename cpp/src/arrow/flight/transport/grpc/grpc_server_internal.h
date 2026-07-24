@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -34,6 +35,44 @@ namespace arrow::flight::transport::grpc {
 
 using MiddlewareFactoryList =
     std::vector<std::pair<std::string, std::shared_ptr<ServerMiddlewareFactory>>>;
+
+/// Adapt a transport-specific handshake read operation to ServerAuthReader.
+template <typename Request>
+class GrpcServerAuthReader final : public ServerAuthReader {
+ public:
+  using ReadFn = std::function<bool(Request*)>;
+
+  explicit GrpcServerAuthReader(ReadFn read_fn) : read_fn_(std::move(read_fn)) {}
+
+  Status Read(std::string* token) override {
+    Request request;
+    if (!read_fn_(&request)) return Status::IOError("Stream is closed.");
+    *token = std::move(*request.mutable_payload());
+    return Status::OK();
+  }
+
+ private:
+  ReadFn read_fn_;
+};
+
+/// Adapt a transport-specific handshake write operation to ServerAuthSender.
+template <typename Response>
+class GrpcServerAuthSender final : public ServerAuthSender {
+ public:
+  using WriteFn = std::function<bool(Response)>;
+
+  explicit GrpcServerAuthSender(WriteFn write_fn) : write_fn_(std::move(write_fn)) {}
+
+  Status Write(const std::string& token) override {
+    Response response;
+    response.set_payload(token);
+    if (!write_fn_(std::move(response))) return Status::IOError("Stream was closed.");
+    return Status::OK();
+  }
+
+ private:
+  WriteFn write_fn_;
+};
 
 ARROW_FLIGHT_EXPORT
 ::grpc::Status FinishGrpcServerStatus(const Status& arrow_status,
@@ -209,5 +248,12 @@ void ConfigureServerBuilderOptions(const FlightServerOptions& options,
 ARROW_FLIGHT_EXPORT
 Status SetServerLocationFromUri(const arrow::util::Uri& uri, int port,
                                 Location* location);
+
+/// Build, register, and start a Flight gRPC service using common server options.
+ARROW_FLIGHT_EXPORT
+Status StartFlightGrpcServer(const FlightServerOptions& options,
+                             const arrow::util::Uri& uri, ::grpc::Service* service,
+                             bool callback_api, std::unique_ptr<::grpc::Server>* server,
+                             Location* location);
 
 }  // namespace arrow::flight::transport::grpc
