@@ -1685,20 +1685,19 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
       }
       helper_.AddMiddlewareHeaders(this->context_, &flight_context_);
       auto status = this->StartWorker([this] {
-          auto outgoing = std::make_unique<
-              transport::grpc::GrpcServerAuthSender<pb::HandshakeResponse>>(
-              [this](pb::HandshakeResponse response) {
-                return this->WriteOnePublic(std::move(response));
-              });
-          auto incoming = std::make_unique<
-              transport::grpc::GrpcServerAuthReader<pb::HandshakeRequest>>(
-              [this](pb::HandshakeRequest* request) { return this->ReadOne(request); });
+        auto outgoing = std::make_unique<
+            transport::grpc::GrpcServerAuthSender<pb::HandshakeResponse>>(
+            [this](pb::HandshakeResponse response) {
+              return this->WriteOnePublic(std::move(response));
+            });
+        auto incoming =
+            std::make_unique<transport::grpc::GrpcServerAuthReader<pb::HandshakeRequest>>(
+                [this](pb::HandshakeRequest* request) { return this->ReadOne(request); });
         if (helper_.auth_handler()) {
           auto status = helper_.auth_handler()->Authenticate(
               flight_context_, outgoing.get(), incoming.get());
           this->FinishFromWorker(flight_context_.FinishRequest(status));
         } else {
-
           this->Hold();
           impl_->base()
               ->Handshake(flight_context_, std::move(outgoing), std::move(incoming))
@@ -1884,7 +1883,7 @@ CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
   reactor->StartAfter(impl_->base()->ListActions(reactor->flight_context()),
                       [](std::vector<ActionType> actions) {
                         return [actions = std::move(actions), index = size_t{0}]() mutable
-                                   -> arrow::Result<std::unique_ptr<ActionType>> {
+                               -> arrow::Result<std::unique_ptr<ActionType>> {
                           if (index >= actions.size()) return nullptr;
                           return std::make_unique<ActionType>(actions[index++]);
                         };
