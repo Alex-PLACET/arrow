@@ -36,7 +36,8 @@ class LegacyAsyncFlightDataStream final : public AsyncFlightDataStream {
       : state_(std::make_shared<State>(std::move(stream))) {}
 
   Future<FlightPayload> GetSchemaPayload() override {
-    return Run<FlightPayload>([](State& state) { return state.stream->GetSchemaPayload(); });
+    return Run<FlightPayload>(
+        [](State& state) { return state.stream->GetSchemaPayload(); });
   }
   Future<FlightPayload> Next() override {
     return Run<FlightPayload>([](State& state) { return state.stream->Next(); });
@@ -51,7 +52,8 @@ class LegacyAsyncFlightDataStream final : public AsyncFlightDataStream {
 
  private:
   struct State {
-    explicit State(std::unique_ptr<FlightDataStream> stream) : stream(std::move(stream)) {}
+    explicit State(std::unique_ptr<FlightDataStream> stream)
+        : stream(std::move(stream)) {}
     std::unique_ptr<FlightDataStream> stream;
     std::mutex mutex;
   };

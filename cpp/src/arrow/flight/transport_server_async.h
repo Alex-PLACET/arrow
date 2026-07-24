@@ -78,14 +78,14 @@ class ARROW_FLIGHT_EXPORT AsyncServerTransport : public ServerTransportBase {
   ///
   /// This should wait for active RPCs to finish, or for the deadline to
   /// expire. Once this returns, the server is no longer listening.
-  
+
   virtual Status Shutdown(const std::chrono::system_clock::time_point& deadline) = 0;
 
   /// \brief Wait for the server to shutdown (but do not shut down the server).
   ///
   /// Once this returns, the server is no longer listening.
   virtual Status Wait() = 0;
-  
+
   /// \brief Get the address the server is listening on, else an empty Location.
   virtual Location location() const = 0;
   ///@}

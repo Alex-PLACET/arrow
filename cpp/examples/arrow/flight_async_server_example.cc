@@ -310,7 +310,7 @@ arrow::Future<> EchoExchange(
              }
 
              return start.Then([writer, chunk = std::move(chunk)]() mutable
-                                   -> arrow::Future<arrow::ControlFlow<>> {
+                               -> arrow::Future<arrow::ControlFlow<>> {
                if (chunk.data && chunk.app_metadata) {
                  return writer->WriteWithMetadata(*chunk.data, chunk.app_metadata)
                      .Then([]() -> arrow::ControlFlow<> { return arrow::Continue{}; });

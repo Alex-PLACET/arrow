@@ -449,7 +449,7 @@ class AsyncAdapterFlightServer : public AsyncFlightServerBase {
                      start = writer->Begin(chunk.data->schema());
                    }
                    return start.Then([writer, chunk = std::move(chunk)]() mutable
-                                         -> Future<ControlFlow<>> {
+                                     -> Future<ControlFlow<>> {
                      if (chunk.data && chunk.app_metadata) {
                        return writer->WriteWithMetadata(*chunk.data, chunk.app_metadata)
                            .Then([]() -> ControlFlow<> { return Continue{}; });
@@ -1986,8 +1986,8 @@ TEST(AsyncFlightDataStreamTest, LegacyAdapterDoesNotBlockCaller) {
   // The adapter must return immediately and complete only after the synchronous
   // operation has been released on its background executor.
   auto state = std::make_shared<BlockingLegacyStreamState>();
-  auto stream = MakeAsyncFlightDataStreamFromSync(
-      std::make_unique<BlockingLegacyStream>(state));
+  auto stream =
+      MakeAsyncFlightDataStreamFromSync(std::make_unique<BlockingLegacyStream>(state));
   std::jthread releaser([state] {
     state->started.Wait();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -2051,8 +2051,8 @@ TEST_F(AsyncNativeStreamApiTest, FinishesAfterUnawaitedMetadataWrite) {
 TEST_F(AsyncNativeStreamApiTest, FinishesAfterUnawaitedExchangeBegin) {
   // The server completes DoExchange without awaiting Begin(); the schema must
   // still be written before the RPC finishes.
-  ASSERT_OK_AND_ASSIGN(
-      auto exchange, client_->DoExchange(FlightDescriptor::Command("unawaited_begin")));
+  ASSERT_OK_AND_ASSIGN(auto exchange,
+                       client_->DoExchange(FlightDescriptor::Command("unawaited_begin")));
   ASSERT_OK(exchange.writer->DoneWriting());
   ASSERT_OK_AND_ASSIGN(auto schema, exchange.reader->GetSchema());
   AssertSchemaEqual(*arrow::schema({field("ints", int32())}), *schema);
