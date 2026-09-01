@@ -85,9 +85,6 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
           pending_read_active_ = false;
           pending_read_ = Future<AsyncReadValue>();
           resolve_pending = true;
-          // gRPC requires the next read to be started from the completion
-          // callback. This preserves that requirement while bounding prefetch
-          // to one message when the application stops reading.
           if (!cancelled_) {
             read_in_flight_ = true;
             start_next_read = true;
@@ -219,8 +216,6 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     pending_read_ = Future<AsyncReadValue>::Make();
     pending_read_active_ = true;
     if (!read_in_flight_) {
-      // The application controls receive-side backpressure. Keep at most one
-      // completed message buffered when it is not currently awaiting a read.
       read_in_flight_ = true;
       start_read = true;
     }
@@ -247,7 +242,10 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     static_assert(std::is_same_v<Resp, pb::FlightData>);
     RETURN_NOT_OK(payload.Validate());
     std::unique_lock<std::mutex> lock(mutex_);
-    if (cancelled_) return false;
+    if (cancelled_)
+    {   
+        return false;
+    }
     current_write_ = std::move(payload);
     write_in_flight_ = true;
     write_ok_ = true;
@@ -258,11 +256,12 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
 
   /// Retain this self-owned reactor across an asynchronous callback.
   void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
+
   /// Release a reference acquired with Hold().
   void ReleaseHold() { ReleaseRef(); }
 
  protected:
-  /// Install the single outstanding async write and hand it to gRPC.
+  
   Future<bool> StartAsyncWrite(WriteValue message) {
     std::unique_lock<std::mutex> lock(mutex_);
     if (cancelled_) {
@@ -280,7 +279,6 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     return pending_write_;
   }
 
-  /// Block a compatibility caller until a queued read or stream end is available.
   bool PopRead(Req* out) {
     bool start_read = false;
     std::unique_lock<std::mutex> lock(mutex_);
@@ -314,7 +312,6 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     return !cancelled_ && write_ok_;
   }
 
-  /// Finish after an active response write, preserving gRPC write ordering.
   void FinishFromWorker(::grpc::Status status) {
     bool finish_now = false;
     ::grpc::Status finish_status;
