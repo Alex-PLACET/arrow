@@ -61,6 +61,20 @@ arrow::Result<std::shared_ptr<Buffer>> SerializeIpcMessage(
   return sink->Finish();
 }
 
+/// Make an inbound FlightData buffer usable by the IPC decoder.
+arrow::Result<std::shared_ptr<internal::FlightData>> PrepareFlightData(
+    std::shared_ptr<internal::FlightData> message,
+    const std::shared_ptr<MemoryManager>& memory_manager) {
+  if (!message) {
+    return std::shared_ptr<internal::FlightData>{};
+  }
+  auto data = std::move(*message);
+  if (data.body) {
+    ARROW_ASSIGN_OR_RAISE(data.body, Buffer::ViewOrCopy(data.body, memory_manager));
+  }
+  return std::make_shared<internal::FlightData>(std::move(data));
+}
+
 /// Decodes inbound FlightData frames into the public async reader interface.
 class NativeAsyncFlightMessageReader final
     : public AsyncFlightMessageReader,
@@ -88,16 +102,9 @@ class NativeAsyncFlightMessageReader final
       return Future<std::shared_ptr<Schema>>::MakeFinished(listener_->schema());
     }
     int64_t token = 0;
-    {
-      std::lock_guard<std::mutex> guard(mutex_);
-      if (operation_in_flight_) {
-        return Future<std::shared_ptr<Schema>>::MakeFinished(
-            Status::Invalid("Concurrent async reads are not supported"));
-      }
-      operation_in_flight_ = true;
-      idle_ = Future<>::Make();
-      active_operation_ = ActiveOperation::kSchema;
-      token = ++active_token_;
+    auto status = StartOperation(ActiveOperation::kSchema, &token);
+    if (!status.ok()) {
+      return Future<std::shared_ptr<Schema>>::MakeFinished(std::move(status));
     }
     auto out = Future<std::shared_ptr<Schema>>::Make();
     shared_from_this()->PumpSchema(out, token);
@@ -117,14 +124,10 @@ class NativeAsyncFlightMessageReader final
       if (finished_) {
         return Future<FlightStreamChunk>::MakeFinished(FlightStreamChunk{});
       }
-      if (operation_in_flight_) {
-        return Future<FlightStreamChunk>::MakeFinished(
-            Status::Invalid("Concurrent async reads are not supported"));
-      }
-      operation_in_flight_ = true;
-      idle_ = Future<>::Make();
-      active_operation_ = ActiveOperation::kNext;
-      token = ++active_token_;
+    }
+    auto status = StartOperation(ActiveOperation::kNext, &token);
+    if (!status.ok()) {
+      return Future<FlightStreamChunk>::MakeFinished(std::move(status));
     }
     auto out = Future<FlightStreamChunk>::Make();
     shared_from_this()->PumpNext(out, token);
@@ -156,16 +159,8 @@ class NativeAsyncFlightMessageReader final
           std::move(pending));
     }
     return read_fn_().Then([memory_manager = memory_manager_](
-                               std::shared_ptr<internal::FlightData> message)
-                               -> ::arrow::Result<std::shared_ptr<internal::FlightData>> {
-      if (!message) {
-        return std::shared_ptr<internal::FlightData>{};
-      }
-      auto data = std::move(*message);
-      if (data.body) {
-        ARROW_ASSIGN_OR_RAISE(data.body, Buffer::ViewOrCopy(data.body, memory_manager));
-      }
-      return std::make_shared<internal::FlightData>(std::move(data));
+                               std::shared_ptr<internal::FlightData> message) {
+      return PrepareFlightData(std::move(message), memory_manager);
     });
   }
 
@@ -186,22 +181,34 @@ class NativeAsyncFlightMessageReader final
     return Status::OK();
   }
 
+  /// Start one serialized reader operation and return its cancellation token.
+  Status StartOperation(ActiveOperation operation, int64_t* token) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (active_operation_ != ActiveOperation::kNone) {
+      return Status::Invalid("Concurrent async reads are not supported");
+    }
+    active_operation_ = operation;
+    idle_ = Future<>::Make();
+    *token = ++active_token_;
+    return Status::OK();
+  }
+
   /// Check whether a callback still belongs to the current read operation.
   bool IsCurrentOperation(int64_t token, ActiveOperation operation) {
     std::lock_guard<std::mutex> guard(mutex_);
-    return operation_in_flight_ && active_token_ == token &&
-           active_operation_ == operation;
+    return active_token_ == token && active_operation_ == operation;
   }
 
-  void FinishSchema(Future<std::shared_ptr<Schema>> out,
-                    ::arrow::Result<std::shared_ptr<Schema>> result, int64_t token) {
+  /// Complete a serialized reader operation and its idle notification.
+  template <typename T>
+  void FinishOperationResult(Future<T> out, ::arrow::Result<T> result, int64_t token,
+                             ActiveOperation operation) {
     Future<> idle;
     {
       std::lock_guard<std::mutex> guard(mutex_);
-      if (active_token_ != token || active_operation_ != ActiveOperation::kSchema) {
+      if (active_token_ != token || active_operation_ != operation) {
         return;
       }
-      operation_in_flight_ = false;
       active_operation_ = ActiveOperation::kNone;
       idle = idle_;
     }
@@ -209,10 +216,23 @@ class NativeAsyncFlightMessageReader final
     idle.MarkFinished();
   }
 
+  template <typename T>
+  void FinishOperation(Future<T> out, T value, int64_t token, ActiveOperation operation) {
+    FinishOperationResult(std::move(out), ::arrow::Result<T>(std::move(value)), token,
+                          operation);
+  }
+
+  template <typename T>
+  void FinishOperation(Future<T> out, Status status, int64_t token,
+                       ActiveOperation operation) {
+    FinishOperationResult(std::move(out), ::arrow::Result<T>(std::move(status)), token,
+                          operation);
+  }
+
   /// Read frames until the decoder produces a schema or the stream fails.
   void PumpSchema(Future<std::shared_ptr<Schema>> out, int64_t token) {
     if (listener_->schema()) {
-      FinishSchema(out, listener_->schema(), token);
+      FinishOperation(out, listener_->schema(), token, ActiveOperation::kSchema);
       return;
     }
     ReadDataAsync().AddCallback(
@@ -223,13 +243,14 @@ class NativeAsyncFlightMessageReader final
             return;
           }
           if (!result.ok()) {
-            self->FinishSchema(out, result.status(), token);
+            self->FinishOperation(out, result.status(), token, ActiveOperation::kSchema);
             return;
           }
           auto maybe_data = result.ValueUnsafe();
           if (!maybe_data) {
-            self->FinishSchema(out, Status::IOError("Client never sent a data message"),
-                               token);
+            self->FinishOperation(out,
+                                  Status::IOError("Client never sent a data message"),
+                                  token, ActiveOperation::kSchema);
             return;
           }
           if (!maybe_data->metadata) {
@@ -241,27 +262,11 @@ class NativeAsyncFlightMessageReader final
           }
           auto st = self->ConsumeDataMessage(*maybe_data);
           if (!st.ok()) {
-            self->FinishSchema(out, st, token);
+            self->FinishOperation(out, st, token, ActiveOperation::kSchema);
             return;
           }
           self->PumpSchema(out, token);
         });
-  }
-
-  void FinishNext(Future<FlightStreamChunk> out,
-                  ::arrow::Result<FlightStreamChunk> result, int64_t token) {
-    Future<> idle;
-    {
-      std::lock_guard<std::mutex> guard(mutex_);
-      if (active_token_ != token || active_operation_ != ActiveOperation::kNext) {
-        return;
-      }
-      operation_in_flight_ = false;
-      active_operation_ = ActiveOperation::kNone;
-      idle = idle_;
-    }
-    out.MarkFinished(std::move(result));
-    idle.MarkFinished();
   }
 
   /// Read frames until a user-visible chunk or end-of-stream is available.
@@ -278,11 +283,11 @@ class NativeAsyncFlightMessageReader final
       }
     }
     if (ready_chunk.has_value()) {
-      FinishNext(out, std::move(*ready_chunk), token);
+      FinishOperation(out, std::move(*ready_chunk), token, ActiveOperation::kNext);
       return;
     }
     if (stream_finished) {
-      FinishNext(out, FlightStreamChunk{}, token);
+      FinishOperation(out, FlightStreamChunk{}, token, ActiveOperation::kNext);
       return;
     }
     ReadDataAsync().AddCallback(
@@ -293,7 +298,7 @@ class NativeAsyncFlightMessageReader final
             return;
           }
           if (!result.ok()) {
-            self->FinishNext(out, result.status(), token);
+            self->FinishOperation(out, result.status(), token, ActiveOperation::kNext);
             return;
           }
           auto maybe_data = result.ValueUnsafe();
@@ -302,7 +307,8 @@ class NativeAsyncFlightMessageReader final
               std::lock_guard<std::mutex> guard(self->mutex_);
               self->finished_ = true;
             }
-            self->FinishNext(out, FlightStreamChunk{}, token);
+            self->FinishOperation(out, FlightStreamChunk{}, token,
+                                  ActiveOperation::kNext);
             return;
           }
           if (!maybe_data->metadata) {
@@ -312,12 +318,12 @@ class NativeAsyncFlightMessageReader final
             }
             FlightStreamChunk chunk;
             chunk.app_metadata = std::move(maybe_data->app_metadata);
-            self->FinishNext(out, std::move(chunk), token);
+            self->FinishOperation(out, std::move(chunk), token, ActiveOperation::kNext);
             return;
           }
           auto st = self->ConsumeDataMessage(*maybe_data);
           if (!st.ok()) {
-            self->FinishNext(out, st, token);
+            self->FinishOperation(out, st, token, ActiveOperation::kNext);
             return;
           }
           self->PumpNext(out, token);
@@ -333,7 +339,6 @@ class NativeAsyncFlightMessageReader final
   mutable std::mutex mutex_;
   std::deque<FlightStreamChunk> decoded_chunks_;
   bool finished_ = false;
-  bool operation_in_flight_ = false;
   ActiveOperation active_operation_ = ActiveOperation::kNone;
   int64_t active_token_ = 0;
   Future<> idle_ = Future<>::MakeFinished();
@@ -429,12 +434,7 @@ class NativeAsyncFlightMessageWriter final
   Future<> WriteMetadata(std::shared_ptr<Buffer> app_metadata) override {
     {
       std::lock_guard<std::mutex> guard(mutex_);
-      if (closed_) {
-        return Future<>::MakeFinished(Status::Invalid("This writer is already closed"));
-      }
-      if (failed_) {
-        return Future<>::MakeFinished(failure_status_);
-      }
+      RETURN_NOT_OK(CheckWritableLocked());
     }
     FlightPayload payload;
     payload.app_metadata = std::move(app_metadata);
@@ -445,11 +445,12 @@ class NativeAsyncFlightMessageWriter final
   Future<> WriteWithMetadata(const RecordBatch& batch,
                              std::shared_ptr<Buffer> app_metadata) override {
     std::vector<FlightPayload> payloads;
+    std::vector<DictionaryUpdate> dictionary_updates;
     {
       std::lock_guard<std::mutex> guard(mutex_);
       RETURN_NOT_OK(CheckStartedLocked());
       RETURN_NOT_OK(ReserveWriteLocked());
-      auto status = BuildDictionaryPayloadsLocked(batch, &payloads);
+      auto status = BuildDictionaryPayloadsLocked(batch, &payloads, &dictionary_updates);
       if (!status.ok()) {
         write_in_flight_ = false;
         return Future<>::MakeFinished(std::move(status));
@@ -465,6 +466,7 @@ class NativeAsyncFlightMessageWriter final
       ++stats_.num_record_batches;
       stats_.total_raw_body_size += payloads.back().ipc_message.raw_body_length;
       stats_.total_serialized_body_size += payloads.back().ipc_message.body_length;
+      CommitDictionaryUpdatesLocked(std::move(dictionary_updates));
     }
     return WritePayloads(std::move(payloads), /*reserved=*/true);
   }
@@ -483,16 +485,22 @@ class NativeAsyncFlightMessageWriter final
   }
 
  private:
-  /// Validate that batch writes are legal while mutex_ is held.
-  Status CheckStartedLocked() const {
+  /// Validate that the writer can accept another operation while mutex_ is held.
+  Status CheckWritableLocked() const {
     if (failed_) {
       return failure_status_;
     }
-    if (!begun_) {
-      return Status::Invalid("This writer is not started. Call Begin() with a schema");
-    }
     if (closed_) {
       return Status::Invalid("This writer is already closed");
+    }
+    return Status::OK();
+  }
+
+  /// Validate that batch writes are legal while mutex_ is held.
+  Status CheckStartedLocked() const {
+    RETURN_NOT_OK(CheckWritableLocked());
+    if (!begun_) {
+      return Status::Invalid("This writer is not started. Call Begin() with a schema");
     }
     return Status::OK();
   }
@@ -506,9 +514,17 @@ class NativeAsyncFlightMessageWriter final
     return Status::OK();
   }
 
+  struct DictionaryUpdate {
+    int64_t id;
+    std::shared_ptr<Array> dictionary;
+    bool is_delta;
+    bool had_previous;
+  };
+
   /// Collect and encode required dictionary replacements or deltas under mutex_.
   Status BuildDictionaryPayloadsLocked(const RecordBatch& batch,
-                                       std::vector<FlightPayload>* payloads) {
+                                       std::vector<FlightPayload>* payloads,
+                                       std::vector<DictionaryUpdate>* updates) {
     ARROW_ASSIGN_OR_RAISE(const auto dictionaries,
                           ipc::CollectDictionaries(batch, *mapper_));
     const auto equal_options = EqualOptions().nans_equal(true);
@@ -547,17 +563,25 @@ class NativeAsyncFlightMessageWriter final
                                                 &payload.ipc_message));
       }
       payloads->push_back(std::move(payload));
+      updates->push_back(
+          {dictionary_id, dictionary, delta_start != 0, dictionary_exists});
+    }
+    return Status::OK();
+  }
+
+  /// Commit dictionary state after the complete batch payload is serialized.
+  void CommitDictionaryUpdatesLocked(std::vector<DictionaryUpdate> updates) {
+    for (auto& update : updates) {
+      last_dictionaries_[update.id] = std::move(update.dictionary);
       ++stats_.num_dictionary_batches;
-      if (dictionary_exists) {
-        if (delta_start) {
+      if (update.had_previous) {
+        if (update.is_delta) {
           ++stats_.num_dictionary_deltas;
         } else {
           ++stats_.num_replaced_dictionaries;
         }
       }
-      *last_dictionary = dictionary;
     }
-    return Status::OK();
   }
 
   /// Serialize a payload sequence through one gRPC write at a time.
@@ -584,10 +608,7 @@ class NativeAsyncFlightMessageWriter final
   void WritePayloadAt(const std::shared_ptr<WriteState>& state, size_t index,
                       Future<> out) {
     if (index >= state->payloads.size()) {
-      {
-        std::lock_guard<std::mutex> guard(mutex_);
-        write_in_flight_ = false;
-      }
+      FinishWrite();
       out.MarkFinished();
       return;
     }
@@ -670,8 +691,8 @@ Future<AsyncMessageReader> MakeAsyncMessageReader(
   auto first_message = read_fn();
   return first_message.Then(
       [read_fn = std::move(read_fn), memory_manager = std::move(memory_manager)](
-          std::shared_ptr<internal::FlightData> message)
-          mutable -> ::arrow::Result<AsyncMessageReader> {
+          std::shared_ptr<internal::FlightData> message) mutable
+          -> ::arrow::Result<AsyncMessageReader> {
         if (!message) {
           return Status::IOError("Stream finished before first message sent");
         }
@@ -686,8 +707,8 @@ Future<AsyncMessageReader> MakeAsyncMessageReader(
         auto impl = std::make_shared<NativeAsyncFlightMessageReader>(
             std::move(descriptor), std::move(data), std::move(read_fn), memory_manager);
         return AsyncMessageReader{
-            std::make_unique<SharedAsyncFlightMessageReader>(impl),
-            [impl] { return impl->WhenIdle(); }};
+            .reader = std::make_unique<SharedAsyncFlightMessageReader>(impl),
+            .when_idle = [impl] { return impl->WhenIdle(); }};
       });
 }
 
