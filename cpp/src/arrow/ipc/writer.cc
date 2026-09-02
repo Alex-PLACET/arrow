@@ -1191,6 +1191,68 @@ IpcPayloadWriter::~IpcPayloadWriter() = default;
 
 Status IpcPayloadWriter::Start() { return Status::OK(); }
 
+Status ComputeDictionaryFrames(
+    const RecordBatch& batch, bool is_file_format, const IpcWriteOptions& options,
+    const DictionaryFieldMapper& mapper,
+    std::unordered_map<int64_t, std::shared_ptr<Array>>* last_dictionaries,
+    std::vector<DictionaryFrame>* frames) {
+  ARROW_ASSIGN_OR_RAISE(const auto dictionaries, CollectDictionaries(batch, mapper));
+  const auto equal_options = EqualOptions().nans_equal(true);
+
+  for (const auto& [dictionary_id, dictionary] : dictionaries) {
+    auto* last_dictionary = &(*last_dictionaries)[dictionary_id];
+    const bool dictionary_exists = (*last_dictionary != nullptr);
+    int64_t delta_start = 0;
+    if (dictionary_exists) {
+      if ((*last_dictionary)->data() == dictionary->data()) {
+        // Same dictionary data by pointer => no need to emit it again
+        continue;
+      }
+      const int64_t last_length = (*last_dictionary)->length();
+      const int64_t new_length = dictionary->length();
+      if (new_length == last_length &&
+          ((*last_dictionary)->Equals(dictionary, equal_options))) {
+        // Same dictionary by value => no need to emit it again
+        // (while this can have a CPU cost, this code path is required
+        //  for the IPC file format)
+        continue;
+      }
+
+      // (the read path doesn't support outer dictionary deltas, don't emit them)
+      if (new_length > last_length && options.emit_dictionary_deltas &&
+          !HasNestedDict(*dictionary->data()) &&
+          ((*last_dictionary)
+               ->RangeEquals(dictionary, 0, last_length, 0, equal_options))) {
+        // New dictionary starts with the current dictionary
+        delta_start = last_length;
+      }
+
+      if (is_file_format && !delta_start) {
+        return Status::Invalid(
+            "Dictionary replacement detected when writing IPC file format. "
+            "Arrow IPC files only support a single non-delta dictionary for "
+            "a given field across all batches.");
+      }
+    }
+
+    DictionaryFrame frame;
+    if (delta_start) {
+      RETURN_NOT_OK(GetDictionaryPayload(dictionary_id, /*is_delta=*/true,
+                                         dictionary->Slice(delta_start), options,
+                                         &frame.payload));
+    } else {
+      RETURN_NOT_OK(GetDictionaryPayload(dictionary_id, dictionary, options,
+                                         &frame.payload));
+    }
+    frame.id = dictionary_id;
+    frame.dictionary = dictionary;
+    frame.is_delta = (delta_start != 0);
+    frame.had_previous = dictionary_exists;
+    frames->push_back(std::move(frame));
+  }
+  return Status::OK();
+}
+
 class ARROW_EXPORT IpcFormatWriter : public RecordBatchWriter {
  public:
   // A RecordBatchWriter implementation that writes to a IpcPayloadWriter.
@@ -1277,71 +1339,23 @@ class ARROW_EXPORT IpcFormatWriter : public RecordBatchWriter {
   }
 
   Status WriteDictionaries(const RecordBatch& batch) {
-    ARROW_ASSIGN_OR_RAISE(const auto dictionaries, CollectDictionaries(batch, mapper_));
-    const auto equal_options = EqualOptions().nans_equal(true);
+    std::vector<internal::DictionaryFrame> frames;
+    RETURN_NOT_OK(internal::ComputeDictionaryFrames(batch, is_file_format_, options_,
+                                                    mapper_, &last_dictionaries_,
+                                                    &frames));
 
-    for (const auto& pair : dictionaries) {
-      int64_t dictionary_id = pair.first;
-      const auto& dictionary = pair.second;
-
-      // If a dictionary with this id was already emitted, check if it was the same.
-      auto* last_dictionary = &last_dictionaries_[dictionary_id];
-      const bool dictionary_exists = (*last_dictionary != nullptr);
-      int64_t delta_start = 0;
-      if (dictionary_exists) {
-        if ((*last_dictionary)->data() == dictionary->data()) {
-          // Fast shortcut for a common case.
-          // Same dictionary data by pointer => no need to emit it again
-          continue;
-        }
-        const int64_t last_length = (*last_dictionary)->length();
-        const int64_t new_length = dictionary->length();
-        if (new_length == last_length &&
-            ((*last_dictionary)->Equals(dictionary, equal_options))) {
-          // Same dictionary by value => no need to emit it again
-          // (while this can have a CPU cost, this code path is required
-          //  for the IPC file format)
-          continue;
-        }
-
-        // (the read path doesn't support outer dictionary deltas, don't emit them)
-        if (new_length > last_length && options_.emit_dictionary_deltas &&
-            !HasNestedDict(*dictionary->data()) &&
-            ((*last_dictionary)
-                 ->RangeEquals(dictionary, 0, last_length, 0, equal_options))) {
-          // New dictionary starts with the current dictionary
-          delta_start = last_length;
-        }
-
-        if (is_file_format_ && !delta_start) {
-          return Status::Invalid(
-              "Dictionary replacement detected when writing IPC file format. "
-              "Arrow IPC files only support a single non-delta dictionary for "
-              "a given field across all batches.");
-        }
-      }
-
-      IpcPayload payload;
-      if (delta_start) {
-        RETURN_NOT_OK(GetDictionaryPayload(dictionary_id, /*is_delta=*/true,
-                                           dictionary->Slice(delta_start), options_,
-                                           &payload));
-      } else {
-        RETURN_NOT_OK(
-            GetDictionaryPayload(dictionary_id, dictionary, options_, &payload));
-      }
-      RETURN_NOT_OK(WritePayload(payload));
+    for (auto& frame : frames) {
+      RETURN_NOT_OK(WritePayload(frame.payload));
+      // Remember dictionary for next batches
+      last_dictionaries_[frame.id] = std::move(frame.dictionary);
       ++stats_.num_dictionary_batches;
-      if (dictionary_exists) {
-        if (delta_start) {
+      if (frame.had_previous) {
+        if (frame.is_delta) {
           ++stats_.num_dictionary_deltas;
         } else {
           ++stats_.num_replaced_dictionaries;
         }
       }
-
-      // Remember dictionary for next batches
-      *last_dictionary = dictionary;
     }
     return Status::OK();
   }

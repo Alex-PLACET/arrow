@@ -24,25 +24,12 @@
 #include <utility>
 
 #include "arrow/array/array_base.h"
-#include "arrow/array/data.h"
-#include "arrow/compare.h"
 #include "arrow/flight/serialization_internal.h"
 #include "arrow/ipc/dictionary.h"
 #include "arrow/ipc/writer.h"
 
 namespace arrow::flight::transport::grpc::async_internal {
 namespace {
-
-/// Return whether an array contains a nested dictionary, which cannot use deltas.
-bool HasNestedDictionary(const ArrayData& data) {
-  if (data.type->id() == Type::DICTIONARY) {
-    return true;
-  }
-  return std::ranges::any_of(data.child_data,
-                             [](const std::shared_ptr<ArrayData>& child) {
-                               return HasNestedDictionary(*child);
-                             });
-}
 
 /// Serializes Arrow schemas, batches, dictionaries, and metadata to FlightData.
 class NativeAsyncFlightMessageWriter final
@@ -151,7 +138,7 @@ class NativeAsyncFlightMessageWriter final
   Status CheckWritableLocked() const {
     switch (state_) {
       case State::kNotStarted:
-        return Status::Invalid("This writer is not started. Call Begin() with a schema");
+        return Status::OK();
       case State::kOpen:
         return Status::OK();
       case State::kClosed:
@@ -159,6 +146,7 @@ class NativeAsyncFlightMessageWriter final
       case State::kFailed:
         return failure_status_;
     }
+    return Status::Invalid("Invalid writer state");
   }
 
   /// Validate that batch writes are legal while mutex_ is held.
@@ -194,46 +182,18 @@ class NativeAsyncFlightMessageWriter final
   Status BuildDictionaryPayloadsLocked(const RecordBatch& batch,
                                        std::vector<FlightPayload>& payloads,
                                        std::vector<DictionaryUpdate>& updates) {
-    ARROW_ASSIGN_OR_RAISE(const auto dictionaries,
-                          ipc::CollectDictionaries(batch, *mapper_));
-    const auto equal_options = EqualOptions().nans_equal(true);
-
-    for (const auto& [dictionary_id, dictionary] : dictionaries) {
-      const auto* last_dictionary = &last_dictionaries_[dictionary_id];
-      const bool dictionary_exists = (*last_dictionary != nullptr);
-      int64_t delta_start = 0;
-      if (dictionary_exists) {
-        if ((*last_dictionary)->data() == dictionary->data()) {
-          continue;
-        }
-        const int64_t last_length = (*last_dictionary)->length();
-        const int64_t new_length = dictionary->length();
-        if (new_length == last_length &&
-            ((*last_dictionary)->Equals(dictionary, equal_options))) {
-          continue;
-        }
-        if (new_length > last_length && options_.emit_dictionary_deltas &&
-            !HasNestedDictionary(*dictionary->data()) &&
-            ((*last_dictionary)
-                 ->RangeEquals(dictionary, 0, last_length, 0, equal_options))) {
-          delta_start = last_length;
-        }
-      }
-
+    std::vector<ipc::internal::DictionaryFrame> frames;
+    RETURN_NOT_OK(ipc::internal::ComputeDictionaryFrames(
+        batch, /*is_file_format=*/false, options_, *mapper_, &last_dictionaries_,
+        &frames));
+    for (auto& frame : frames) {
       FlightPayload payload;
-      if (delta_start) {
-        RETURN_NOT_OK(ipc::GetDictionaryPayload(dictionary_id, /*is_delta=*/true,
-                                                dictionary->Slice(delta_start), options_,
-                                                &payload.ipc_message));
-      } else {
-        RETURN_NOT_OK(ipc::GetDictionaryPayload(dictionary_id, dictionary, options_,
-                                                &payload.ipc_message));
-      }
+      payload.ipc_message = std::move(frame.payload);
       payloads.push_back(std::move(payload));
-      updates.push_back({.id = dictionary_id,
-                         .dictionary = dictionary,
-                         .is_delta = (delta_start != 0),
-                         .had_previous = dictionary_exists});
+      updates.push_back({.id = frame.id,
+                         .dictionary = std::move(frame.dictionary),
+                         .is_delta = frame.is_delta,
+                         .had_previous = frame.had_previous});
     }
     return Status::OK();
   }

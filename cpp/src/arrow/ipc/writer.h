@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "arrow/ipc/dictionary.h"  // IWYU pragma: export
@@ -420,6 +421,39 @@ Status GetSparseTensorPayload(const SparseTensor& sparse_tensor, MemoryPool* poo
 namespace internal {
 
 // These internal APIs may change without warning or deprecation
+
+/// A single dictionary payload to emit before a record batch, along with the
+/// bookkeeping needed to advance the stream's dictionary tracking state.
+struct DictionaryFrame {
+  /// Dictionary id in the IPC schema.
+  int64_t id;
+  /// Serialized dictionary payload.
+  IpcPayload payload;
+  /// Dictionary values that become current for this id once the payload is written.
+  std::shared_ptr<Array> dictionary;
+  /// Whether this frame appends a delta to the previous dictionary.
+  bool is_delta;
+  /// Whether a previous dictionary existed for this id.
+  bool had_previous;
+};
+
+/// Compute the dictionary payloads that must precede a record batch.
+///
+/// Compares the batch's dictionaries against `last_dictionaries` (the
+/// dictionaries previously emitted for each id) and produces only what the
+/// stream requires: unchanged dictionaries are skipped, dictionaries that
+/// grow in place may become deltas, and otherwise a full replacement is
+/// emitted. For the IPC file format (`is_file_format`), replacements are
+/// rejected.
+///
+/// This function does not modify `last_dictionaries` or any stats; the
+/// caller applies each frame's bookkeeping as it writes the frame's payload.
+ARROW_EXPORT
+Status ComputeDictionaryFrames(
+    const RecordBatch& batch, bool is_file_format, const IpcWriteOptions& options,
+    const DictionaryFieldMapper& mapper,
+    std::unordered_map<int64_t, std::shared_ptr<Array>>* last_dictionaries,
+    std::vector<DictionaryFrame>* frames);
 
 class ARROW_EXPORT IpcPayloadWriter {
  public:
