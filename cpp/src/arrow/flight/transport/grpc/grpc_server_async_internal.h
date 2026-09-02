@@ -181,24 +181,20 @@ MakeHandshakeReactor(::grpc::CallbackServerContext* context,
     const CallbackServiceHelper& helper);
 
 ::grpc::ServerWriteReactor<pb::FlightInfo>* MakeListFlightsReactor(
-    ::grpc::CallbackServerContext* context,
     std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context,
     Future<std::unique_ptr<FlightListing>> future);
 
 ::grpc::ServerWriteReactor<pb::ActionType>* MakeListActionsReactor(
-    ::grpc::CallbackServerContext* context,
     std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context, Future<std::vector<ActionType>> future);
 
 ::grpc::ServerWriteReactor<pb::Result>* MakeDoActionReactor(
-    ::grpc::CallbackServerContext* context,
     std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context,
     Future<std::unique_ptr<ResultStream>> future);
 
 ::grpc::ServerWriteReactor<pb::FlightData>* MakeDoGetReactor(
-    ::grpc::CallbackServerContext* context,
     std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context,
     Future<std::unique_ptr<AsyncFlightDataStream>> future);
