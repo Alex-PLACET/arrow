@@ -95,7 +95,7 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
     ::grpc::CallbackServerContext* context, const pb::Criteria* request) {
   return HandleAuthenticatedStreamingCall<pb::FlightInfo>(
       helper_, FlightMethod::ListFlights, context,
-      [this, context, request](GrpcServerCallContext flight_context) {
+      [this, request](GrpcServerCallContext flight_context) {
         Criteria criteria;
         if (request) {
           auto conv = internal::FromProto(*request, &criteria);
@@ -104,8 +104,8 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
           }
         }
         auto future = impl_->base()->ListFlights(flight_context, &criteria);
-        return MakeListFlightsReactor(context, impl_->executor(),
-                                      std::move(flight_context), std::move(future));
+        return MakeListFlightsReactor(impl_->executor(), std::move(flight_context),
+                                      std::move(future));
       });
 }
 
@@ -141,7 +141,7 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
     ::grpc::CallbackServerContext* context, const pb::Ticket* request) {
   return HandleAuthenticatedStreamingCall<pb::FlightData>(
       helper_, FlightMethod::DoGet, context,
-      [this, context, request](GrpcServerCallContext flight_context) {
+      [this, request](GrpcServerCallContext flight_context) {
         Ticket ticket;
         const auto arrow_status = ParseRequiredRequest(request, "ticket", &ticket);
         if (!arrow_status.ok()) {
@@ -149,7 +149,7 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
               flight_context.FinishRequest(arrow_status));
         }
         auto future = impl_->base()->DoGet(flight_context, ticket);
-        return MakeDoGetReactor(context, impl_->executor(), std::move(flight_context),
+        return MakeDoGetReactor(impl_->executor(), std::move(flight_context),
                                 std::move(future));
       });
 }
@@ -171,10 +171,10 @@ CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
     ::grpc::CallbackServerContext* context, const pb::Empty*) {
   return HandleAuthenticatedStreamingCall<pb::ActionType>(
       helper_, FlightMethod::ListActions, context,
-      [this, context](GrpcServerCallContext flight_context) {
+      [this](GrpcServerCallContext flight_context) {
         auto future = impl_->base()->ListActions(flight_context);
-        return MakeListActionsReactor(context, impl_->executor(),
-                                      std::move(flight_context), std::move(future));
+        return MakeListActionsReactor(impl_->executor(), std::move(flight_context),
+                                      std::move(future));
       });
 }
 
@@ -183,14 +183,14 @@ CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
     ::grpc::CallbackServerContext* context, const pb::Action* request) {
   return HandleAuthenticatedStreamingCall<pb::Result>(
       helper_, FlightMethod::DoAction, context,
-      [this, context, request](GrpcServerCallContext flight_context) {
+      [this, request](GrpcServerCallContext flight_context) {
         Action action;
         const auto arrow_status = ParseRequiredRequest(request, "Action", &action);
         if (!arrow_status.ok()) {
           return FinishWriteNow<pb::Result>(flight_context.FinishRequest(arrow_status));
         }
         auto future = impl_->base()->DoAction(flight_context, action);
-        return MakeDoActionReactor(context, impl_->executor(), std::move(flight_context),
+        return MakeDoActionReactor(impl_->executor(), std::move(flight_context),
                                    std::move(future));
       });
 }

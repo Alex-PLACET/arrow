@@ -33,11 +33,9 @@ class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
   using WriteValue =
       std::conditional_t<std::is_same_v<Proto, pb::FlightData>, FlightPayload, Proto>;
 
-  AsyncWriteReactorBase(::grpc::CallbackServerContext* context,
-                        std::shared_ptr<arrow::internal::ThreadPool> executor,
+  AsyncWriteReactorBase(std::shared_ptr<arrow::internal::ThreadPool> executor,
                         GrpcServerCallContext flight_context)
-      : context_(context),
-        executor_(std::move(executor)),
+      : executor_(std::move(executor)),
         flight_context_(std::move(flight_context)) {}
 
   /// Remember gRPC cancellation for background producers.
@@ -136,7 +134,6 @@ class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
     }
   }
 
-  ::grpc::CallbackServerContext* context_;
   std::shared_ptr<arrow::internal::ThreadPool> executor_;
   GrpcServerCallContext flight_context_;
   WriteValue current_write_;
@@ -167,10 +164,9 @@ class IteratorReactor : public AsyncWriteReactorBase<Proto> {
   using NextFn = std::function<arrow::Result<std::unique_ptr<UserType>>()>;
   using ToProtoFn = std::function<Status(const UserType&, Proto*)>;
 
-  IteratorReactor(::grpc::CallbackServerContext* context,
-                  std::shared_ptr<arrow::internal::ThreadPool> executor,
+  IteratorReactor(std::shared_ptr<arrow::internal::ThreadPool> executor,
                   GrpcServerCallContext flight_context, ToProtoFn to_proto)
-      : AsyncWriteReactorBase<Proto>(context, std::move(executor),
+      : AsyncWriteReactorBase<Proto>(std::move(executor),
                                      std::move(flight_context)),
         to_proto_(std::move(to_proto)) {}
 
@@ -229,13 +225,10 @@ class IteratorReactor : public AsyncWriteReactorBase<Proto> {
 /// Streams an AsyncFlightDataStream to the DoGet gRPC response.
 class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
  public:
-  DoGetReactor(::grpc::CallbackServerContext* context,
-               std::shared_ptr<arrow::internal::ThreadPool> executor,
-               GrpcServerCallContext flight_context,
-               std::unique_ptr<AsyncFlightDataStream> stream)
-      : AsyncWriteReactorBase<pb::FlightData>(context, std::move(executor),
-                                              std::move(flight_context)),
-        stream_(std::move(stream)) {}
+  DoGetReactor(std::shared_ptr<arrow::internal::ThreadPool> executor,
+               GrpcServerCallContext flight_context)
+      : AsyncWriteReactorBase<pb::FlightData>(std::move(executor),
+                                              std::move(flight_context)) {}
 
   /// Install a source returned by AsyncFlightServerBase::DoGet.
   void StartAfter(Future<std::unique_ptr<AsyncFlightDataStream>> future) {
@@ -257,9 +250,8 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
 
   /// Select the next schema, payload, or close operation from the source.
   Status Advance() override {
-    if (this->cancelled())
-    {
-        return Status::OK();
+    if (this->cancelled()) {
+      return Status::OK();
     }
     if (!stream_) {
       this->FinishOnce(this->flight_context_.FinishRequest(
@@ -354,11 +346,10 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
 }  // namespace
 
 ::grpc::ServerWriteReactor<pb::FlightInfo>* MakeListFlightsReactor(
-    ::grpc::CallbackServerContext* context,
     std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context, Future<std::unique_ptr<FlightListing>> future) {
   auto* reactor = new IteratorReactor<pb::FlightInfo, FlightInfo>(
-      context, std::move(executor), std::move(flight_context),
+      std::move(executor), std::move(flight_context),
       [](const FlightInfo& info, pb::FlightInfo* out) {
         return internal::ToProto(info, out);
       });
@@ -374,11 +365,10 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
 }
 
 ::grpc::ServerWriteReactor<pb::ActionType>* MakeListActionsReactor(
-    ::grpc::CallbackServerContext* context,
     std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context, Future<std::vector<ActionType>> future) {
   auto* reactor = new IteratorReactor<pb::ActionType, ActionType>(
-      context, std::move(executor), std::move(flight_context),
+      std::move(executor), std::move(flight_context),
       [](const ActionType& action, pb::ActionType* out) {
         return internal::ToProto(action, out);
       });
@@ -395,11 +385,10 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
 }
 
 ::grpc::ServerWriteReactor<pb::Result>* MakeDoActionReactor(
-    ::grpc::CallbackServerContext* context,
     std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context, Future<std::unique_ptr<ResultStream>> future) {
   auto* reactor = new IteratorReactor<pb::Result, Result>(
-      context, std::move(executor), std::move(flight_context),
+      std::move(executor), std::move(flight_context),
       [](const Result& result, pb::Result* out) {
         return internal::ToProto(result, out);
       });
@@ -417,12 +406,11 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
 }
 
 ::grpc::ServerWriteReactor<pb::FlightData>* MakeDoGetReactor(
-    ::grpc::CallbackServerContext* context,
     std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context,
     Future<std::unique_ptr<AsyncFlightDataStream>> future) {
   auto* reactor =
-      new DoGetReactor(context, std::move(executor), std::move(flight_context), nullptr);
+      new DoGetReactor(std::move(executor), std::move(flight_context));
   reactor->StartAfter(std::move(future));
   return reactor;
 }
