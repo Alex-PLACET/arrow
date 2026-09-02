@@ -405,10 +405,12 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
       });
   reactor->StartAfter(std::move(future), [](std::unique_ptr<ResultStream> results) {
     auto state = std::make_shared<std::unique_ptr<ResultStream>>(std::move(results));
-    return [state]() mutable {
-      return *state ? (*state)->Next()
-                    : arrow::Result<std::unique_ptr<arrow::flight::Result>>(
-                          std::unique_ptr<arrow::flight::Result>{});
+    return [state]() mutable -> arrow::Result<std::unique_ptr<arrow::flight::Result>> {
+      if (!*state) {
+        // Mirror the sync server: a null result stream is cancelled.
+        return Status::Cancelled();
+      }
+      return (*state)->Next();
     };
   });
   return reactor;

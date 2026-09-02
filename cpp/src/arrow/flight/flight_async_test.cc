@@ -2225,6 +2225,43 @@ TEST_F(AsyncRpcCoverageTest, DoAction) {
   ASSERT_EQ(nullptr, terminal);
 }
 
+/// Returns a null result stream, mirroring the sync-server cancellation case.
+class AsyncNullResultStreamTestServer : public AsyncFlightServerBase {
+ public:
+  Future<std::unique_ptr<ResultStream>> DoAction(const ServerCallContext&,
+                                                 const Action&) override {
+    return Future<std::unique_ptr<ResultStream>>::MakeFinished(
+        std::unique_ptr<ResultStream>{});
+  }
+};
+
+class AsyncNullResultStreamTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
+    ASSERT_OK(MakeAsyncServer<AsyncNullResultStreamTestServer>(
+        location, &server_, &client_, [](FlightServerOptions*) { return Status::OK(); },
+        [](FlightClientOptions*) { return Status::OK(); }));
+  }
+
+  void TearDown() override {
+    ASSERT_OK(client_->Close());
+    ASSERT_OK(server_->Shutdown());
+    ASSERT_OK(server_->Wait());
+  }
+
+  std::unique_ptr<FlightClient> client_;
+  std::unique_ptr<AsyncFlightServerBase> server_;
+};
+
+TEST_F(AsyncNullResultStreamTest, DoActionNullStreamIsCancelled) {
+  // A null result stream must surface as cancellation, matching the sync server.
+  Action action{"null-stream", Buffer::FromString("")};
+  ASSERT_OK_AND_ASSIGN(auto results, client_->DoAction(action));
+  const auto status = results->Next().status();
+  ASSERT_TRUE(status.IsCancelled()) << status.ToString();
+}
+
 class GrpcAsyncServerConnectivityTest : public AsyncConnectivityTest {};
 ARROW_FLIGHT_ASYNC_TEST_CONNECTIVITY(GrpcAsyncServerConnectivityTest);
 
