@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -47,6 +48,9 @@ class NativeAsyncFlightMessageWriter final
     std::vector<FlightPayload> payloads;
     {
       std::lock_guard<std::mutex> guard(mutex_);
+      if (failure_status_) {
+        return Future<>::MakeFinished(*failure_status_);
+      }
       switch(state_) {
         case State::kNotStarted:
           break;
@@ -55,8 +59,6 @@ class NativeAsyncFlightMessageWriter final
               Status::Invalid("This writer has already been started."));
         case State::kClosed:
           return Future<>::MakeFinished(Status::Invalid("This writer is already closed"));
-        case State::kFailed:
-          return Future<>::MakeFinished(failure_status_);
       } 
       if (!schema) {
         return Future<>::MakeFinished(Status::Invalid("Schema cannot be null"));
@@ -121,7 +123,7 @@ class NativeAsyncFlightMessageWriter final
   /// Prevent future writes without cancelling an active write.
   Future<> Close() override {
     std::lock_guard<std::mutex> guard(mutex_);
-    if (state_ != State::kFailed) {
+    if (!failure_status_) {
       state_ = State::kClosed;
     }
     return Future<>::MakeFinished();
@@ -136,15 +138,15 @@ class NativeAsyncFlightMessageWriter final
  private:
   /// Validate that the writer can accept another operation while mutex_ is held.
   Status CheckWritableLocked() const {
+    if (failure_status_) {
+      return *failure_status_;
+    }
     switch (state_) {
       case State::kNotStarted:
-        return Status::OK();
       case State::kOpen:
         return Status::OK();
       case State::kClosed:
         return Status::Invalid("This writer is already closed");
-      case State::kFailed:
-        return failure_status_;
     }
     return Status::Invalid("Invalid writer state");
   }
@@ -253,7 +255,6 @@ class NativeAsyncFlightMessageWriter final
     std::lock_guard<std::mutex> guard(mutex_);
     write_in_flight_ = false;
     if (!status.ok()) {
-      state_ = State::kFailed;
       failure_status_ = status;
     }
   }
@@ -272,11 +273,11 @@ class NativeAsyncFlightMessageWriter final
   ipc::WriteStats stats_;
   /// Whether one or more payloads are currently being written.
   bool write_in_flight_ = false;
-  enum class State { kNotStarted, kOpen, kClosed, kFailed };
+  enum class State { kNotStarted, kOpen, kClosed };
   /// Lifecycle state of the writer, excluding the independent write operation state.
   State state_ = State::kNotStarted;
-  /// Error returned by subsequent operations after a terminal write failure.
-  Status failure_status_;
+  /// Terminal write error; a set value means the writer has failed.
+  std::optional<Status> failure_status_;
 };
 
 }  // namespace

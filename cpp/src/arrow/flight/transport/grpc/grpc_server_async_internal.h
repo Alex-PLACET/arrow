@@ -59,7 +59,7 @@ Status ParseRequiredRequest(const ProtoRequest* request, const char* request_nam
   if (request == nullptr) {
     return Status::Invalid(request_name, " cannot be null");
   }
-    return ::arrow::flight::internal::FromProto(*request, out);
+  return ::arrow::flight::internal::FromProto(*request, out);
 }
 
 template <typename ArrowResponse, typename ProtoResponse, typename ToProtoFn>
