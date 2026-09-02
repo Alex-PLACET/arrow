@@ -194,8 +194,13 @@ set(ARROW_FLIGHT_SRCS
     transport/grpc/grpc_server.cc
     transport/grpc/grpc_server_internal.cc
     transport/grpc/grpc_server_async.cc
+    transport/grpc/grpc_server_async_service.cc
     transport/grpc/grpc_server_async_bidi.cc
-    transport/grpc/grpc_server_async_message.cc
+    transport/grpc/grpc_server_async_message_reader.cc
+    transport/grpc/grpc_server_async_message_reader_shared.cc
+    transport/grpc/grpc_server_async_metadata_writer.cc
+    transport/grpc/grpc_server_async_message_writer.cc
+    transport/grpc/grpc_server_async_message_writer_shared.cc
     transport/grpc/grpc_server_async_stream.cc
     transport/grpc/serialization_internal.cc
     transport/grpc/protocol_grpc_internal.cc
