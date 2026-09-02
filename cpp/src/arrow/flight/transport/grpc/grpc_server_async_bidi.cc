@@ -31,16 +31,16 @@ namespace {
 
 /// Shared state machine for callback bidi RPCs, including synchronous handshake
 /// compatibility and future-based Flight data reads/writes.
-template <typename Req, typename Resp>
-class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
+template <typename Request, typename Response>
+class BidiReactorBase : public ::grpc::ServerBidiReactor<Request, Response> {
  public:
   using ReadValue =
-      std::conditional_t<std::is_same_v<Req, pb::FlightData>, internal::FlightData, Req>;
+      std::conditional_t<std::is_same_v<Request, pb::FlightData>, internal::FlightData, Request>;
   using WriteValue =
-      std::conditional_t<std::is_same_v<Resp, pb::FlightData>, FlightPayload, Resp>;
+      std::conditional_t<std::is_same_v<Response, pb::FlightData>, FlightPayload, Response>;
   using AsyncReadValue =
-      std::conditional_t<std::is_same_v<Req, pb::FlightData>,
-                         std::shared_ptr<internal::FlightData>, std::optional<Req>>;
+      std::conditional_t<std::is_same_v<Request, pb::FlightData>,
+                         std::shared_ptr<internal::FlightData>, std::optional<Request>>;
 
   BidiReactorBase(::grpc::CallbackServerContext* context,
                   std::shared_ptr<arrow::internal::ThreadPool> executor)
@@ -76,29 +76,24 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     bool start_next_read = false;
 
     {
-      std::unique_lock<std::mutex> lock(mutex_);
+      std::lock_guard<std::mutex> lock(mutex_);
       read_in_flight_ = false;
       if (ok) {
         completed_read.emplace(std::move(read_buffer_));
-        if (pending_read_active_) {
-          pending_future = pending_read_;
-          pending_read_active_ = false;
-          pending_read_ = Future<AsyncReadValue>();
-          resolve_pending = true;
-          if (!cancelled_) {
-            read_in_flight_ = true;
-            start_next_read = true;
-          }
-        } else {
+        if (!pending_read_active_) {
           reads_.push_back(std::move(*completed_read));
         }
       } else {
         reads_done_ = true;
-        if (pending_read_active_) {
-          pending_future = pending_read_;
-          pending_read_active_ = false;
-          pending_read_ = Future<AsyncReadValue>();
-          resolve_pending = true;
+      }
+      if (pending_read_active_) {
+        pending_future = pending_read_;
+        pending_read_active_ = false;
+        pending_read_ = Future<AsyncReadValue>();
+        resolve_pending = true;
+        if (ok && !cancelled_) {
+          read_in_flight_ = true;
+          start_next_read = true;
         }
       }
     }
@@ -182,10 +177,10 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   void OnDone() override { ReleaseRef(); }
 
   /// Synchronously read one message for legacy handshake authentication.
-  bool ReadOne(Req* out) { return PopRead(out); }
+  bool ReadOne(Request* out) { return PopRead(out); }
 
-  /// Synchronously write one message for legacy handshake authentication.
-  bool WriteOnePublic(Resp message) { return WriteOne(std::move(message)); }
+/// Block a compatibility caller until a gRPC write completes.
+  bool WriteOne(Response message) { return WriteOneImpl(std::move(message)); }
 
   /// Return the next inbound message while enforcing one outstanding read.
   Future<AsyncReadValue> ReadOneAsync() {
@@ -228,30 +223,20 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   }
 
   /// Start an asynchronous protobuf response write.
-  Future<bool> WriteOneAsync(Resp message) { return StartAsyncWrite(std::move(message)); }
+  Future<bool> WriteOneAsync(Response message) { return StartAsyncWrite(std::move(message)); }
 
   /// Validate and start an asynchronous FlightData response write.
   Future<bool> WritePayloadAsync(FlightPayload payload) {
-    static_assert(std::is_same_v<Resp, pb::FlightData>);
+    static_assert(std::is_same_v<Response, pb::FlightData>);
     RETURN_NOT_OK(payload.Validate());
     return StartAsyncWrite(std::move(payload));
   }
 
   /// Synchronously write a Flight payload for legacy server streams.
   arrow::Result<bool> WritePayloadPublic(FlightPayload payload) {
-    static_assert(std::is_same_v<Resp, pb::FlightData>);
+    static_assert(std::is_same_v<Response, pb::FlightData>);
     RETURN_NOT_OK(payload.Validate());
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (cancelled_)
-    {   
-        return false;
-    }
-    current_write_ = std::move(payload);
-    write_in_flight_ = true;
-    write_ok_ = true;
-    this->StartWrite(GrpcWriteBuffer());
-    cv_.wait(lock, [&] { return !write_in_flight_ || cancelled_; });
-    return !cancelled_ && write_ok_;
+    return WriteOneImpl(std::move(payload));
   }
 
   /// Retain this self-owned reactor across an asynchronous callback.
@@ -261,7 +246,7 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   void ReleaseHold() { ReleaseRef(); }
 
  protected:
-  
+  /// Start one outbound write while enforcing the single-write contract.
   Future<bool> StartAsyncWrite(WriteValue message) {
     std::unique_lock<std::mutex> lock(mutex_);
     if (cancelled_) {
@@ -279,7 +264,8 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     return pending_write_;
   }
 
-  bool PopRead(Req* out) {
+  /// Block a compatibility caller until an inbound message or end-of-stream.
+  bool PopRead(Request* out) {
     bool start_read = false;
     std::unique_lock<std::mutex> lock(mutex_);
     if (reads_.empty() && !cancelled_ && !reads_done_ && !read_in_flight_) {
@@ -300,10 +286,12 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     return false;
   }
 
-  /// Block a compatibility caller until a gRPC write completes.
-  bool WriteOne(Resp message) {
+  /// Start a synchronous write for either a protobuf or FlightData response.
+  bool WriteOneImpl(WriteValue message) {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (cancelled_) return false;
+    if (cancelled_) {
+      return false;
+    }
     current_write_ = std::move(message);
     write_in_flight_ = true;
     write_ok_ = true;
@@ -312,6 +300,7 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
     return !cancelled_ && write_ok_;
   }
 
+  /// Request RPC completion, deferring it until an active write finishes.
   void FinishFromWorker(::grpc::Status status) {
     bool finish_now = false;
     ::grpc::Status finish_status;
@@ -336,18 +325,18 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
   }
 
   /// Return the protobuf storage used by gRPC for the next inbound message.
-  Req* GrpcReadBuffer() {
-    if constexpr (std::is_same_v<Req, pb::FlightData>) {
-      return reinterpret_cast<Req*>(&read_buffer_);
+  Request* GrpcReadBuffer() {
+    if constexpr (std::is_same_v<Request, pb::FlightData>) {
+      return reinterpret_cast<Request*>(&read_buffer_);
     } else {
       return &read_buffer_;
     }
   }
 
   /// Return the protobuf storage used by gRPC for the active outbound message.
-  Resp* GrpcWriteBuffer() {
-    if constexpr (std::is_same_v<Resp, pb::FlightData>) {
-      return reinterpret_cast<Resp*>(&current_write_);
+  Response* GrpcWriteBuffer() {
+    if constexpr (std::is_same_v<Response, pb::FlightData>) {
+      return reinterpret_cast<Response*>(&current_write_);
     } else {
       return &current_write_;
     }
@@ -355,58 +344,77 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Req, Resp> {
 
   /// Convert a transport read value to the public async representation.
   AsyncReadValue MakeAsyncReadValue(ReadValue value) {
-    if constexpr (std::is_same_v<Req, pb::FlightData>) {
+    if constexpr (std::is_same_v<Request, pb::FlightData>) {
       return std::make_shared<internal::FlightData>(std::move(value));
     } else {
-      return std::optional<Req>(std::move(value));
+      return std::optional<Request>(std::move(value));
     }
   }
 
   /// Return the public end-of-stream representation for this request type.
   AsyncReadValue EndAsyncReadValue() {
-    if constexpr (std::is_same_v<Req, pb::FlightData>) {
+    if constexpr (std::is_same_v<Request, pb::FlightData>) {
       return nullptr;
     } else {
-      return std::optional<Req>{};
+      return std::optional<Request>{};
     }
   }
 
+  /// gRPC context associated with this reactor.
   ::grpc::CallbackServerContext* context_;
+  /// Executor used for blocking compatibility handlers.
   std::shared_ptr<arrow::internal::ThreadPool> executor_;
+  /// Protobuf storage supplied to the next gRPC read.
   ReadValue read_buffer_;
+  /// Inbound messages buffered until an application read consumes them.
   std::deque<ReadValue> reads_;
+  /// Protobuf or FlightPayload storage supplied to the active gRPC write.
   WriteValue current_write_;
+  /// Protects all read, write, cancellation, and completion state.
   std::mutex mutex_;
+  /// Wakes compatibility callers after reads, writes, or cancellation.
   std::condition_variable cv_;
+  /// Whether gRPC has delivered the inbound end-of-stream signal.
   bool reads_done_ = false;
+  /// Future for the one application read currently waiting for gRPC input.
   Future<AsyncReadValue> pending_read_;
+  /// Whether pending_read_ contains an unresolved application read.
   bool pending_read_active_ = false;
+  /// Whether a gRPC read is currently armed.
   bool read_in_flight_ = false;
+  /// Whether gRPC has cancelled the RPC.
   bool cancelled_ = false;
+  /// Future completed when the one application write currently in progress ends.
   Future<bool> pending_write_;
+  /// Whether pending_write_ contains an unresolved application write.
   bool pending_write_active_ = false;
+  /// Whether a gRPC write is currently active.
   bool write_in_flight_ = false;
+  /// Result reported by the most recent completed gRPC write.
   bool write_ok_ = true;
+  /// Whether a worker has requested RPC completion.
   bool finish_requested_ = false;
+  /// gRPC status to use when the active write has completed.
   ::grpc::Status finish_status_;
+  /// Self-owned reactor references held by gRPC and background callbacks.
   std::atomic<int> refs_{1};
 };
 
 /// Dispatches DoPut or DoExchange after authentication and the first input frame.
-template <typename Resp>
-class AsyncBidiFlightReactor final : public BidiReactorBase<pb::FlightData, Resp> {
+template <typename Response>
+class AsyncBidiFlightReactor final : public BidiReactorBase<pb::FlightData, Response> {
  public:
   AsyncBidiFlightReactor(::grpc::CallbackServerContext* context,
                          AsyncGrpcServerTransport* impl,
                          const CallbackServiceHelper& helper)
-      : BidiReactorBase<pb::FlightData, Resp>(context, impl->executor()),
+      : BidiReactorBase<pb::FlightData, Response>(context, impl->executor()),
         impl_(impl),
         helper_(helper),
         flight_context_(context) {}
 
   /// Authenticate the RPC and asynchronously acquire its public reader.
   void Start() {
-    constexpr auto kMethod = std::is_same_v<Resp, pb::PutResult>
+    constexpr auto kMethod = std::is_same_v<Response, pb::PutResult>
                                  ? FlightMethod::DoPut
                                  : FlightMethod::DoExchange;
     auto st =
@@ -435,7 +443,7 @@ class AsyncBidiFlightReactor final : public BidiReactorBase<pb::FlightData, Resp
         std::move(const_cast<::arrow::Result<AsyncMessageReader>&>(result))
             .MoveValueUnsafe();
     Future<> completion;
-    if constexpr (std::is_same_v<Resp, pb::PutResult>) {
+    if constexpr (std::is_same_v<Response, pb::PutResult>) {
       completion = impl_->base()->DoPut(
           flight_context_, reader_and_state.TakeReader(),
           MakeAsyncMetadataWriter([this](pb::PutResult result) {
@@ -467,8 +475,11 @@ class AsyncBidiFlightReactor final : public BidiReactorBase<pb::FlightData, Resp
         });
   }
 
+  /// Async transport providing the server implementation and executor.
   AsyncGrpcServerTransport* impl_;
+  /// Authentication and middleware helper for this RPC.
   const CallbackServiceHelper& helper_;
+  /// Flight context used for authentication and status conversion.
   GrpcServerCallContext flight_context_;
 };
 
@@ -500,7 +511,7 @@ MakeHandshakeReactor(::grpc::CallbackServerContext* context,
         auto outgoing = std::make_unique<
             ::arrow::flight::transport::grpc::GrpcServerAuthSender<
                 pb::HandshakeResponse>>([this](pb::HandshakeResponse response) {
-          return this->WriteOnePublic(std::move(response));
+          return this->WriteOne(std::move(response));
         });
         auto incoming = std::make_unique<
             ::arrow::flight::transport::grpc::GrpcServerAuthReader<
@@ -528,8 +539,11 @@ MakeHandshakeReactor(::grpc::CallbackServerContext* context,
     }
 
    private:
+    /// Async transport providing the server implementation.
     AsyncGrpcServerTransport* impl_;
+    /// Authentication and middleware helper for the handshake.
     const CallbackServiceHelper& helper_;
+    /// Flight context used for handshake authentication and completion.
     GrpcServerCallContext flight_context_;
   };
 

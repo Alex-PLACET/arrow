@@ -28,9 +28,9 @@ arrow::Result<std::shared_ptr<arrow::internal::ThreadPool>> MakeAsyncGrpcExecuto
                                         FlightMethod method,
                                         ::grpc::CallbackServerContext* context,
                                         GrpcServerCallContext* flight_context) {
-  auto st = helper.CheckAuth(method, context, flight_context);
-  if (!st.ok()) {
-    return st;
+  const auto status = helper.CheckAuth(method, context, flight_context);
+  if (!status.ok()) {
+    return status;
   }
   helper.AddMiddlewareHeaders(context, flight_context);
   return ::grpc::Status::OK;
@@ -38,7 +38,7 @@ arrow::Result<std::shared_ptr<arrow::internal::ThreadPool>> MakeAsyncGrpcExecuto
 
 AsyncGrpcServerTransport::AsyncGrpcServerTransport(
     AsyncFlightServerBase* base, std::shared_ptr<MemoryManager> memory_manager)
-  : arrow::flight::internal::AsyncServerTransport(base, std::move(memory_manager)) {}
+    : arrow::flight::internal::AsyncServerTransport(base, std::move(memory_manager)) {}
 
 AsyncGrpcServerTransport::~AsyncGrpcServerTransport() = default;
 
@@ -71,168 +71,6 @@ Status AsyncGrpcServerTransport::Wait() {
 }
 
 Location AsyncGrpcServerTransport::location() const { return location_; }
-
-/// Bridge the generated callback service to the async handshake reactor.
-::grpc::ServerBidiReactor<pb::HandshakeRequest, pb::HandshakeResponse>*
-CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
-  return MakeHandshakeReactor(context, impl_, helper_);
-}
-
-/// Authenticate ListFlights and stream the returned FlightListing iterator.
-::grpc::ServerWriteReactor<pb::FlightInfo>* CallbackFlightService::ListFlights(
-    ::grpc::CallbackServerContext* context, const pb::Criteria* request) {
-  GrpcServerCallContext flight_context(context);
-  auto st = PrepareAuthenticatedCall(helper_, FlightMethod::ListFlights, context,
-                                     &flight_context);
-  if (!st.ok()) {
-    return FinishWriteNow<pb::FlightInfo>(st);
-  }
-
-  Criteria criteria;
-  if (request) {
-    auto conv = internal::FromProto(*request, &criteria);
-    if (!conv.ok()) {
-      return FinishWriteNow<pb::FlightInfo>(flight_context.FinishRequest(conv));
-    }
-  }
-  auto future = impl_->base()->ListFlights(flight_context, &criteria);
-  return MakeListFlightsReactor(context, impl_->executor(), std::move(flight_context),
-                                std::move(future));
-}
-
-/// Authenticate, parse, and asynchronously resolve GetFlightInfo.
-::grpc::ServerUnaryReactor* CallbackFlightService::GetFlightInfo(
-    ::grpc::CallbackServerContext* context, const pb::FlightDescriptor* request,
-    pb::FlightInfo* response) {
-  auto* reactor = context->DefaultReactor();
-  GrpcServerCallContext flight_context(context);
-  auto st = PrepareAuthenticatedCall(helper_, FlightMethod::GetFlightInfo, context,
-                                     &flight_context);
-  if (!st.ok()) return FinishNow(reactor, st);
-  FlightDescriptor descr;
-  auto arrow_st = ParseRequiredRequest(request, "FlightDescriptor", &descr);
-  if (!arrow_st.ok()) return FinishNow(reactor, flight_context.FinishRequest(arrow_st));
-  impl_->base()
-      ->GetFlightInfo(flight_context, descr)
-      .AddCallback([reactor, response, flight_context = std::move(flight_context)](
-                       const arrow::Result<std::unique_ptr<FlightInfo>>& result) mutable {
-        FinishUnaryResult(reactor, response, std::move(flight_context), result,
-                          "Flight not found",
-                          [](const FlightInfo& info, pb::FlightInfo* out) {
-                            return internal::ToProto(info, out);
-                          });
-      });
-  return reactor;
-}
-
-/// Authenticate, parse, and asynchronously resolve PollFlightInfo.
-::grpc::ServerUnaryReactor* CallbackFlightService::PollFlightInfo(
-    ::grpc::CallbackServerContext* context, const pb::FlightDescriptor* request,
-    pb::PollInfo* response) {
-  auto* reactor = context->DefaultReactor();
-  GrpcServerCallContext flight_context(context);
-  auto st = PrepareAuthenticatedCall(helper_, FlightMethod::PollFlightInfo, context,
-                                     &flight_context);
-  if (!st.ok()) return FinishNow(reactor, st);
-  FlightDescriptor descr;
-  auto arrow_st = ParseRequiredRequest(request, "FlightDescriptor", &descr);
-  if (!arrow_st.ok()) return FinishNow(reactor, flight_context.FinishRequest(arrow_st));
-  impl_->base()
-      ->PollFlightInfo(flight_context, descr)
-      .AddCallback([reactor, response, flight_context = std::move(flight_context)](
-                       const arrow::Result<std::unique_ptr<PollInfo>>& result) mutable {
-        FinishUnaryResult(reactor, response, std::move(flight_context), result,
-                          "Flight not found",
-                          [](const PollInfo& info, pb::PollInfo* out) {
-                            return internal::ToProto(info, out);
-                          });
-      });
-  return reactor;
-}
-
-/// Authenticate, parse, and asynchronously resolve GetSchema.
-::grpc::ServerUnaryReactor* CallbackFlightService::GetSchema(
-    ::grpc::CallbackServerContext* context, const pb::FlightDescriptor* request,
-    pb::SchemaResult* response) {
-  auto* reactor = context->DefaultReactor();
-  GrpcServerCallContext flight_context(context);
-  auto st = PrepareAuthenticatedCall(helper_, FlightMethod::GetSchema, context,
-                                     &flight_context);
-  if (!st.ok()) return FinishNow(reactor, st);
-  FlightDescriptor descr;
-  auto arrow_st = ParseRequiredRequest(request, "FlightDescriptor", &descr);
-  if (!arrow_st.ok()) return FinishNow(reactor, flight_context.FinishRequest(arrow_st));
-  impl_->base()
-      ->GetSchema(flight_context, descr)
-      .AddCallback(
-          [reactor, response, flight_context = std::move(flight_context)](
-              const arrow::Result<std::unique_ptr<SchemaResult>>& result) mutable {
-            FinishUnaryResult(reactor, response, std::move(flight_context), result,
-                              "Flight not found",
-                              [](const SchemaResult& schema, pb::SchemaResult* out) {
-                                return internal::ToProto(schema, out);
-                              });
-          });
-  return reactor;
-}
-
-/// Authenticate DoGet, parse its ticket, and stream the async source.
-::grpc::ServerWriteReactor<pb::FlightData>* CallbackFlightService::DoGet(
-    ::grpc::CallbackServerContext* context, const pb::Ticket* request) {
-  GrpcServerCallContext flight_context(context);
-  auto st =
-      PrepareAuthenticatedCall(helper_, FlightMethod::DoGet, context, &flight_context);
-  if (!st.ok()) return FinishWriteNow<pb::FlightData>(st);
-  Ticket ticket;
-  auto arrow_st = ParseRequiredRequest(request, "ticket", &ticket);
-  if (!arrow_st.ok()) {
-    return FinishWriteNow<pb::FlightData>(flight_context.FinishRequest(arrow_st));
-  }
-  auto future = impl_->base()->DoGet(flight_context, ticket);
-  return MakeDoGetReactor(context, impl_->executor(), std::move(flight_context),
-                          std::move(future));
-}
-
-/// Create the shared async bidi reactor for DoPut.
-::grpc::ServerBidiReactor<pb::FlightData, pb::PutResult>* CallbackFlightService::DoPut(
-    ::grpc::CallbackServerContext* context) {
-  return MakeDoPutReactor(context, impl_, helper_);
-}
-
-/// Create the shared async bidi reactor for DoExchange.
-::grpc::ServerBidiReactor<pb::FlightData, pb::FlightData>*
-CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
-  return MakeDoExchangeReactor(context, impl_, helper_);
-}
-
-/// Authenticate ListActions and stream its returned action-type vector.
-::grpc::ServerWriteReactor<pb::ActionType>* CallbackFlightService::ListActions(
-    ::grpc::CallbackServerContext* context, const pb::Empty*) {
-  GrpcServerCallContext flight_context(context);
-  auto st = PrepareAuthenticatedCall(helper_, FlightMethod::ListActions, context,
-                                     &flight_context);
-  if (!st.ok()) return FinishWriteNow<pb::ActionType>(st);
-  auto future = impl_->base()->ListActions(flight_context);
-  return MakeListActionsReactor(context, impl_->executor(), std::move(flight_context),
-                                std::move(future));
-}
-
-/// Authenticate DoAction, parse its request, and stream action results.
-::grpc::ServerWriteReactor<pb::Result>* CallbackFlightService::DoAction(
-    ::grpc::CallbackServerContext* context, const pb::Action* request) {
-  GrpcServerCallContext flight_context(context);
-  auto st =
-      PrepareAuthenticatedCall(helper_, FlightMethod::DoAction, context, &flight_context);
-  if (!st.ok()) return FinishWriteNow<pb::Result>(st);
-  Action action;
-  auto arrow_st = ParseRequiredRequest(request, "Action", &action);
-  if (!arrow_st.ok()) {
-    return FinishWriteNow<pb::Result>(flight_context.FinishRequest(arrow_st));
-  }
-  auto future = impl_->base()->DoAction(flight_context, action);
-  return MakeDoActionReactor(context, impl_->executor(), std::move(flight_context),
-                             std::move(future));
-}
 
 }  // namespace arrow::flight::transport::grpc::async_internal
 

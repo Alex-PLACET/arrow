@@ -113,7 +113,6 @@ class NativeAsyncFlightMessageReader final
 
   /// Decode and return the next logical record-batch or metadata chunk.
   Future<FlightStreamChunk> Next() override {
-    int64_t token = 0;
     {
       std::lock_guard<std::mutex> guard(mutex_);
       if (!decoded_chunks_.empty()) {
@@ -125,6 +124,7 @@ class NativeAsyncFlightMessageReader final
         return Future<FlightStreamChunk>::MakeFinished(FlightStreamChunk{});
       }
     }
+    int64_t token = 0;
     auto status = StartOperation(ActiveOperation::kNext, &token);
     if (!status.ok()) {
       return Future<FlightStreamChunk>::MakeFinished(std::move(status));
@@ -330,17 +330,29 @@ class NativeAsyncFlightMessageReader final
         });
   }
 
+  /// Descriptor carried by the first inbound FlightData frame.
   FlightDescriptor descriptor_;
+  /// First frame retained until schema or data decoding consumes it.
   std::optional<internal::FlightData> pending_message_;
+  /// Callback used to request subsequent inbound frames from gRPC.
   ReadFn read_fn_;
+  /// Memory manager used when preparing inbound message bodies.
   std::shared_ptr<MemoryManager> memory_manager_;
+  /// IPC listener collecting decoded schemas and record batches.
   std::shared_ptr<ipc::CollectListener> listener_;
+  /// IPC stream decoder consuming serialized FlightData messages.
   ipc::StreamDecoder decoder_;
+  /// Protects reader operation state and decoded chunk storage.
   mutable std::mutex mutex_;
+  /// Decoded chunks waiting to be returned by Next().
   std::deque<FlightStreamChunk> decoded_chunks_;
+  /// Whether the inbound stream has reached its end marker.
   bool finished_ = false;
+  /// Reader operation currently consuming inbound frames.
   ActiveOperation active_operation_ = ActiveOperation::kNone;
+  /// Monotonic identity used to reject callbacks from older operations.
   int64_t active_token_ = 0;
+  /// Completes when the current serialized reader operation becomes idle.
   Future<> idle_ = Future<>::MakeFinished();
 };
 
@@ -357,6 +369,7 @@ class SharedAsyncFlightMessageReader final : public AsyncFlightMessageReader {
   ipc::ReadStats stats() const override { return impl_->stats(); }
 
  private:
+  /// Shared reader state retained behind the public unique_ptr interface.
   std::shared_ptr<NativeAsyncFlightMessageReader> impl_;
 };
 
@@ -381,6 +394,7 @@ class NativeAsyncFlightMetadataWriter final : public AsyncFlightMetadataWriter {
   }
 
  private:
+  /// Callback used to submit metadata protobufs to gRPC.
   WriteFn write_fn_;
 };
 
@@ -414,11 +428,10 @@ class NativeAsyncFlightMessageWriter final
         return Future<>::MakeFinished(Status::Invalid("Schema cannot be null"));
       }
       options_ = options;
-      schema_ = schema;
       mapper_ = std::make_unique<ipc::DictionaryFieldMapper>(*schema);
       FlightPayload payload;
       RETURN_NOT_OK(
-          ipc::GetSchemaPayload(*schema_, options_, *mapper_, &payload.ipc_message));
+          ipc::GetSchemaPayload(*schema, options, *mapper_, &payload.ipc_message));
       begun_ = true;
       payloads.push_back(std::move(payload));
     }
@@ -515,9 +528,13 @@ class NativeAsyncFlightMessageWriter final
   }
 
   struct DictionaryUpdate {
+    /// Dictionary field identifier in the IPC schema.
     int64_t id;
+    /// Dictionary state to make current after the batch is serialized.
     std::shared_ptr<Array> dictionary;
+    /// Whether the update appends a dictionary delta.
     bool is_delta;
+    /// Whether a previous dictionary existed for this identifier.
     bool had_previous;
   };
 
@@ -563,8 +580,10 @@ class NativeAsyncFlightMessageWriter final
                                                 &payload.ipc_message));
       }
       payloads->push_back(std::move(payload));
-      updates->push_back(
-          {dictionary_id, dictionary, delta_start != 0, dictionary_exists});
+      updates->push_back({.id = dictionary_id,
+                          .dictionary = dictionary,
+                          .is_delta = delta_start != 0,
+                          .had_previous = dictionary_exists});
     }
     return Status::OK();
   }
@@ -601,6 +620,7 @@ class NativeAsyncFlightMessageWriter final
   }
 
   struct WriteState {
+    /// Payloads still waiting for sequential gRPC writes.
     std::vector<FlightPayload> payloads;
   };
 
@@ -642,17 +662,27 @@ class NativeAsyncFlightMessageWriter final
     }
   }
 
+  /// Callback used to submit serialized FlightData payloads to gRPC.
   WriteFn write_fn_;
+  /// Protects writer state and dictionary bookkeeping.
   mutable std::mutex mutex_;
-  std::shared_ptr<Schema> schema_;
+  /// Maps schema dictionary fields to IPC dictionary identifiers.
   std::unique_ptr<ipc::DictionaryFieldMapper> mapper_;
+  /// Most recently serialized dictionary for each IPC dictionary identifier.
   std::unordered_map<int64_t, std::shared_ptr<Array>> last_dictionaries_;
+  /// IPC options used for all payloads produced by this writer.
   ipc::IpcWriteOptions options_ = ipc::IpcWriteOptions::Defaults();
+  /// Serialization statistics accumulated by this writer.
   ipc::WriteStats stats_;
+  /// Whether Begin() has successfully initialized the writer.
   bool begun_ = false;
+  /// Whether the writer rejects new operations.
   bool closed_ = false;
+  /// Whether one or more payloads are currently being written.
   bool write_in_flight_ = false;
+  /// Whether a terminal write error has occurred.
   bool failed_ = false;
+  /// Error returned by subsequent operations after a terminal write failure.
   Status failure_status_;
 };
 
@@ -681,6 +711,7 @@ class SharedAsyncFlightMessageWriter final : public AsyncFlightMessageWriter {
   ipc::WriteStats stats() const override { return impl_->stats(); }
 
  private:
+  /// Shared implementation retaining writer state across the public wrapper.
   std::shared_ptr<NativeAsyncFlightMessageWriter> impl_;
 };
 

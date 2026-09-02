@@ -48,6 +48,39 @@ class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
 
   const GrpcServerCallContext& flight_context() const { return flight_context_; }
 
+  /// Start producing values from the configured source.
+  void Start() { AdvanceAndFinish(); }
+
+  /// Continue producing values after an asynchronous source is available.
+  template <typename T, typename InitFn>
+  void StartAfter(Future<T> future, InitFn init_fn) {
+    this->Hold();
+    future.AddCallback([this, init_fn = std::move(init_fn)](
+                           const arrow::Result<T>& result) mutable {
+      if (!result.ok()) {
+        FinishWithError(result.status());
+      } else {
+        auto value = std::move(const_cast<arrow::Result<T>&>(result)).MoveValueUnsafe();
+        init_fn(std::move(value));
+        if (cancelled()) {
+          OnSourceCancelled();
+        } else {
+          Start();
+        }
+      }
+      this->ReleaseHold();
+    });
+  }
+
+  /// Continue producing values after a successful response write.
+  void OnWriteDone(bool ok) override {
+    if (!ok) {
+      OnWriteFailure();
+      return;
+    }
+    AdvanceAndFinish();
+  }
+
  protected:
   template <typename Fn>
   /// Schedule blocking compatibility work while retaining the reactor.
@@ -66,6 +99,25 @@ class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
 
   /// Return whether gRPC has cancelled the RPC.
   bool cancelled() const { return cancelled_.load(std::memory_order_relaxed); }
+
+  /// Advance the source and translate immediate failures to gRPC completion.
+  void AdvanceAndFinish() {
+    auto status = Advance();
+    if (!status.ok()) {
+      FinishWithError(status);
+    }
+  }
+
+  /// Finish the RPC with an Arrow status.
+  void FinishWithError(const Status& status) {
+    FinishOnce(this->flight_context_.FinishRequest(status));
+  }
+
+  virtual void OnSourceCancelled() {}
+
+  virtual void OnWriteFailure() { FinishWithError(Status::OK()); }
+
+  virtual Status Advance() = 0;
 
   /// Finish at most once, even when multiple async operations fail concurrently.
   void FinishOnce(::grpc::Status status) {
@@ -117,60 +169,24 @@ class IteratorReactor : public AsyncWriteReactorBase<Proto> {
 
   IteratorReactor(::grpc::CallbackServerContext* context,
                   std::shared_ptr<arrow::internal::ThreadPool> executor,
-                  GrpcServerCallContext flight_context, NextFn next_fn,
-                  ToProtoFn to_proto)
-      : AsyncWriteReactorBase<Proto>(context, std::move(executor),
-                                     std::move(flight_context)),
-        next_fn_(std::move(next_fn)),
-        to_proto_(std::move(to_proto)) {}
-
-  IteratorReactor(::grpc::CallbackServerContext* context,
-                  std::shared_ptr<arrow::internal::ThreadPool> executor,
                   GrpcServerCallContext flight_context, ToProtoFn to_proto)
       : AsyncWriteReactorBase<Proto>(context, std::move(executor),
                                      std::move(flight_context)),
         to_proto_(std::move(to_proto)) {}
 
-  /// Begin producing values from an already-installed iterator.
-  void Start() {
-    auto status = ScheduleAdvance();
-    if (!status.ok()) {
-      this->FinishOnce(this->flight_context_.FinishRequest(status));
-    }
-  }
-
-  template <typename T, typename MakeNextFn>
   /// Install an iterator once an asynchronous server hook has completed.
+  template <typename T, typename MakeNextFn>
   void StartAfter(Future<T> future, MakeNextFn make_next_fn) {
-    this->Hold();
-    future.AddCallback([this, make_next_fn = std::move(make_next_fn)](
-                           const arrow::Result<T>& result) mutable {
-      if (!result.ok()) {
-        this->FinishOnce(this->flight_context_.FinishRequest(result.status()));
-      } else {
-        auto value = std::move(const_cast<arrow::Result<T>&>(result)).MoveValueUnsafe();
-        next_fn_ = make_next_fn(std::move(value));
-        Start();
-      }
-      this->ReleaseHold();
-    });
-  }
-
-  /// Advance after each successful response write.
-  void OnWriteDone(bool ok) override {
-    if (!ok) {
-      this->FinishOnce(this->flight_context_.FinishRequest(Status::OK()));
-      return;
-    }
-    auto status = ScheduleAdvance();
-    if (!status.ok()) {
-      this->FinishOnce(this->flight_context_.FinishRequest(status));
-    }
+    AsyncWriteReactorBase<Proto>::StartAfter(
+        std::move(future),
+        [this, make_next_fn = std::move(make_next_fn)](T value) mutable {
+          next_fn_ = make_next_fn(std::move(value));
+        });
   }
 
  private:
   /// Pull, serialize, and start one response write on a worker thread.
-  Status ScheduleAdvance() {
+  Status Advance() override {
     return this->StartBackgroundWork([this] {
       if (this->cancelled()) {
         return;
@@ -178,20 +194,20 @@ class IteratorReactor : public AsyncWriteReactorBase<Proto> {
 
       auto maybe_value = next_fn_();
       if (!maybe_value.ok()) {
-        this->FinishOnce(this->flight_context_.FinishRequest(maybe_value.status()));
+        this->FinishWithError(maybe_value.status());
         return;
       }
 
       auto value = std::move(maybe_value).ValueUnsafe();
       if (!value) {
-        this->FinishOnce(this->flight_context_.FinishRequest(Status::OK()));
+        this->FinishWithError(Status::OK());
         return;
       }
 
       Proto proto;
       auto st = to_proto_(*value, &proto);
       if (!st.ok()) {
-        this->FinishOnce(this->flight_context_.FinishRequest(st));
+        this->FinishWithError(st);
         return;
       }
 
@@ -221,44 +237,13 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
                                               std::move(flight_context)),
         stream_(std::move(stream)) {}
 
-  /// Start stream progression after a source is available.
-  void Start() {
-    auto status = Advance();
-    if (!status.ok()) {
-      this->FinishOnce(this->flight_context_.FinishRequest(status));
-    }
-  }
-
   /// Install a source returned by AsyncFlightServerBase::DoGet.
   void StartAfter(Future<std::unique_ptr<AsyncFlightDataStream>> future) {
-    this->Hold();
-    future.AddCallback(
-        [this](
-            const arrow::Result<std::unique_ptr<AsyncFlightDataStream>>& result) mutable {
-          if (!result.ok()) {
-            this->FinishOnce(this->flight_context_.FinishRequest(result.status()));
-          } else {
-            stream_ =
-                std::move(
-                    const_cast<arrow::Result<std::unique_ptr<AsyncFlightDataStream>>&>(
-                        result))
-                    .MoveValueUnsafe();
-            Start();
-          }
-          this->ReleaseHold();
+    AsyncWriteReactorBase<pb::FlightData>::StartAfter(
+        std::move(future), [this](std::unique_ptr<AsyncFlightDataStream> stream) {
+          std::lock_guard<std::mutex> lock(this->mutex_);
+          stream_ = std::move(stream);
         });
-  }
-
-  /// Continue with the next source operation after a successful write.
-  void OnWriteDone(bool ok) override {
-    if (!ok) {
-      this->FinishOnce(this->flight_context_.FinishRequest(Status::OK()));
-      return;
-    }
-    auto status = Advance();
-    if (!status.ok()) {
-      this->FinishOnce(this->flight_context_.FinishRequest(status));
-    }
   }
 
   /// Release the application stream when gRPC cancels the RPC.
@@ -267,46 +252,59 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
     ARROW_UNUSED(CloseStream());
   }
 
-  void OnDone() override { AsyncWriteReactorBase<pb::FlightData>::OnDone(); }
-
  private:
   enum class Stage { kSchema, kPayloads, kFinish };
 
   /// Select the next schema, payload, or close operation from the source.
-  Status Advance() {
+  Status Advance() override {
     if (this->cancelled()) return Status::OK();
-    if (!stream_) {
+    AsyncFlightDataStream* stream = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(this->mutex_);
+      stream = stream_.get();
+    }
+    if (!stream) {
       this->FinishOnce(this->flight_context_.FinishRequest(
           Status::KeyError("No data in this flight")));
       return Status::OK();
     }
     if (stage_ == Stage::kSchema) {
       stage_ = Stage::kPayloads;
-      return ReadSchema();
+      return ReadSchema(stream);
     }
     if (stage_ == Stage::kPayloads) {
-      return ReadNext();
+      return ReadNext(stream);
     }
     return CloseStream();
   }
 
   /// Request the mandatory schema payload.
-  Status ReadSchema() { return ReadPayload(stream_->GetSchemaPayload()); }
+  Status ReadSchema(AsyncFlightDataStream* stream) {
+    return ReadPayload(stream->GetSchemaPayload());
+  }
 
   /// Request the next payload after the schema.
-  Status ReadNext() { return ReadPayload(stream_->Next()); }
+  Status ReadNext(AsyncFlightDataStream* stream) { return ReadPayload(stream->Next()); }
 
   /// Close the source and finish the RPC with its close status.
-  Status CloseStream() {
+  Status CloseStream(Status failure = Status::OK()) {
+    AsyncFlightDataStream* stream = nullptr;
     {
       std::lock_guard<std::mutex> lock(this->mutex_);
-      if (close_started_) return Status::OK();
+      if (close_started_) {
+        return Status::OK();
+      }
+      stream = stream_.get();
+      if (!stream) {
+        return Status::OK();
+      }
       close_started_ = true;
     }
     this->Hold();
-    stream_->Close().AddCallback(
-        [this](const ::arrow::Result<::arrow::internal::Empty>& result) {
-          this->FinishOnce(this->flight_context_.FinishRequest(result.status()));
+    stream->Close().AddCallback(
+        [this, failure = std::move(failure)](
+            const ::arrow::Result<::arrow::internal::Empty>& result) mutable {
+          this->FinishWithError(failure.ok() ? result.status() : failure);
           this->ReleaseHold();
         });
     return Status::OK();
@@ -317,19 +315,19 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
     this->Hold();
     future.AddCallback([this](const ::arrow::Result<FlightPayload>& result) {
       if (!result.ok()) {
-        this->FinishOnce(this->flight_context_.FinishRequest(result.status()));
+        ARROW_UNUSED(CloseStream(result.status()));
       } else {
         auto payload = result.ValueUnsafe();
         if (payload.ipc_message.metadata == nullptr) {
           stage_ = Stage::kFinish;
           auto status = Advance();
           if (!status.ok()) {
-            this->FinishOnce(this->flight_context_.FinishRequest(status));
+            ARROW_UNUSED(CloseStream(status));
           }
         } else {
           auto status = StartPayloadWrite(std::move(payload));
           if (!status.ok()) {
-            this->FinishOnce(this->flight_context_.FinishRequest(status));
+            ARROW_UNUSED(CloseStream(status));
           }
         }
       }
@@ -352,6 +350,12 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
     return Status::OK();
   }
 
+  /// Close the source when a response write fails.
+  void OnWriteFailure() override { ARROW_UNUSED(CloseStream()); }
+
+  /// Close a source that became available after cancellation.
+  void OnSourceCancelled() override { ARROW_UNUSED(CloseStream()); }
+
   std::unique_ptr<AsyncFlightDataStream> stream_;
   Stage stage_ = Stage::kSchema;
   bool close_started_ = false;
@@ -362,22 +366,20 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
 ::grpc::ServerWriteReactor<pb::FlightInfo>* MakeListFlightsReactor(
     ::grpc::CallbackServerContext* context,
     std::shared_ptr<arrow::internal::ThreadPool> executor,
-    GrpcServerCallContext flight_context,
-    Future<std::unique_ptr<FlightListing>> future) {
+    GrpcServerCallContext flight_context, Future<std::unique_ptr<FlightListing>> future) {
   auto* reactor = new IteratorReactor<pb::FlightInfo, FlightInfo>(
       context, std::move(executor), std::move(flight_context),
       [](const FlightInfo& info, pb::FlightInfo* out) {
         return internal::ToProto(info, out);
       });
-  reactor->StartAfter(
-      std::move(future), [](std::unique_ptr<FlightListing> listing) {
-        auto state = std::make_shared<std::unique_ptr<FlightListing>>(std::move(listing));
-        return [state]() mutable {
-          return *state ? (*state)->Next()
-                        : arrow::Result<std::unique_ptr<FlightInfo>>(
-                              std::unique_ptr<FlightInfo>{});
-        };
-      });
+  reactor->StartAfter(std::move(future), [](std::unique_ptr<FlightListing> listing) {
+    auto state = std::make_shared<std::unique_ptr<FlightListing>>(std::move(listing));
+    return [state]() mutable {
+      return *state ? (*state)->Next()
+                    : arrow::Result<std::unique_ptr<FlightInfo>>(
+                          std::unique_ptr<FlightInfo>{});
+    };
+  });
   return reactor;
 }
 
@@ -390,36 +392,36 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
       [](const ActionType& action, pb::ActionType* out) {
         return internal::ToProto(action, out);
       });
-  reactor->StartAfter(
-      std::move(future), [](std::vector<ActionType> actions) {
-        return [actions = std::move(actions), index = size_t{0}]() mutable
-               -> arrow::Result<std::unique_ptr<ActionType>> {
-          if (index >= actions.size()) return nullptr;
-          return std::make_unique<ActionType>(actions[index++]);
-        };
-      });
+  reactor->StartAfter(std::move(future), [](std::vector<ActionType> actions) {
+    return [actions = std::move(actions),
+            index = size_t{0}]() mutable -> arrow::Result<std::unique_ptr<ActionType>> {
+      if (index >= actions.size())
+      {
+        return nullptr;
+      }
+      return std::make_unique<ActionType>(actions[index++]);
+    };
+  });
   return reactor;
 }
 
 ::grpc::ServerWriteReactor<pb::Result>* MakeDoActionReactor(
     ::grpc::CallbackServerContext* context,
     std::shared_ptr<arrow::internal::ThreadPool> executor,
-    GrpcServerCallContext flight_context,
-    Future<std::unique_ptr<ResultStream>> future) {
+    GrpcServerCallContext flight_context, Future<std::unique_ptr<ResultStream>> future) {
   auto* reactor = new IteratorReactor<pb::Result, Result>(
       context, std::move(executor), std::move(flight_context),
       [](const Result& result, pb::Result* out) {
         return internal::ToProto(result, out);
       });
-  reactor->StartAfter(
-      std::move(future), [](std::unique_ptr<ResultStream> results) {
-        auto state = std::make_shared<std::unique_ptr<ResultStream>>(std::move(results));
-        return [state]() mutable {
-          return *state ? (*state)->Next()
-                        : arrow::Result<std::unique_ptr<arrow::flight::Result>>(
-                              std::unique_ptr<arrow::flight::Result>{});
-        };
-      });
+  reactor->StartAfter(std::move(future), [](std::unique_ptr<ResultStream> results) {
+    auto state = std::make_shared<std::unique_ptr<ResultStream>>(std::move(results));
+    return [state]() mutable {
+      return *state ? (*state)->Next()
+                    : arrow::Result<std::unique_ptr<arrow::flight::Result>>(
+                          std::unique_ptr<arrow::flight::Result>{});
+    };
+  });
   return reactor;
 }
 
@@ -428,8 +430,8 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
     std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context,
     Future<std::unique_ptr<AsyncFlightDataStream>> future) {
-  auto* reactor = new DoGetReactor(context, std::move(executor), std::move(flight_context),
-                                   nullptr);
+  auto* reactor =
+      new DoGetReactor(context, std::move(executor), std::move(flight_context), nullptr);
   reactor->StartAfter(std::move(future));
   return reactor;
 }
