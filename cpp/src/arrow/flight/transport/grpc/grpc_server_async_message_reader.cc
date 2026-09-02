@@ -149,15 +149,12 @@ class NativeAsyncFlightMessageReader final
   Status ConsumeDataMessage(internal::FlightData& data) {
     ARROW_ASSIGN_OR_RAISE(auto buffer,
                           SerializeIpcMessage(data, ipc::IpcWriteOptions::Defaults()));
-    const auto previous_batches = listener_->num_record_batches();
+    const int64_t previous_batches = listener_->num_record_batches();
     RETURN_NOT_OK(decoder_.Consume(std::move(buffer)));
-    const auto new_batches = listener_->num_record_batches();
+    const int64_t new_batches = listener_->num_record_batches();
     if (new_batches > previous_batches) {
-      auto batch = listener_->PopRecordBatch();
-      FlightStreamChunk chunk;
-      chunk.data = std::move(batch);
-      chunk.app_metadata = std::move(data.app_metadata);
-      decoded_chunks_.push_back(std::move(chunk));
+      auto batch = listener_->PopRecordBatch();;
+      decoded_chunks_.emplace_back(std::move(batch), std::move(data.app_metadata));
     }
     return Status::OK();
   }
