@@ -72,7 +72,7 @@ void FinishUnaryResult(::grpc::ServerUnaryReactor* reactor, ProtoResponse* respo
     return;
   }
   reactor->Finish(flight_context.FinishRequest(
-      result.ok() ? Status::KeyError("FFlight not found") : result.status()));
+      result.ok() ? Status::KeyError("Flight not found") : result.status()));
 }
 
 struct AsyncMessageReader {
@@ -131,25 +131,34 @@ class CallbackFlightService final : public FlightService::CallbackService {
 
   ::grpc::ServerBidiReactor<pb::HandshakeRequest, pb::HandshakeResponse>* Handshake(
       ::grpc::CallbackServerContext* context) override;
+
   ::grpc::ServerWriteReactor<pb::FlightInfo>* ListFlights(
       ::grpc::CallbackServerContext* context, const pb::Criteria* request) override;
+
   ::grpc::ServerUnaryReactor* GetFlightInfo(::grpc::CallbackServerContext* context,
                                             const pb::FlightDescriptor* request,
                                             pb::FlightInfo* response) override;
+
   ::grpc::ServerUnaryReactor* PollFlightInfo(::grpc::CallbackServerContext* context,
                                              const pb::FlightDescriptor* request,
                                              pb::PollInfo* response) override;
+
   ::grpc::ServerUnaryReactor* GetSchema(::grpc::CallbackServerContext* context,
                                         const pb::FlightDescriptor* request,
                                         pb::SchemaResult* response) override;
+
   ::grpc::ServerWriteReactor<pb::FlightData>* DoGet(
       ::grpc::CallbackServerContext* context, const pb::Ticket* request) override;
+
   ::grpc::ServerBidiReactor<pb::FlightData, pb::PutResult>* DoPut(
       ::grpc::CallbackServerContext* context) override;
+
   ::grpc::ServerBidiReactor<pb::FlightData, pb::FlightData>* DoExchange(
       ::grpc::CallbackServerContext* context) override;
+
   ::grpc::ServerWriteReactor<pb::ActionType>* ListActions(
       ::grpc::CallbackServerContext* context, const pb::Empty* request) override;
+
   ::grpc::ServerWriteReactor<pb::Result>* DoAction(::grpc::CallbackServerContext* context,
                                                    const pb::Action* request) override;
 
