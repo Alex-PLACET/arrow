@@ -131,33 +131,9 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
 ::grpc::ServerUnaryReactor* CallbackFlightService::GetSchema(
     ::grpc::CallbackServerContext* context, const pb::FlightDescriptor* request,
     pb::SchemaResult* response) {
-  auto* reactor = context->DefaultReactor();
-  GrpcServerCallContext flight_context(context);
-  const auto status = PrepareAuthenticatedCall(helper_, FlightMethod::GetSchema, context,
-                                               &flight_context);
-  if (!status.ok()) {
-    reactor->Finish(status);
-    return reactor;
-  }
-
-  FlightDescriptor descr;
-  const auto arrow_status = ParseRequiredRequest(request, "FlightDescriptor", &descr);
-  if (!arrow_status.ok()) {
-    reactor->Finish(flight_context.FinishRequest(arrow_status));
-    return reactor;
-  }
-
-  impl_->base()
-      ->GetSchema(flight_context, descr)
-      .AddCallback(
-          [reactor, response, flight_context = std::move(flight_context)](
-              const arrow::Result<std::unique_ptr<SchemaResult>>& result) mutable {
-            FinishUnaryResult(reactor, response, std::move(flight_context), result,
-                              [](const SchemaResult& schema, pb::SchemaResult* out) {
-                                return internal::ToProto(schema, out);
-                              });
-          });
-  return reactor;
+  return HandleDescriptorUnary<SchemaResult, pb::SchemaResult, FlightMethod::GetSchema,
+                               &AsyncFlightServerBase::GetSchema>(
+      impl_, helper_, context, request, response);
 }
 
 /// Authenticate DoGet, parse its ticket, and stream the async source.

@@ -175,10 +175,9 @@ class NativeAsyncFlightMessageWriter final
     RETURN_NOT_OK(ipc::internal::ComputeDictionaryFrames(
         batch, /*is_file_format=*/false, options_, *mapper_, &last_dictionaries_,
         &updates));
+    payloads.reserve(updates.size());
     for (auto& frame : updates) {
-      FlightPayload payload;
-      payload.ipc_message = std::move(frame.payload);
-      payloads.push_back(std::move(payload));
+      payloads.emplace_back(nullptr,nullptr, std::move(frame.payload));
     }
     return Status::OK();
   }

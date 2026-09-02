@@ -153,8 +153,7 @@ class NativeAsyncFlightMessageReader final
     RETURN_NOT_OK(decoder_.Consume(std::move(buffer)));
     const int64_t new_batches = listener_->num_record_batches();
     if (new_batches > previous_batches) {
-      auto batch = listener_->PopRecordBatch();;
-      decoded_chunks_.emplace_back(std::move(batch), std::move(data.app_metadata));
+      decoded_chunks_.emplace_back(listener_->PopRecordBatch(), std::move(data.app_metadata));
     }
     return Status::OK();
   }
