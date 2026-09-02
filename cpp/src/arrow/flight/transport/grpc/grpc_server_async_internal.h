@@ -65,36 +65,14 @@ Status ParseRequiredRequest(const ProtoRequest* request, const char* request_nam
 template <typename ArrowResponse, typename ProtoResponse, typename ToProtoFn>
 void FinishUnaryResult(::grpc::ServerUnaryReactor* reactor, ProtoResponse* response,
                        GrpcServerCallContext flight_context,
-                       const arrow::Result<std::unique_ptr<ArrowResponse>>& result,
-                       const char* not_found_message, ToProtoFn&& to_proto) {
+                       const arrow::Result<std::unique_ptr<ArrowResponse>>& result, ToProtoFn&& to_proto) {
   if (result.ok() && result.ValueUnsafe()) {
     reactor->Finish(
         flight_context.FinishRequest(to_proto(*result.ValueUnsafe(), response)));
     return;
   }
   reactor->Finish(flight_context.FinishRequest(
-      result.ok() ? Status::KeyError(not_found_message) : result.status()));
-}
-
-template <typename Proto>
-class ImmediateWriteReactor final : public ::grpc::ServerWriteReactor<Proto> {
- public:
-  explicit ImmediateWriteReactor(::grpc::Status status) {
-    this->Finish(std::move(status));
-  }
-
-  void OnDone() override { delete this; }
-};
-
-template <typename Proto>
-::grpc::ServerWriteReactor<Proto>* FinishWriteNow(const ::grpc::Status& status) {
-  return new ImmediateWriteReactor<Proto>(status);
-}
-
-template <typename ReactorT>
-ReactorT* FinishNow(ReactorT* reactor, const ::grpc::Status& status) {
-    reactor->Finish(status);
-    return reactor;
+      result.ok() ? Status::KeyError("FFlight not found") : result.status()));
 }
 
 struct AsyncMessageReader {
