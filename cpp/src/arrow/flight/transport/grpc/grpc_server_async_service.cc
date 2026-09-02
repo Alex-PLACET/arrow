@@ -65,7 +65,7 @@ template <typename ArrowResponse, typename ProtoResponse, FlightMethod method,
     return reactor;
   }
   FlightDescriptor descriptor;
-  auto arrow_status = ParseRequiredRequest(request, "FlightDescriptor", &descriptor);
+  const auto arrow_status = ParseRequiredRequest(request, "FlightDescriptor", &descriptor);
   if (!arrow_status.ok()) {
     reactor->Finish(flight_context.FinishRequest(arrow_status));
     return reactor;
