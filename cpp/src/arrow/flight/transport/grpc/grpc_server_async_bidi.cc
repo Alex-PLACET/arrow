@@ -305,17 +305,15 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Request, Response> {
   /// Request RPC completion, deferring it until an active write finishes.
   void FinishFromWorker(::grpc::Status status) {
     bool finish_now = false;
-    ::grpc::Status finish_status;
     std::unique_lock<std::mutex> lock(mutex_);
     finish_requested_ = true;
     finish_status_ = std::move(status);
     if (!write_in_flight_) {
       finish_now = true;
-      finish_status = finish_status_;
     }
     lock.unlock();
     if (finish_now) {
-      this->Finish(finish_status);
+      this->Finish(finish_status_);
     }
   }
 
@@ -419,10 +417,10 @@ class AsyncBidiFlightReactor final : public BidiReactorBase<pb::FlightData, Resp
     constexpr auto kMethod = std::is_same_v<Response, pb::PutResult>
                                  ? FlightMethod::DoPut
                                  : FlightMethod::DoExchange;
-    auto st =
+    const auto status =
         PrepareAuthenticatedCall(helper_, kMethod, this->context_, &flight_context_);
-    if (!st.ok()) {
-      this->Finish(st);
+    if (!status.ok()) {
+      this->Finish(status);
       return;
     }
     this->Hold();
@@ -505,37 +503,39 @@ class Reactor final
       return;
     }
     helper_.AddMiddlewareHeaders(this->context_, &flight_context_);
-    auto status = this->StartWorker([this] {
-      auto outgoing = std::make_unique<
-          ::arrow::flight::transport::grpc::GrpcServerAuthSender<pb::HandshakeResponse>>(
-          [this](pb::HandshakeResponse response) {
-            return this->WriteOne(std::move(response));
-          });
-
-      auto incoming = std::make_unique<
-          ::arrow::flight::transport::grpc::GrpcServerAuthReader<pb::HandshakeRequest>>(
-          [this](pb::HandshakeRequest* request) { return this->ReadOne(request); });
-
-      if (helper_.auth_handler()) {
-        const auto status = helper_.auth_handler()->Authenticate(
-            flight_context_, outgoing.get(), incoming.get());
-        this->FinishFromWorker(flight_context_.FinishRequest(status));
-      } else {
-        this->Hold();
-        impl_->base()
-            ->Handshake(flight_context_, std::move(outgoing), std::move(incoming))
-            .AddCallback([this](const ::arrow::Result<::arrow::internal::Empty>& result) {
-              this->FinishFromWorker(flight_context_.FinishRequest(result.status()));
-              this->ReleaseHold();
-            });
-      }
-    });
+    const auto status = this->StartWorker([this] { RunHandshake(); });
     if (!status.ok()) {
       this->Finish(flight_context_.FinishRequest(status));
     }
   }
 
  private:
+  void RunHandshake() {
+    auto outgoing = std::make_unique<
+        ::arrow::flight::transport::grpc::GrpcServerAuthSender<pb::HandshakeResponse>>(
+        [this](pb::HandshakeResponse response) {
+          return this->WriteOne(std::move(response));
+        });
+
+    auto incoming = std::make_unique<
+        ::arrow::flight::transport::grpc::GrpcServerAuthReader<pb::HandshakeRequest>>(
+        [this](pb::HandshakeRequest* request) { return this->ReadOne(request); });
+
+    if (helper_.auth_handler()) {
+      const auto status = helper_.auth_handler()->Authenticate(flight_context_, outgoing.get(),
+                                                               incoming.get());
+      this->FinishFromWorker(flight_context_.FinishRequest(status));
+    } else {
+      this->Hold();
+      impl_->base()
+          ->Handshake(flight_context_, std::move(outgoing), std::move(incoming))
+          .AddCallback([this](const ::arrow::Result<::arrow::internal::Empty>& result) {
+            this->FinishFromWorker(flight_context_.FinishRequest(result.status()));
+            this->ReleaseHold();
+          });
+    }
+  }
+
   /// Async transport providing the server implementation.
   AsyncGrpcServerTransport* impl_;
   /// Authentication and middleware helper for the handshake.

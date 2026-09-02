@@ -83,7 +83,7 @@ class NativeAsyncFlightMessageReader final
       return Future<std::shared_ptr<Schema>>::MakeFinished(listener_->schema());
     }
     int64_t token = 0;
-    auto status = StartOperation(ActiveOperation::kSchema, &token);
+    const auto status = StartOperation(ActiveOperation::kSchema, &token);
     if (!status.ok()) {
       return Future<std::shared_ptr<Schema>>::MakeFinished(std::move(status));
     }
@@ -210,6 +210,35 @@ class NativeAsyncFlightMessageReader final
                           operation);
   }
 
+  /// Complete the schema operation from an inbound FlightData frame.
+  void HandleSchemaResult(
+      Future<std::shared_ptr<Schema>> out, int64_t token,
+      const ::arrow::Result<std::shared_ptr<internal::FlightData>>& result) {
+    if (!IsCurrentOperation(token, ActiveOperation::kSchema)) {
+      return;
+    }
+    if (!result.ok()) {
+      FinishOperation(out, result.status(), token, ActiveOperation::kSchema);
+      return;
+    }
+    auto maybe_data = result.ValueUnsafe();
+    if (!maybe_data) {
+      FinishOperation(out, Status::IOError("Client never sent a data message"), token,
+                      ActiveOperation::kSchema);
+      return;
+    }
+    if (!maybe_data->metadata) {
+      PumpSchema(out, token);
+      return;
+    }
+    const auto status = ConsumeDataMessage(*maybe_data);
+    if (!status.ok()) {
+      FinishOperation(out, status, token, ActiveOperation::kSchema);
+      return;
+    }
+    PumpSchema(out, token);
+  }
+
   /// Read frames until the decoder produces a schema or the stream fails.
   void PumpSchema(Future<std::shared_ptr<Schema>> out, int64_t token) {
     if (listener_->schema()) {
@@ -219,35 +248,47 @@ class NativeAsyncFlightMessageReader final
     ReadDataAsync().AddCallback(
         [self = shared_from_this(), out,
          token](const ::arrow::Result<std::shared_ptr<internal::FlightData>>&
-                    result) mutable {
-          if (!self->IsCurrentOperation(token, ActiveOperation::kSchema)) {
-            return;
-          }
-          if (!result.ok()) {
-            self->FinishOperation(out, result.status(), token, ActiveOperation::kSchema);
-            return;
-          }
-          auto maybe_data = result.ValueUnsafe();
-          if (!maybe_data) {
-            self->FinishOperation(out,
-                                  Status::IOError("Client never sent a data message"),
-                                  token, ActiveOperation::kSchema);
-            return;
-          }
-          if (!maybe_data->metadata) {
-            // Descriptor-only or metadata-only FlightData frames do not advance the
-            // IPC decoder toward a schema, so continue reading until an IPC message
-            // arrives or the stream ends.
-            self->PumpSchema(out, token);
-            return;
-          }
-          auto st = self->ConsumeDataMessage(*maybe_data);
-          if (!st.ok()) {
-            self->FinishOperation(out, st, token, ActiveOperation::kSchema);
-            return;
-          }
-          self->PumpSchema(out, token);
+                    result) {
+          self->HandleSchemaResult(out, token, result);
         });
+  }
+
+  /// Complete the next operation from an inbound FlightData frame.
+  void HandleNextResult(
+      Future<FlightStreamChunk> out, int64_t token,
+      const ::arrow::Result<std::shared_ptr<internal::FlightData>>& result) {
+    if (!IsCurrentOperation(token, ActiveOperation::kNext)) {
+      return;
+    }
+    if (!result.ok()) {
+      FinishOperation(out, result.status(), token, ActiveOperation::kNext);
+      return;
+    }
+    auto maybe_data = result.ValueUnsafe();
+    if (!maybe_data) {
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        finished_ = true;
+      }
+      FinishOperation(out, FlightStreamChunk{}, token, ActiveOperation::kNext);
+      return;
+    }
+    if (!maybe_data->metadata) {
+      if (!maybe_data->app_metadata) {
+        PumpNext(out, token);
+        return;
+      }
+      FlightStreamChunk chunk;
+      chunk.app_metadata = std::move(maybe_data->app_metadata);
+      FinishOperation(out, std::move(chunk), token, ActiveOperation::kNext);
+      return;
+    }
+    const auto status = ConsumeDataMessage(*maybe_data);
+    if (!status.ok()) {
+      FinishOperation(out, status, token, ActiveOperation::kNext);
+      return;
+    }
+    PumpNext(out, token);
   }
 
   /// Read frames until a user-visible chunk or end-of-stream is available.
@@ -274,40 +315,8 @@ class NativeAsyncFlightMessageReader final
     ReadDataAsync().AddCallback(
         [self = shared_from_this(), out,
          token](const ::arrow::Result<std::shared_ptr<internal::FlightData>>&
-                    result) mutable {
-          if (!self->IsCurrentOperation(token, ActiveOperation::kNext)) {
-            return;
-          }
-          if (!result.ok()) {
-            self->FinishOperation(out, result.status(), token, ActiveOperation::kNext);
-            return;
-          }
-          auto maybe_data = result.ValueUnsafe();
-          if (!maybe_data) {
-            {
-              std::lock_guard<std::mutex> guard(self->mutex_);
-              self->finished_ = true;
-            }
-            self->FinishOperation(out, FlightStreamChunk{}, token,
-                                  ActiveOperation::kNext);
-            return;
-          }
-          if (!maybe_data->metadata) {
-            if (!maybe_data->app_metadata) {
-              self->PumpNext(out, token);
-              return;
-            }
-            FlightStreamChunk chunk;
-            chunk.app_metadata = std::move(maybe_data->app_metadata);
-            self->FinishOperation(out, std::move(chunk), token, ActiveOperation::kNext);
-            return;
-          }
-          auto st = self->ConsumeDataMessage(*maybe_data);
-          if (!st.ok()) {
-            self->FinishOperation(out, st, token, ActiveOperation::kNext);
-            return;
-          }
-          self->PumpNext(out, token);
+            result) {
+          self->HandleNextResult(out, token, result);
         });
   }
 
