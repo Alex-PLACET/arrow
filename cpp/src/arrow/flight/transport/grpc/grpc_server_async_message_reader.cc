@@ -64,13 +64,9 @@ class NativeAsyncFlightMessageReader final
   using ReadFn = AsyncReadFn;
   enum class ActiveOperation { kNone, kSchema, kNext };
 
-  NativeAsyncFlightMessageReader(FlightDescriptor descriptor,
-                                 internal::FlightData first_message, ReadFn read_fn,
-                                 std::shared_ptr<MemoryManager> memory_manager)
+  NativeAsyncFlightMessageReader(FlightDescriptor descriptor, ReadFn read_fn)
       : descriptor_(std::move(descriptor)),
-        pending_message_(std::move(first_message)),
         read_fn_(std::move(read_fn)),
-        memory_manager_(std::move(memory_manager)),
         listener_(std::make_shared<ipc::CollectListener>()),
         decoder_(listener_) {}
 
@@ -125,24 +121,9 @@ class NativeAsyncFlightMessageReader final
   }
 
  private:
-  /// Consume the retained first frame or request the next frame from gRPC.
+  /// Request the next prepared frame from the composed source.
   Future<std::shared_ptr<internal::FlightData>> ReadDataAsync() {
-    std::shared_ptr<internal::FlightData> pending;
-    {
-      std::lock_guard<std::mutex> guard(mutex_);
-      if (pending_message_) {
-        pending = std::make_shared<internal::FlightData>(std::move(*pending_message_));
-        pending_message_.reset();
-      }
-    }
-    if (pending) {
-      return Future<std::shared_ptr<internal::FlightData>>::MakeFinished(
-          std::move(pending));
-    }
-    return read_fn_().Then([memory_manager = memory_manager_](
-                               std::shared_ptr<internal::FlightData> message) {
-      return PrepareFlightData(std::move(message), memory_manager);
-    });
+    return read_fn_();
   }
 
   /// Feed one IPC frame to the decoder and queue any resulting record batch.
@@ -318,12 +299,9 @@ class NativeAsyncFlightMessageReader final
 
   /// Descriptor carried by the first inbound FlightData frame.
   FlightDescriptor descriptor_;
-  /// First frame retained until schema or data decoding consumes it.
-  std::optional<internal::FlightData> pending_message_;
-  /// Callback used to request subsequent inbound frames from gRPC.
+  /// Composed source yielding prepared frames: the retained first frame,
+  /// then prepared frames from the underlying gRPC reads.
   ReadFn read_fn_;
-  /// Memory manager used when preparing inbound message bodies.
-  std::shared_ptr<MemoryManager> memory_manager_;
   /// IPC listener collecting decoded schemas and record batches.
   std::shared_ptr<ipc::CollectListener> listener_;
   /// IPC stream decoder consuming serialized FlightData messages.
@@ -362,8 +340,28 @@ Future<AsyncMessageReaderParts> MakeNativeAsyncMessageReader(
           return Status::IOError("Descriptor missing on first message");
         }
         auto descriptor = *data.descriptor;
+        // Compose the reader's frame source: yield the retained first frame,
+        // then prepare subsequent frames with the memory manager on read.
+        auto first_frame =
+            std::make_shared<std::optional<internal::FlightData>>(std::move(data));
+        AsyncReadFn composed_read_fn =
+            [read_fn = std::move(read_fn), memory_manager,
+             first_frame = std::move(first_frame)]() mutable {
+              if (first_frame->has_value()) {
+                auto frame = std::make_shared<internal::FlightData>(
+                    std::move(**first_frame));
+                first_frame->reset();
+                return Future<std::shared_ptr<internal::FlightData>>::MakeFinished(
+                    std::move(frame));
+              }
+              return read_fn().Then(
+                  [memory_manager](
+                      std::shared_ptr<internal::FlightData> message) {
+                    return PrepareFlightData(std::move(message), memory_manager);
+                  });
+            };
         auto impl = std::make_shared<NativeAsyncFlightMessageReader>(
-            std::move(descriptor), std::move(data), std::move(read_fn), memory_manager);
+            std::move(descriptor), std::move(composed_read_fn));
         return AsyncMessageReaderParts{.reader = impl,
                                        .when_idle = [impl] { return impl->WhenIdle(); }};
       });
