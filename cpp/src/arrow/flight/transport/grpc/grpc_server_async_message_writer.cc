@@ -92,7 +92,7 @@ class NativeAsyncFlightMessageWriter final
   Future<> WriteWithMetadata(const RecordBatch& batch,
                              std::shared_ptr<Buffer> app_metadata) override {
     std::vector<FlightPayload> payloads;
-    std::vector<DictionaryUpdate> dictionary_updates;
+    std::vector<ipc::internal::DictionaryFrame> dictionary_updates;
     {
       std::lock_guard<std::mutex> guard(mutex_);
       RETURN_NOT_OK(CheckStartedLocked());
@@ -167,39 +167,24 @@ class NativeAsyncFlightMessageWriter final
     return Status::OK();
   }
 
-  struct DictionaryUpdate {
-    /// Dictionary field identifier in the IPC schema.
-    int64_t id;
-    /// Dictionary state to make current after the batch is serialized.
-    std::shared_ptr<Array> dictionary;
-    /// Whether the update appends a dictionary delta.
-    bool is_delta;
-    /// Whether a previous dictionary existed for this identifier.
-    bool had_previous;
-  };
-
   /// Collect and encode required dictionary replacements or deltas under mutex_.
+  /// `updates` carries the ipc-side bookkeeping until the batch is serialized.
   Status BuildDictionaryPayloadsLocked(const RecordBatch& batch,
                                        std::vector<FlightPayload>& payloads,
-                                       std::vector<DictionaryUpdate>& updates) {
-    std::vector<ipc::internal::DictionaryFrame> frames;
+                                       std::vector<ipc::internal::DictionaryFrame>& updates) {
     RETURN_NOT_OK(ipc::internal::ComputeDictionaryFrames(
         batch, /*is_file_format=*/false, options_, *mapper_, &last_dictionaries_,
-        &frames));
-    for (auto& frame : frames) {
+        &updates));
+    for (auto& frame : updates) {
       FlightPayload payload;
       payload.ipc_message = std::move(frame.payload);
       payloads.push_back(std::move(payload));
-      updates.push_back({.id = frame.id,
-                         .dictionary = std::move(frame.dictionary),
-                         .is_delta = frame.is_delta,
-                         .had_previous = frame.had_previous});
     }
     return Status::OK();
   }
 
   /// Commit dictionary state after the complete batch payload is serialized.
-  void CommitDictionaryUpdatesLocked(std::vector<DictionaryUpdate> updates) {
+  void CommitDictionaryUpdatesLocked(std::vector<ipc::internal::DictionaryFrame> updates) {
     for (auto& update : updates) {
       last_dictionaries_[update.id] = std::move(update.dictionary);
       ++stats_.num_dictionary_batches;
