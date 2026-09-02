@@ -60,16 +60,17 @@ class NativeAsyncFlightMessageWriter final
     std::vector<FlightPayload> payloads;
     {
       std::lock_guard<std::mutex> guard(mutex_);
-      if (begun_) {
-        return Future<>::MakeFinished(
-            Status::Invalid("This writer has already been started."));
-      }
-      if (closed_) {
-        return Future<>::MakeFinished(Status::Invalid("This writer is already closed"));
-      }
-      if (failed_) {
-        return Future<>::MakeFinished(failure_status_);
-      }
+      switch(state_) {
+        case State::kNotStarted:
+          break;
+        case State::kOpen:
+          return Future<>::MakeFinished(
+              Status::Invalid("This writer has already been started."));
+        case State::kClosed:
+          return Future<>::MakeFinished(Status::Invalid("This writer is already closed"));
+        case State::kFailed:
+          return Future<>::MakeFinished(failure_status_);
+      } 
       if (!schema) {
         return Future<>::MakeFinished(Status::Invalid("Schema cannot be null"));
       }
@@ -78,7 +79,7 @@ class NativeAsyncFlightMessageWriter final
       FlightPayload payload;
       RETURN_NOT_OK(
           ipc::GetSchemaPayload(*schema, options, *mapper_, &payload.ipc_message));
-      begun_ = true;
+      state_ = State::kOpen;
       payloads.push_back(std::move(payload));
     }
     return WritePayloads(std::move(payloads));
@@ -127,13 +128,15 @@ class NativeAsyncFlightMessageWriter final
       stats_.total_serialized_body_size += payloads.back().ipc_message.body_length;
       CommitDictionaryUpdatesLocked(std::move(dictionary_updates));
     }
-    return WritePayloads(std::move(payloads), /*reserved=*/true);
+    return WriteReservedPayloads(std::move(payloads));
   }
 
   /// Prevent future writes without cancelling an active write.
   Future<> Close() override {
     std::lock_guard<std::mutex> guard(mutex_);
-    closed_ = true;
+    if (state_ != State::kFailed) {
+      state_ = State::kClosed;
+    }
     return Future<>::MakeFinished();
   }
 
@@ -146,19 +149,22 @@ class NativeAsyncFlightMessageWriter final
  private:
   /// Validate that the writer can accept another operation while mutex_ is held.
   Status CheckWritableLocked() const {
-    if (failed_) {
-      return failure_status_;
+    switch (state_) {
+      case State::kNotStarted:
+        return Status::Invalid("This writer is not started. Call Begin() with a schema");
+      case State::kOpen:
+        return Status::OK();
+      case State::kClosed:
+        return Status::Invalid("This writer is already closed");
+      case State::kFailed:
+        return failure_status_;
     }
-    if (closed_) {
-      return Status::Invalid("This writer is already closed");
-    }
-    return Status::OK();
   }
 
   /// Validate that batch writes are legal while mutex_ is held.
   Status CheckStartedLocked() const {
     RETURN_NOT_OK(CheckWritableLocked());
-    if (!begun_) {
+    if (state_ == State::kNotStarted) {
       return Status::Invalid("This writer is not started. Call Begin() with a schema");
     }
     return Status::OK();
@@ -247,17 +253,19 @@ class NativeAsyncFlightMessageWriter final
     }
   }
 
-  /// Serialize a payload sequence through one gRPC write at a time.
-  ///
-  /// When `reserved` is true, the caller has already reserved the writer's
-  /// in-flight slot before serializing the payloads and this method must not
-  /// reserve it again. The default path reserves the slot here.
-  Future<> WritePayloads(std::vector<FlightPayload> payloads, bool reserved = false) {
+  /// Reserve the writer and serialize a payload sequence through one gRPC write at a time.
+  Future<> WritePayloads(std::vector<FlightPayload> payloads) {
     {
       std::lock_guard<std::mutex> guard(mutex_);
-      if (!reserved) {
-        RETURN_NOT_OK(ReserveWriteLocked());
-      }
+      RETURN_NOT_OK(ReserveWriteLocked());
+    }
+    return WriteReservedPayloads(std::move(payloads));
+  }
+
+  /// Serialize a payload sequence after the caller has reserved the writer.
+  Future<> WriteReservedPayloads(std::vector<FlightPayload> payloads) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
       stats_.num_messages += static_cast<int64_t>(payloads.size());
     }
     auto out = Future<>::Make();
@@ -301,7 +309,7 @@ class NativeAsyncFlightMessageWriter final
     std::lock_guard<std::mutex> guard(mutex_);
     write_in_flight_ = false;
     if (!status.ok()) {
-      failed_ = true;
+      state_ = State::kFailed;
       failure_status_ = status;
     }
   }
@@ -318,14 +326,11 @@ class NativeAsyncFlightMessageWriter final
   ipc::IpcWriteOptions options_ = ipc::IpcWriteOptions::Defaults();
   /// Serialization statistics accumulated by this writer.
   ipc::WriteStats stats_;
-  /// Whether Begin() has successfully initialized the writer.
-  bool begun_ = false;
-  /// Whether the writer rejects new operations.
-  bool closed_ = false;
   /// Whether one or more payloads are currently being written.
   bool write_in_flight_ = false;
-  /// Whether a terminal write error has occurred.
-  bool failed_ = false;
+  enum class State { kNotStarted, kOpen, kClosed, kFailed };
+  /// Lifecycle state of the writer, excluding the independent write operation state.
+  State state_ = State::kNotStarted;
   /// Error returned by subsequent operations after a terminal write failure.
   Status failure_status_;
 };
