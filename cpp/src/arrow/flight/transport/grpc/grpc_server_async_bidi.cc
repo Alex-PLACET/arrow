@@ -34,10 +34,10 @@ namespace {
 template <typename Request, typename Response>
 class BidiReactorBase : public ::grpc::ServerBidiReactor<Request, Response> {
  public:
-  using ReadValue =
-      std::conditional_t<std::is_same_v<Request, pb::FlightData>, internal::FlightData, Request>;
-  using WriteValue =
-      std::conditional_t<std::is_same_v<Response, pb::FlightData>, FlightPayload, Response>;
+  using ReadValue = std::conditional_t<std::is_same_v<Request, pb::FlightData>,
+                                       internal::FlightData, Request>;
+  using WriteValue = std::conditional_t<std::is_same_v<Response, pb::FlightData>,
+                                        FlightPayload, Response>;
   using AsyncReadValue =
       std::conditional_t<std::is_same_v<Request, pb::FlightData>,
                          std::shared_ptr<internal::FlightData>, std::optional<Request>>;
@@ -179,7 +179,7 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Request, Response> {
   /// Synchronously read one message for legacy handshake authentication.
   bool ReadOne(Request* out) { return PopRead(out); }
 
-/// Block a compatibility caller until a gRPC write completes.
+  /// Block a compatibility caller until a gRPC write completes.
   bool WriteOne(Response message) { return WriteOneImpl(std::move(message)); }
 
   /// Return the next inbound message while enforcing one outstanding read.
@@ -223,7 +223,9 @@ class BidiReactorBase : public ::grpc::ServerBidiReactor<Request, Response> {
   }
 
   /// Start an asynchronous protobuf response write.
-  Future<bool> WriteOneAsync(Response message) { return StartAsyncWrite(std::move(message)); }
+  Future<bool> WriteOneAsync(Response message) {
+    return StartAsyncWrite(std::move(message));
+  }
 
   /// Validate and start an asynchronous FlightData response write.
   Future<bool> WritePayloadAsync(FlightPayload payload) {
@@ -444,17 +446,17 @@ class AsyncBidiFlightReactor final : public BidiReactorBase<pb::FlightData, Resp
             .MoveValueUnsafe();
     Future<> completion;
     if constexpr (std::is_same_v<Response, pb::PutResult>) {
-      completion = impl_->base()->DoPut(
-          flight_context_, reader_and_state.TakeReader(),
-          MakeAsyncMetadataWriter([this](pb::PutResult result) {
-            return this->WriteOneAsync(std::move(result));
-          }));
+      completion =
+          impl_->base()->DoPut(flight_context_, reader_and_state.TakeReader(),
+                               MakeAsyncMetadataWriter([this](pb::PutResult result) {
+                                 return this->WriteOneAsync(std::move(result));
+                               }));
     } else {
-      completion = impl_->base()->DoExchange(
-          flight_context_, reader_and_state.TakeReader(),
-          MakeAsyncMessageWriter([this](FlightPayload payload) {
-            return this->WritePayloadAsync(std::move(payload));
-          }));
+      completion =
+          impl_->base()->DoExchange(flight_context_, reader_and_state.TakeReader(),
+                                    MakeAsyncMessageWriter([this](FlightPayload payload) {
+                                      return this->WritePayloadAsync(std::move(payload));
+                                    }));
     }
     FinishAfterReader(std::move(reader_and_state), std::move(completion));
   }
@@ -485,68 +487,67 @@ class AsyncBidiFlightReactor final : public BidiReactorBase<pb::FlightData, Resp
 
 }  // namespace
 
+class Reactor final
+    : public BidiReactorBase<pb::HandshakeRequest, pb::HandshakeResponse> {
+ public:
+  Reactor(::grpc::CallbackServerContext* context, AsyncGrpcServerTransport* impl,
+          const CallbackServiceHelper& helper)
+      : BidiReactorBase(context, impl->executor()),
+        impl_(impl),
+        helper_(helper),
+        flight_context_(context) {}
+
+  void Start() {
+    auto grpc_status = helper_.MakeCallContext(FlightMethod::Handshake, this->context_,
+                                               &flight_context_);
+    if (!grpc_status.ok()) {
+      this->Finish(grpc_status);
+      return;
+    }
+    helper_.AddMiddlewareHeaders(this->context_, &flight_context_);
+    auto status = this->StartWorker([this] {
+      auto outgoing = std::make_unique<
+          ::arrow::flight::transport::grpc::GrpcServerAuthSender<pb::HandshakeResponse>>(
+          [this](pb::HandshakeResponse response) {
+            return this->WriteOne(std::move(response));
+          });
+
+      auto incoming = std::make_unique<
+          ::arrow::flight::transport::grpc::GrpcServerAuthReader<pb::HandshakeRequest>>(
+          [this](pb::HandshakeRequest* request) { return this->ReadOne(request); });
+
+      if (helper_.auth_handler()) {
+        const auto status = helper_.auth_handler()->Authenticate(
+            flight_context_, outgoing.get(), incoming.get());
+        this->FinishFromWorker(flight_context_.FinishRequest(status));
+      } else {
+        this->Hold();
+        impl_->base()
+            ->Handshake(flight_context_, std::move(outgoing), std::move(incoming))
+            .AddCallback([this](const ::arrow::Result<::arrow::internal::Empty>& result) {
+              this->FinishFromWorker(flight_context_.FinishRequest(result.status()));
+              this->ReleaseHold();
+            });
+      }
+    });
+    if (!status.ok()) {
+      this->Finish(flight_context_.FinishRequest(status));
+    }
+  }
+
+ private:
+  /// Async transport providing the server implementation.
+  AsyncGrpcServerTransport* impl_;
+  /// Authentication and middleware helper for the handshake.
+  const CallbackServiceHelper& helper_;
+  /// Flight context used for handshake authentication and completion.
+  GrpcServerCallContext flight_context_;
+};
+
 ::grpc::ServerBidiReactor<pb::HandshakeRequest, pb::HandshakeResponse>*
 MakeHandshakeReactor(::grpc::CallbackServerContext* context,
                      AsyncGrpcServerTransport* impl,
                      const CallbackServiceHelper& helper) {
-  class Reactor final
-      : public BidiReactorBase<pb::HandshakeRequest, pb::HandshakeResponse> {
-   public:
-    Reactor(::grpc::CallbackServerContext* context, AsyncGrpcServerTransport* impl,
-            const CallbackServiceHelper& helper)
-        : BidiReactorBase(context, impl->executor()),
-          impl_(impl),
-          helper_(helper),
-          flight_context_(context) {}
-
-    void Start() {
-      auto st = helper_.MakeCallContext(FlightMethod::Handshake, this->context_,
-                                        &flight_context_);
-      if (!st.ok()) {
-        this->Finish(st);
-        return;
-      }
-      helper_.AddMiddlewareHeaders(this->context_, &flight_context_);
-      auto status = this->StartWorker([this] {
-        auto outgoing = std::make_unique<
-            ::arrow::flight::transport::grpc::GrpcServerAuthSender<
-                pb::HandshakeResponse>>([this](pb::HandshakeResponse response) {
-          return this->WriteOne(std::move(response));
-        });
-        auto incoming = std::make_unique<
-            ::arrow::flight::transport::grpc::GrpcServerAuthReader<
-                pb::HandshakeRequest>>([this](pb::HandshakeRequest* request) {
-          return this->ReadOne(request);
-        });
-        if (helper_.auth_handler()) {
-          auto status = helper_.auth_handler()->Authenticate(
-              flight_context_, outgoing.get(), incoming.get());
-          this->FinishFromWorker(flight_context_.FinishRequest(status));
-        } else {
-          this->Hold();
-          impl_->base()
-              ->Handshake(flight_context_, std::move(outgoing), std::move(incoming))
-              .AddCallback([this](
-                               const ::arrow::Result<::arrow::internal::Empty>& result) {
-                this->FinishFromWorker(flight_context_.FinishRequest(result.status()));
-                this->ReleaseHold();
-              });
-        }
-      });
-      if (!status.ok()) {
-        this->Finish(flight_context_.FinishRequest(status));
-      }
-    }
-
-   private:
-    /// Async transport providing the server implementation.
-    AsyncGrpcServerTransport* impl_;
-    /// Authentication and middleware helper for the handshake.
-    const CallbackServiceHelper& helper_;
-    /// Flight context used for handshake authentication and completion.
-    GrpcServerCallContext flight_context_;
-  };
-
   auto* reactor = new Reactor(context, impl, helper);
   reactor->Start();
   return reactor;

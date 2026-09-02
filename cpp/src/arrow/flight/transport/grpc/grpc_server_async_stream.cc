@@ -257,51 +257,41 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
 
   /// Select the next schema, payload, or close operation from the source.
   Status Advance() override {
-    if (this->cancelled()) return Status::OK();
-    AsyncFlightDataStream* stream = nullptr;
+    if (this->cancelled())
     {
-      std::lock_guard<std::mutex> lock(this->mutex_);
-      stream = stream_.get();
+        return Status::OK();
     }
-    if (!stream) {
+    if (!stream_) {
       this->FinishOnce(this->flight_context_.FinishRequest(
           Status::KeyError("No data in this flight")));
       return Status::OK();
     }
-    if (stage_ == Stage::kSchema) {
-      stage_ = Stage::kPayloads;
-      return ReadSchema(stream);
+    switch (stage_) {
+      case Stage::kSchema:
+        stage_ = Stage::kPayloads;
+        return ReadPayload(stream_->GetSchemaPayload());
+      case Stage::kPayloads:
+        return ReadPayload(stream_->Next());
+      case Stage::kFinish:
+        return CloseStream();
     }
-    if (stage_ == Stage::kPayloads) {
-      return ReadNext(stream);
-    }
-    return CloseStream();
+    return CloseStream(Status::Invalid("Invalid stage"));
   }
-
-  /// Request the mandatory schema payload.
-  Status ReadSchema(AsyncFlightDataStream* stream) {
-    return ReadPayload(stream->GetSchemaPayload());
-  }
-
-  /// Request the next payload after the schema.
-  Status ReadNext(AsyncFlightDataStream* stream) { return ReadPayload(stream->Next()); }
 
   /// Close the source and finish the RPC with its close status.
   Status CloseStream(Status failure = Status::OK()) {
-    AsyncFlightDataStream* stream = nullptr;
     {
       std::lock_guard<std::mutex> lock(this->mutex_);
       if (close_started_) {
         return Status::OK();
       }
-      stream = stream_.get();
-      if (!stream) {
+      if (!stream_) {
         return Status::OK();
       }
       close_started_ = true;
     }
     this->Hold();
-    stream->Close().AddCallback(
+    stream_->Close().AddCallback(
         [this, failure = std::move(failure)](
             const ::arrow::Result<::arrow::internal::Empty>& result) mutable {
           this->FinishWithError(failure.ok() ? result.status() : failure);
@@ -320,12 +310,12 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
         auto payload = result.ValueUnsafe();
         if (payload.ipc_message.metadata == nullptr) {
           stage_ = Stage::kFinish;
-          auto status = Advance();
+          const auto status = Advance();
           if (!status.ok()) {
             ARROW_UNUSED(CloseStream(status));
           }
         } else {
-          auto status = StartPayloadWrite(std::move(payload));
+          const auto status = StartPayloadWrite(std::move(payload));
           if (!status.ok()) {
             ARROW_UNUSED(CloseStream(status));
           }
@@ -395,8 +385,7 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
   reactor->StartAfter(std::move(future), [](std::vector<ActionType> actions) {
     return [actions = std::move(actions),
             index = size_t{0}]() mutable -> arrow::Result<std::unique_ptr<ActionType>> {
-      if (index >= actions.size())
-      {
+      if (index >= actions.size()) {
         return nullptr;
       }
       return std::make_unique<ActionType>(actions[index++]);
