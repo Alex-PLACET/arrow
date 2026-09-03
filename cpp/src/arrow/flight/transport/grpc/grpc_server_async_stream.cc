@@ -225,14 +225,19 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
     if (this->cancelled()) {
       return Status::OK();
     }
-    if (!stream_) {
+    bool has_stream;
+    {
+      std::lock_guard<std::mutex> lock(this->mutex_);
+      has_stream = stream_ != nullptr;
+    }
+    if (!has_stream) {
       this->FinishOnce(this->flight_context_.FinishRequest(
           Status::KeyError("No data in this flight")));
       return Status::OK();
     }
-    switch (stage_) {
+    switch (stage_.load(std::memory_order_relaxed)) {
       case Stage::kSchema:
-        stage_ = Stage::kPayloads;
+        stage_.store(Stage::kPayloads, std::memory_order_relaxed);
         return ReadPayload(stream_->GetSchemaPayload());
       case Stage::kPayloads:
         return ReadPayload(stream_->Next());
@@ -273,7 +278,7 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
       } else {
         auto payload = result.ValueUnsafe();
         if (payload.ipc_message.metadata == nullptr) {
-          stage_ = Stage::kFinish;
+          stage_.store(Stage::kFinish, std::memory_order_relaxed);
           const auto status = Advance();
           if (!status.ok()) {
             ARROW_UNUSED(CloseStream(status));
@@ -311,7 +316,9 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
   void OnSourceCancelled() override { ARROW_UNUSED(CloseStream()); }
 
   std::unique_ptr<AsyncFlightDataStream> stream_;
-  Stage stage_ = Stage::kSchema;
+  /// Next stage of the DoGet stream; transitions are structurally serialized
+  /// by write/future completions, the atomic only satisfies the race check.
+  std::atomic<Stage> stage_{Stage::kSchema};
   bool close_started_ = false;
 };
 
