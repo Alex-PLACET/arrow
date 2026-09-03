@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#pragma once
+#include "arrow/flight/transport_server_async.h"
 
-#include "arrow/flight/client.h"
-#include "arrow/flight/client_auth.h"
-#include "arrow/flight/client_middleware.h"
-#include "arrow/flight/client_tracing_middleware.h"
-#include "arrow/flight/middleware.h"
-#include "arrow/flight/server.h"
-#include "arrow/flight/server_async.h"
-#include "arrow/flight/server_auth.h"
-#include "arrow/flight/server_middleware.h"
-#include "arrow/flight/server_tracing_middleware.h"
-#include "arrow/flight/types.h"
-#include "arrow/flight/types_async.h"
+#include "arrow/flight/transport_server_internal.h"
+
+namespace arrow::flight::internal {
+
+arrow::Result<std::unique_ptr<AsyncServerTransport>> MakeAsyncServerTransport(
+    const std::string& scheme, AsyncFlightServerBase* base,
+    std::shared_ptr<MemoryManager> memory_manager) {
+  if (scheme == kSchemeGrpc || scheme == kSchemeGrpcTcp || scheme == kSchemeGrpcTls ||
+      scheme == kSchemeGrpcUnix) {
+    return MakeGrpcCallbackServerTransport(base, std::move(memory_manager));
+  }
+  return Status::KeyError("No async server transport implementation for ", scheme);
+}
+
+}  // namespace arrow::flight::internal
