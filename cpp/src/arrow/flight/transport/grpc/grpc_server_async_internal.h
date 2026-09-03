@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -45,6 +46,47 @@ using GrpcServerCallContext =
 using CallbackServiceHelper =
     ::arrow::flight::transport::grpc::GrpcServerCallContextHelper<
         ::grpc::CallbackServerContext>;
+
+/// CRTP base providing self-ownership, cancellation, and finish-once semantics
+/// for gRPC callback reactors.
+///
+/// gRPC does not own the reactor: the service allocates it and is expected to
+/// delete it once the RPC is done and no background callback is still running.
+/// `Derived` must be a complete class with a virtual destructor (all reactors
+/// inherit one from gRPC's `ServerReactor`); deletion happens through it.
+template <typename Derived>
+class SelfOwnedReactor {
+ public:
+  /// Retain this self-owned reactor across an asynchronous callback.
+  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
+  /// Release a reference acquired with Hold() or the initial gRPC reference.
+  void ReleaseHold() { ReleaseRef(); }
+  /// Return whether gRPC has cancelled the RPC.
+  bool cancelled() const { return cancelled_.load(std::memory_order_relaxed); }
+  /// Record gRPC cancellation for background producers.
+  void SetCanceled() { cancelled_.store(true, std::memory_order_relaxed); }
+
+ protected:
+  /// Finish the RPC at most once, even if several async paths fail together.
+  void FinishOnce(::grpc::Status status) {
+    bool expected = false;
+    if (finished_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      static_cast<Derived*>(this)->Finish(std::move(status));
+    }
+  }
+
+ private:
+  /// Delete this reactor when gRPC and background callbacks have released it.
+  void ReleaseRef() {
+    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete static_cast<Derived*>(this);
+    }
+  }
+
+  std::atomic<bool> cancelled_{false};
+  std::atomic<bool> finished_{false};
+  std::atomic<int> refs_{1};
+};
 
 arrow::Result<std::shared_ptr<arrow::internal::ThreadPool>> MakeAsyncGrpcExecutor();
 
