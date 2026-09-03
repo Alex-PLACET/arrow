@@ -28,7 +28,9 @@ namespace {
 
 /// Common lifetime, cancellation, and output storage for server-streaming RPCs.
 template <typename Proto>
-class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
+class AsyncWriteReactorBase
+    : public ::grpc::ServerWriteReactor<Proto>,
+      public SelfOwnedReactor<AsyncWriteReactorBase<Proto>> {
  public:
   using WriteValue =
       std::conditional_t<std::is_same_v<Proto, pb::FlightData>, FlightPayload, Proto>;
@@ -38,10 +40,10 @@ class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
       : executor_(std::move(executor)), flight_context_(std::move(flight_context)) {}
 
   /// Remember gRPC cancellation for background producers.
-  void OnCancel() override { cancelled_.store(true, std::memory_order_relaxed); }
+  void OnCancel() override { this->SetCanceled(); }
 
   /// Release gRPC's ownership reference.
-  void OnDone() override { ReleaseRef(); }
+  void OnDone() override { this->ReleaseHold(); }
 
   const GrpcServerCallContext& flight_context() const { return flight_context_; }
 
@@ -59,7 +61,7 @@ class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
       } else {
         auto value = std::move(const_cast<arrow::Result<T>&>(result)).MoveValueUnsafe();
         init_fn(std::move(value));
-        if (cancelled()) {
+        if (this->cancelled()) {
           OnSourceCancelled();
         } else {
           Start();
@@ -82,20 +84,17 @@ class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
   template <typename Fn>
   /// Schedule blocking compatibility work while retaining the reactor.
   Status StartBackgroundWork(Fn&& fn) {
-    refs_.fetch_add(1, std::memory_order_relaxed);
+    this->Hold();
     auto maybe_future = executor_->Submit([this, fn = std::forward<Fn>(fn)]() mutable {
       fn();
-      ReleaseRef();
+      this->ReleaseHold();
     });
     if (!maybe_future.ok()) {
-      ReleaseRef();
+      this->ReleaseHold();
       return maybe_future.status();
     }
     return Status::OK();
   }
-
-  /// Return whether gRPC has cancelled the RPC.
-  bool cancelled() const { return cancelled_.load(std::memory_order_relaxed); }
 
   /// Advance the source and translate immediate failures to gRPC completion.
   void AdvanceAndFinish() {
@@ -107,7 +106,7 @@ class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
 
   /// Finish the RPC with an Arrow status.
   void FinishWithError(const Status& status) {
-    FinishOnce(this->flight_context_.FinishRequest(status));
+    this->FinishOnce(this->flight_context_.FinishRequest(status));
   }
 
   virtual void OnSourceCancelled() {}
@@ -115,14 +114,6 @@ class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
   virtual void OnWriteFailure() { FinishWithError(Status::OK()); }
 
   virtual Status Advance() = 0;
-
-  /// Finish at most once, even when multiple async operations fail concurrently.
-  void FinishOnce(::grpc::Status status) {
-    bool expected = false;
-    if (finished_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-      this->Finish(std::move(status));
-    }
-  }
 
   /// Return the protobuf storage submitted by StartWrite().
   Proto* GrpcWriteBuffer() {
@@ -137,23 +128,6 @@ class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
   GrpcServerCallContext flight_context_;
   WriteValue current_write_;
   std::mutex mutex_;
-
-  /// Retain this self-owned reactor across an asynchronous callback.
-  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
-  /// Release a reference acquired with Hold().
-  void ReleaseHold() { ReleaseRef(); }
-
- private:
-  /// Delete this reactor when gRPC and background callbacks have released it.
-  void ReleaseRef() {
-    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      delete this;
-    }
-  }
-
-  std::atomic<bool> cancelled_{false};
-  std::atomic<bool> finished_{false};
-  std::atomic<int> refs_{1};
 };
 
 /// Streams a legacy pull iterator to a server-streaming gRPC response.
