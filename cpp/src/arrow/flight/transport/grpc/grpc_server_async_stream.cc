@@ -35,8 +35,7 @@ class AsyncWriteReactorBase : public ::grpc::ServerWriteReactor<Proto> {
 
   AsyncWriteReactorBase(std::shared_ptr<arrow::internal::ThreadPool> executor,
                         GrpcServerCallContext flight_context)
-      : executor_(std::move(executor)),
-        flight_context_(std::move(flight_context)) {}
+      : executor_(std::move(executor)), flight_context_(std::move(flight_context)) {}
 
   /// Remember gRPC cancellation for background producers.
   void OnCancel() override { cancelled_.store(true, std::memory_order_relaxed); }
@@ -166,8 +165,7 @@ class IteratorReactor : public AsyncWriteReactorBase<Proto> {
 
   IteratorReactor(std::shared_ptr<arrow::internal::ThreadPool> executor,
                   GrpcServerCallContext flight_context, ToProtoFn to_proto)
-      : AsyncWriteReactorBase<Proto>(std::move(executor),
-                                     std::move(flight_context)),
+      : AsyncWriteReactorBase<Proto>(std::move(executor), std::move(flight_context)),
         to_proto_(std::move(to_proto)) {}
 
   /// Install an iterator once an asynchronous server hook has completed.
@@ -343,6 +341,18 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
   bool close_started_ = false;
 };
 
+/// Own a pull-source and delegate Next() to it; `on_null` produces the
+/// terminal result once the source is exhausted or was never provided.
+template <typename T, typename Source>
+std::function<arrow::Result<std::unique_ptr<T>>()> MakeSourceIteratorNext(
+    std::unique_ptr<Source> source,
+    std::function<arrow::Result<std::unique_ptr<T>>()> on_null) {
+  auto state = std::make_shared<std::unique_ptr<Source>>(std::move(source));
+  return [state, on_null = std::move(on_null)]() mutable {
+    return *state ? (*state)->Next() : on_null();
+  };
+}
+
 }  // namespace
 
 ::grpc::ServerWriteReactor<pb::FlightInfo>* MakeListFlightsReactor(
@@ -354,12 +364,8 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
         return internal::ToProto(info, out);
       });
   reactor->StartAfter(std::move(future), [](std::unique_ptr<FlightListing> listing) {
-    auto state = std::make_shared<std::unique_ptr<FlightListing>>(std::move(listing));
-    return [state]() mutable {
-      return *state ? (*state)->Next()
-                    : arrow::Result<std::unique_ptr<FlightInfo>>(
-                          std::unique_ptr<FlightInfo>{});
-    };
+    return MakeSourceIteratorNext<FlightInfo>(
+        std::move(listing), [] { return std::unique_ptr<FlightInfo>{}; });
   });
   return reactor;
 }
@@ -393,14 +399,8 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
         return internal::ToProto(result, out);
       });
   reactor->StartAfter(std::move(future), [](std::unique_ptr<ResultStream> results) {
-    auto state = std::make_shared<std::unique_ptr<ResultStream>>(std::move(results));
-    return [state]() mutable -> arrow::Result<std::unique_ptr<arrow::flight::Result>> {
-      if (!*state) {
-        // Mirror the sync server: a null result stream is cancelled.
-        return Status::Cancelled();
-      }
-      return (*state)->Next();
-    };
+    return MakeSourceIteratorNext<arrow::flight::Result>(
+        std::move(results), [] { return Status::Cancelled(); });
   });
   return reactor;
 }
@@ -409,8 +409,7 @@ class DoGetReactor : public AsyncWriteReactorBase<pb::FlightData> {
     std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context,
     Future<std::unique_ptr<AsyncFlightDataStream>> future) {
-  auto* reactor =
-      new DoGetReactor(std::move(executor), std::move(flight_context));
+  auto* reactor = new DoGetReactor(std::move(executor), std::move(flight_context));
   reactor->StartAfter(std::move(future));
   return reactor;
 }
