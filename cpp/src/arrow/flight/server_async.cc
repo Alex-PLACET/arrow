@@ -21,66 +21,10 @@
 #include "arrow/flight/transport_server_async.h"
 #include "arrow/flight/transport_server_internal.h"
 #include "arrow/status.h"
-#include "arrow/util/thread_pool.h"
 
 #include <memory>
-#include <mutex>
 
 namespace arrow::flight {
-
-namespace {
-
-class LegacyAsyncFlightDataStream final : public AsyncFlightDataStream {
- public:
-  explicit LegacyAsyncFlightDataStream(std::unique_ptr<FlightDataStream> stream)
-      : state_(std::make_shared<State>(std::move(stream))) {}
-
-  Future<FlightPayload> GetSchemaPayload() override {
-    return Run<FlightPayload>(
-        [](State& state) { return state.stream->GetSchemaPayload(); });
-  }
-  Future<FlightPayload> Next() override {
-    return Run<FlightPayload>([](State& state) { return state.stream->Next(); });
-  }
-  Future<> Close() override {
-    return Run<::arrow::internal::Empty>(
-        [](State& state) -> ::arrow::Result<::arrow::internal::Empty> {
-          RETURN_NOT_OK(state.stream->Close());
-          return ::arrow::internal::Empty{};
-        });
-  }
-
- private:
-  struct State {
-    explicit State(std::unique_ptr<FlightDataStream> stream)
-        : stream(std::move(stream)) {}
-    std::unique_ptr<FlightDataStream> stream;
-    std::mutex mutex;
-  };
-
-  template <typename T, typename Fn>
-  Future<T> Run(Fn&& fn) {
-    auto out = Future<T>::Make();
-    auto state = state_;
-    auto submitted = ::arrow::internal::GetCpuThreadPool()->Submit(
-        [out, state, fn = std::forward<Fn>(fn)]() mutable {
-          std::lock_guard<std::mutex> guard(state->mutex);
-          out.MarkFinished(fn(*state));
-        });
-    if (!submitted.ok()) out.MarkFinished(submitted.status());
-    return out;
-  }
-
-  std::shared_ptr<State> state_;
-};
-
-}  // namespace
-
-std::unique_ptr<AsyncFlightDataStream> MakeAsyncFlightDataStreamFromSync(
-    std::unique_ptr<FlightDataStream> stream) {
-  if (!stream) return nullptr;
-  return std::make_unique<LegacyAsyncFlightDataStream>(std::move(stream));
-}
 
 struct AsyncFlightServerBase::Impl {
   std::unique_ptr<internal::AsyncServerTransport> transport_;
@@ -161,14 +105,21 @@ Status AsyncFlightServerBase::Wait() {
 }
 
 Future<> AsyncFlightServerBase::Handshake(const ServerCallContext&,
-                                          std::unique_ptr<ServerAuthSender>,
-                                          std::unique_ptr<ServerAuthReader>) {
-  return Future<>::MakeFinished(Status::NotImplemented("NYI"));
+                                          std::unique_ptr<AsyncServerAuthSender>,
+                                          std::unique_ptr<AsyncServerAuthReader>) {
+  return Future<>::MakeFinished(Status::NotImplemented(
+      "This service does not have an authentication mechanism enabled."));
 }
 
-Future<std::unique_ptr<FlightListing>> AsyncFlightServerBase::ListFlights(
+Status AsyncFlightServerBase::ValidateToken(const ServerCallContext&,
+                                            const std::string&, std::string*) {
+  // Keep the transport-level (TLS) identity; ignore the token.
+  return Status::OK();
+}
+
+Future<std::unique_ptr<AsyncFlightListing>> AsyncFlightServerBase::ListFlights(
     const ServerCallContext&, const Criteria*) {
-  return Future<std::unique_ptr<FlightListing>>::MakeFinished(
+  return Future<std::unique_ptr<AsyncFlightListing>>::MakeFinished(
       Status::NotImplemented("NYI"));
 }
 
@@ -206,9 +157,9 @@ Future<> AsyncFlightServerBase::DoExchange(const ServerCallContext&,
   return Future<>::MakeFinished(Status::NotImplemented("DoExchange must be overridden"));
 }
 
-Future<std::unique_ptr<ResultStream>> AsyncFlightServerBase::DoAction(
+Future<std::unique_ptr<AsyncResultStream>> AsyncFlightServerBase::DoAction(
     const ServerCallContext&, const Action&) {
-  return Future<std::unique_ptr<ResultStream>>::MakeFinished(
+  return Future<std::unique_ptr<AsyncResultStream>>::MakeFinished(
       Status::NotImplemented("NYI"));
 }
 

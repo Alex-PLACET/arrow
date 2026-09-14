@@ -19,11 +19,6 @@
 
 namespace arrow::flight::transport::grpc::async_internal {
 
-arrow::Result<std::shared_ptr<arrow::internal::ThreadPool>> MakeAsyncGrpcExecutor() {
-  return arrow::internal::ThreadPool::MakeEternal(
-      arrow::internal::ThreadPool::DefaultCapacity());
-}
-
 ::grpc::Status PrepareAuthenticatedCall(const CallbackServiceHelper& helper,
                                         FlightMethod method,
                                         ::grpc::CallbackServerContext* context,
@@ -44,9 +39,18 @@ AsyncGrpcServerTransport::~AsyncGrpcServerTransport() = default;
 
 Status AsyncGrpcServerTransport::Init(const FlightServerOptions& options,
                                       const arrow::util::Uri& uri) {
-  ARROW_ASSIGN_OR_RAISE(executor_pool_, MakeAsyncGrpcExecutor());
-  helper_ =
-      std::make_unique<CallbackServiceHelper>(options.auth_handler, options.middleware);
+  if (options.auth_handler) {
+    return Status::Invalid(
+        "FlightServerOptions::auth_handler is not supported by the async server; "
+        "override AsyncFlightServerBase::Handshake() and ValidateToken() instead, "
+        "or use the synchronous FlightServerBase.");
+  }
+  helper_ = std::make_unique<CallbackServiceHelper>(
+      /*auth_handler=*/nullptr, options.middleware,
+      [this](const ServerCallContext& context, const std::string& token,
+             std::string* peer_identity) {
+        return base()->ValidateToken(context, token, peer_identity);
+      });
   grpc_service_ = std::make_unique<CallbackFlightService>(this, *helper_);
 
   return transport::grpc::StartFlightGrpcServer(options, uri, grpc_service_.get(),

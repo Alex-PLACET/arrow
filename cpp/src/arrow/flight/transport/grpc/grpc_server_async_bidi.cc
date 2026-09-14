@@ -18,7 +18,6 @@
 #include "arrow/flight/transport/grpc/grpc_server_async_internal.h"
 
 #include <atomic>
-#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -29,8 +28,8 @@
 namespace arrow::flight::transport::grpc::async_internal {
 namespace {
 
-/// Shared state machine for callback bidi RPCs, including synchronous handshake
-/// compatibility and future-based Flight data reads/writes.
+/// Shared state machine for callback bidi RPCs, exposing future-based reads
+/// and writes to the async server hooks.
 template <typename Request, typename Response>
 class BidiReactorBase
     : public ::grpc::ServerBidiReactor<Request, Response>,
@@ -55,31 +54,8 @@ class BidiReactorBase
   };
 
  public:
-  BidiReactorBase(::grpc::CallbackServerContext* context,
-                  std::shared_ptr<arrow::internal::ThreadPool> executor)
-      : context_(context), executor_(std::move(executor)) {}
-
-  /// Arm the first read and run a blocking compatibility handler on the pool.
-  Status StartWorker(std::function<void()> fn) {
-    // For bidi RPCs the first read must be armed explicitly. After that, reads
-    // are re-armed only from OnReadDone() so the callback path owns the
-    // receive-side state machine.
-    {
-      std::unique_lock<std::mutex> lock(mutex_);
-      read_state_.in_flight = true;
-    }
-    this->StartRead(GrpcReadBuffer());
-    this->Hold();
-    auto maybe_future = executor_->Submit([this, fn = std::move(fn)]() mutable {
-      fn();
-      this->ReleaseHold();
-    });
-    if (!maybe_future.ok()) {
-      this->ReleaseHold();
-      return maybe_future.status();
-    }
-    return Status::OK();
-  }
+  explicit BidiReactorBase(::grpc::CallbackServerContext* context)
+      : context_(context) {}
 
   /// Deliver one completed read or stream end to the pending async read.
   void OnReadDone(bool ok) override {
@@ -121,7 +97,6 @@ class BidiReactorBase
         pending_future.MarkFinished(EndAsyncReadValue());
       }
     }
-    cv_.notify_all();
   }
 
   /// Complete the pending write and finish a deferred RPC if necessary.
@@ -152,7 +127,6 @@ class BidiReactorBase
     if (finish_now) {
       this->Finish(finish_status);
     }
-    cv_.notify_all();
   }
 
   /// Wake pending reads and writes when gRPC cancels the RPC.
@@ -176,24 +150,16 @@ class BidiReactorBase
       if (resolve_write) {
         write_future.MarkFinished(false);
       }
-      cv_.notify_all();
       return;
     }
     lock.unlock();
     if (resolve_write) {
       write_future.MarkFinished(false);
     }
-    cv_.notify_all();
   }
 
   /// Release gRPC's ownership reference.
   void OnDone() override { this->ReleaseHold(); }
-
-  /// Synchronously read one message for legacy handshake authentication.
-  bool ReadOne(Request* out) { return PopRead(out); }
-
-  /// Block a compatibility caller until a gRPC write completes.
-  bool WriteOne(Response message) { return WriteOneImpl(std::move(message)); }
 
   /// Return the next inbound message while enforcing one outstanding read.
   Future<AsyncReadValue> ReadOneAsync() {
@@ -247,14 +213,7 @@ class BidiReactorBase
     return StartAsyncWrite(std::move(payload));
   }
 
-  /// Synchronously write a Flight payload for legacy server streams.
-  arrow::Result<bool> WritePayloadPublic(FlightPayload payload) {
-    static_assert(std::is_same_v<Response, pb::FlightData>);
-    RETURN_NOT_OK(payload.Validate());
-    return WriteOneImpl(std::move(payload));
-  }
-
-  protected:
+ protected:
   /// Start one outbound write while enforcing the single-write contract.
   Future<bool> StartAsyncWrite(WriteValue message) {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -271,45 +230,6 @@ class BidiReactorBase
     write_state_.in_flight = true;
     this->StartWrite(GrpcWriteBuffer());
     return write_state_.pending;
-  }
-
-  /// Block a compatibility caller until an inbound message or end-of-stream.
-  bool PopRead(Request* out) {
-    bool start_read = false;
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (read_state_.messages.empty() && !this->cancelled() && !read_state_.done &&
-        !read_state_.in_flight) {
-      read_state_.in_flight = true;
-      start_read = true;
-    }
-    if (start_read) {
-      lock.unlock();
-      this->StartRead(GrpcReadBuffer());
-      lock.lock();
-    }
-    cv_.wait(lock, [&] {
-      return this->cancelled() || read_state_.done || !read_state_.messages.empty();
-    });
-    if (!read_state_.messages.empty()) {
-      *out = std::move(read_state_.messages.front());
-      read_state_.messages.pop_front();
-      return true;
-    }
-    return false;
-  }
-
-  /// Start a synchronous write for either a protobuf or FlightData response.
-  bool WriteOneImpl(WriteValue message) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (this->cancelled()) {
-      return false;
-    }
-    current_write_ = std::move(message);
-    write_state_.in_flight = true;
-    write_state_.ok = true;
-    this->StartWrite(GrpcWriteBuffer());
-    cv_.wait(lock, [&] { return !write_state_.in_flight || this->cancelled(); });
-    return !this->cancelled() && write_state_.ok;
   }
 
   /// Request RPC completion, deferring it until an active write finishes.
@@ -365,16 +285,12 @@ class BidiReactorBase
 
   /// gRPC context associated with this reactor.
   ::grpc::CallbackServerContext* context_;
-  /// Executor used for blocking compatibility handlers.
-  std::shared_ptr<arrow::internal::ThreadPool> executor_;
   /// Receive-side state, including the buffer owned by the active gRPC read.
   ReadState read_state_;
   /// Protobuf or FlightPayload storage supplied to the active gRPC write.
   WriteValue current_write_;
   /// Protects all read, write, cancellation, and completion state.
   std::mutex mutex_;
-  /// Wakes compatibility callers after reads, writes, or cancellation.
-  std::condition_variable cv_;
   /// Write-side state, including the pending application write.
   struct WriteState {
     /// Future completed when the one application write currently in progress ends.
@@ -387,7 +303,7 @@ class BidiReactorBase
     bool ok = true;
   };
   WriteState write_state_;
-  /// Deferred RPC completion requested by a background worker.
+  /// Deferred RPC completion requested via FinishFromWorker().
   struct FinishState {
     bool requested = false;
     ::grpc::Status status;
@@ -402,7 +318,7 @@ class AsyncBidiFlightReactor final : public BidiReactorBase<pb::FlightData, Resp
   AsyncBidiFlightReactor(::grpc::CallbackServerContext* context,
                          AsyncGrpcServerTransport* impl,
                          const CallbackServiceHelper& helper)
-      : BidiReactorBase<pb::FlightData, Response>(context, impl->executor()),
+      : BidiReactorBase<pb::FlightData, Response>(context),
         impl_(impl),
         helper_(helper),
         flight_context_(context) {}
@@ -470,7 +386,7 @@ class AsyncBidiFlightReactor final : public BidiReactorBase<pb::FlightData, Resp
         });
   }
 
-  /// Async transport providing the server implementation and executor.
+  /// Async transport providing the server implementation.
   AsyncGrpcServerTransport* impl_;
   /// Authentication and middleware helper for this RPC.
   const CallbackServiceHelper& helper_;
@@ -480,15 +396,49 @@ class AsyncBidiFlightReactor final : public BidiReactorBase<pb::FlightData, Resp
 
 }  // namespace
 
+template <typename Request>
+class AsyncGrpcServerAuthReader final : public AsyncServerAuthReader {
+ public:
+  using ReadFn = std::function<Future<std::optional<Request>>()>;
+  explicit AsyncGrpcServerAuthReader(ReadFn read_fn) : read_fn_(std::move(read_fn)) {}
+
+  Future<std::string> Read() override {
+    return read_fn_().Then([](const std::optional<Request>& request) {
+      if (!request) {
+        return Future<std::string>::MakeFinished(Status::IOError("Stream is closed."));
+      }
+      return Future<std::string>::MakeFinished(std::string(request->payload()));
+    });
+  }
+
+ private:
+  ReadFn read_fn_;
+};
+
+template <typename Response>
+class AsyncGrpcServerAuthSender final : public AsyncServerAuthSender {
+ public:
+  using WriteFn = std::function<Future<bool>(Response)>;
+  explicit AsyncGrpcServerAuthSender(WriteFn write_fn) : write_fn_(std::move(write_fn)) {}
+
+  Future<> Write(const std::string& token) override {
+    Response response;
+    response.set_payload(token);
+    return write_fn_(std::move(response)).Then([](bool ok) -> Status {
+      return ok ? Status::OK() : Status::IOError("Stream was closed.");
+    });
+  }
+
+ private:
+  WriteFn write_fn_;
+};
+
 class Reactor final
     : public BidiReactorBase<pb::HandshakeRequest, pb::HandshakeResponse> {
  public:
   Reactor(::grpc::CallbackServerContext* context, AsyncGrpcServerTransport* impl,
           const CallbackServiceHelper& helper)
-      : BidiReactorBase(context, impl->executor()),
-        impl_(impl),
-        helper_(helper),
-        flight_context_(context) {}
+      : BidiReactorBase(context), impl_(impl), helper_(helper), flight_context_(context) {}
 
   void Start() {
     auto grpc_status = helper_.MakeCallContext(FlightMethod::Handshake, this->context_,
@@ -498,37 +448,26 @@ class Reactor final
       return;
     }
     helper_.AddMiddlewareHeaders(this->context_, &flight_context_);
-    const auto status = this->StartWorker([this] { RunHandshake(); });
-    if (!status.ok()) {
-      this->Finish(flight_context_.FinishRequest(status));
-    }
+    RunHandshake();
   }
 
  private:
+  /// Drive the handshake inline; the async sender/reader never block, so the
+  /// callback thread stays free.
   void RunHandshake() {
-    auto outgoing = std::make_unique<
-        ::arrow::flight::transport::grpc::GrpcServerAuthSender<pb::HandshakeResponse>>(
+    auto outgoing = std::make_unique<AsyncGrpcServerAuthSender<pb::HandshakeResponse>>(
         [this](pb::HandshakeResponse response) {
-          return this->WriteOne(std::move(response));
+          return this->WriteOneAsync(std::move(response));
         });
-
-    auto incoming = std::make_unique<
-        ::arrow::flight::transport::grpc::GrpcServerAuthReader<pb::HandshakeRequest>>(
-        [this](pb::HandshakeRequest* request) { return this->ReadOne(request); });
-
-    if (helper_.auth_handler()) {
-      const auto status = helper_.auth_handler()->Authenticate(flight_context_, outgoing.get(),
-                                                               incoming.get());
-      this->FinishFromWorker(flight_context_.FinishRequest(status));
-    } else {
-      this->Hold();
-      impl_->base()
-          ->Handshake(flight_context_, std::move(outgoing), std::move(incoming))
-          .AddCallback([this](const ::arrow::Result<::arrow::internal::Empty>& result) {
-            this->FinishFromWorker(flight_context_.FinishRequest(result.status()));
-            this->ReleaseHold();
-          });
-    }
+    auto incoming = std::make_unique<AsyncGrpcServerAuthReader<pb::HandshakeRequest>>(
+        [this] { return this->ReadOneAsync(); });
+    this->Hold();
+    impl_->base()
+        ->Handshake(flight_context_, std::move(outgoing), std::move(incoming))
+        .AddCallback([this](const ::arrow::Result<::arrow::internal::Empty>& result) {
+          this->Finish(flight_context_.FinishRequest(result.status()));
+          this->ReleaseHold();
+        });
   }
 
   /// Async transport providing the server implementation.

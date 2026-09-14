@@ -84,15 +84,37 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataStream {
   virtual Future<> Close() = 0;
 };
 
-/// \brief Adapt a legacy synchronous FlightDataStream to AsyncFlightDataStream.
+/// \brief An asynchronous source of FlightInfo for ListFlights.
 ///
-/// "Legacy" refers only to the synchronous FlightDataStream interface. It is
-/// supported as a compatibility bridge, not deprecated. This adapter completes
-/// each Future by calling the synchronous stream method, so it does not make a
-/// blocking stream non-blocking. New async servers should implement
-/// AsyncFlightDataStream directly.
-ARROW_FLIGHT_EXPORT std::unique_ptr<AsyncFlightDataStream>
-MakeAsyncFlightDataStreamFromSync(std::unique_ptr<FlightDataStream> stream);
+/// Next() must return immediately. Return an unfinished Future if the next item
+/// is not ready, and a null pointer when there are no more items. If the RPC
+/// ends early, for example because the client cancelled it, the transport calls
+/// Close() once. Close() must be idempotent and complete any pending Next()
+/// before the transport releases the source.
+class ARROW_FLIGHT_EXPORT AsyncFlightListing {
+ public:
+  virtual ~AsyncFlightListing() = default;
+  /// Return the next FlightInfo, or null when there are no more items.
+  virtual Future<std::unique_ptr<FlightInfo>> Next() = 0;
+  /// Release resources after cancellation. This must be idempotent.
+  virtual Future<> Close() = 0;
+};
+
+/// \brief An asynchronous pull source of action results for DoAction.
+///
+/// Next() must return immediately. Return an unfinished Future if the next item
+/// is not ready, and a null pointer when there are no more items. If the RPC
+/// ends early, for example because the client cancelled it, the transport calls
+/// Close() once. Close() must be idempotent and complete any pending Next()
+/// before the transport releases the source.
+class ARROW_FLIGHT_EXPORT AsyncResultStream {
+ public:
+  virtual ~AsyncResultStream() = default;
+  /// Return the next Result, or null when exhausted.
+  virtual Future<std::unique_ptr<Result>> Next() = 0;
+  /// Release resources after cancellation; idempotent.
+  virtual Future<> Close() = 0;
+};
 
 class ARROW_FLIGHT_EXPORT AsyncFlightMetadataWriter {
  public:
@@ -147,6 +169,24 @@ class ARROW_FLIGHT_EXPORT AsyncFlightMessageWriter {
   virtual arrow::ipc::WriteStats stats() const = 0;
 };
 
+/// \brief An async writer for handshake messages, provided to Handshake().
+class ARROW_FLIGHT_EXPORT AsyncServerAuthSender {
+ public:
+  virtual ~AsyncServerAuthSender() = default;
+  /// Write one message.
+  //  Complete the returned Future once it was sent.
+  virtual Future<> Write(const std::string& message) = 0;
+};
+
+/// \brief An async reader for handshake messages, provided to Handshake().
+class ARROW_FLIGHT_EXPORT AsyncServerAuthReader {
+ public:
+  virtual ~AsyncServerAuthReader() = default;
+  /// Read one message
+  //  Fails with IOError if the stream is closed.
+  virtual Future<std::string> Read() = 0;
+};
+
 /// \brief Experimental skeleton asynchronous RPC server implementation.
 ///
 /// AsyncFlightServerBase is a parallel server model to FlightServerBase. It
@@ -197,17 +237,27 @@ class ARROW_FLIGHT_EXPORT AsyncFlightServerBase {
   /// \brief Wait until the server has shut down without initiating shutdown.
   Status Wait();
 
-  /// \brief Authenticate the client handshake stream.
+  /// \brief Handle the handshake protocol with the client.
   ///
-  /// The default implementation returns NotImplemented.
+  /// Resolve the returned Future after all sender/reader operations started
+  /// by this hook have completed. Servers that authenticate clients must
+  /// override this together with ValidateToken(); the async server does not
+  /// use FlightServerOptions::auth_handler.
   virtual Future<> Handshake(const ServerCallContext& context,
-                             std::unique_ptr<ServerAuthSender> outgoing,
-                             std::unique_ptr<ServerAuthReader> incoming);
+                             std::unique_ptr<AsyncServerAuthSender> outgoing,
+                             std::unique_ptr<AsyncServerAuthReader> incoming);
 
-  /// \brief Enumerate flights matching criteria.
+  /// \brief Validate the token sent in the `authorization` header of RPCs
+  /// issued after a successful Handshake().
   ///
-  /// Return a listing whose Next() is consumed by the transport until exhausted.
-  virtual Future<std::unique_ptr<FlightListing>> ListFlights(
+  /// Runs inline on the RPC dispatch path, so it must be cheap and
+  /// non-blocking (same contract as ServerMiddlewareFactory::StartCall).
+  /// On success set `peer_identity` to the authenticated identity.
+  virtual Status ValidateToken(const ServerCallContext& context,
+                               const std::string& token, std::string* peer_identity);
+
+  /// \brief List the flights available on the server, as an async source.
+  virtual Future<std::unique_ptr<AsyncFlightListing>> ListFlights(
       const ServerCallContext& context, const Criteria* criteria);
 
   /// \brief Resolve FlightInfo for a descriptor.
@@ -225,9 +275,7 @@ class ARROW_FLIGHT_EXPORT AsyncFlightServerBase {
   /// \brief Create an asynchronous server-to-client data stream for a ticket.
   ///
   /// This is the asynchronous counterpart to FlightServerBase::DoGet(). Return
-  /// a Future containing the stream once it is ready. Use
-  /// MakeAsyncFlightDataStreamFromSync() to adapt an existing FlightDataStream
-  /// during migration.
+  /// a Future containing the stream once it is ready.
   virtual Future<std::unique_ptr<AsyncFlightDataStream>> DoGet(
       const ServerCallContext& context, const Ticket& request);
 
@@ -247,9 +295,9 @@ class ARROW_FLIGHT_EXPORT AsyncFlightServerBase {
                               std::unique_ptr<AsyncFlightMessageReader> reader,
                               std::unique_ptr<AsyncFlightMessageWriter> writer);
 
-  /// \brief Execute an action and return its result stream.
-  virtual Future<std::unique_ptr<ResultStream>> DoAction(const ServerCallContext& context,
-                                                         const Action& action);
+  /// \brief Execute an action and return its async result source.
+  virtual Future<std::unique_ptr<AsyncResultStream>> DoAction(
+      const ServerCallContext& context, const Action& action);
 
   /// \brief Return the action types supported by this server.
   virtual Future<std::vector<ActionType>> ListActions(const ServerCallContext& context);
