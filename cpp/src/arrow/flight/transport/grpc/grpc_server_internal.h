@@ -159,9 +159,15 @@ class GrpcServerCallContext : public ServerCallContext {
 template <typename GrpcContext>
 class GrpcServerCallContextHelper {
  public:
+  using ValidateTokenFn =
+      std::function<Status(const ServerCallContext&, const std::string&, std::string*)>;
+
   GrpcServerCallContextHelper(std::shared_ptr<ServerAuthHandler> auth_handler,
-                              MiddlewareFactoryList middleware)
-      : auth_handler_(std::move(auth_handler)), middleware_(std::move(middleware)) {}
+                              MiddlewareFactoryList middleware,
+                              ValidateTokenFn validate_token = {})
+      : auth_handler_(std::move(auth_handler)),
+        middleware_(std::move(middleware)),
+        validate_token_(std::move(validate_token)) {}
 
   // Authenticate the client (if applicable) and construct the call context
   ::grpc::Status MakeCallContext(FlightMethod method, GrpcContext* context,
@@ -201,30 +207,25 @@ class GrpcServerCallContextHelper {
   // Authenticate the client (if applicable) and construct the call context
   ::grpc::Status CheckAuth(FlightMethod method, GrpcContext* context,
                            GrpcServerCallContext<GrpcContext>* flight_context) const {
-    if (!auth_handler_) {
-      const auto auth_context = context->auth_context();
-      if (auth_context && auth_context->IsPeerAuthenticated()) {
-        auto peer_identity = auth_context->GetPeerIdentity();
-        flight_context->peer_identity_ =
-            peer_identity.empty()
-                ? ""
-                : std::string(peer_identity.front().begin(), peer_identity.front().end());
-      } else {
-        flight_context->peer_identity_ = "";
-      }
-    } else {
-      const auto client_metadata = context->client_metadata();
-      const auto [auth_header, auth_header_end] =
-          client_metadata.equal_range(kGrpcAuthHeader);
-      std::string token;
-      if (auth_header != auth_header_end) {
-        token = std::string(auth_header->second.data(), auth_header->second.length());
-      }
+    if (auth_handler_) {
+      const std::string token = GetAuthToken(context);
       auto auth_status =
           auth_handler_->IsValid(*flight_context, token, &flight_context->peer_identity_);
       if (!auth_status.ok()) {
         return flight_context->FinishRequest(auth_status);
       }
+    } else if (validate_token_) {
+      SetTransportPeerIdentity(context, flight_context);
+      const std::string token = GetAuthToken(context);
+      if (!token.empty()) {
+        auto auth_status =
+            validate_token_(*flight_context, token, &flight_context->peer_identity_);
+        if (!auth_status.ok()) {
+          return flight_context->FinishRequest(auth_status);
+        }
+      }
+    } else {
+      SetTransportPeerIdentity(context, flight_context);
     }
     return MakeCallContext(method, context, flight_context);
   }
@@ -232,8 +233,35 @@ class GrpcServerCallContextHelper {
   const std::shared_ptr<ServerAuthHandler>& auth_handler() const { return auth_handler_; }
 
  private:
+
+  void SetTransportPeerIdentity(
+      GrpcContext* context,
+      GrpcServerCallContext<GrpcContext>* flight_context) const {
+    const auto auth_context = context->auth_context();
+    if (auth_context && auth_context->IsPeerAuthenticated()) {
+      auto peer_identity = auth_context->GetPeerIdentity();
+      flight_context->peer_identity_ =
+          peer_identity.empty()
+              ? ""
+              : std::string(peer_identity.front().begin(), peer_identity.front().end());
+    } else {
+      flight_context->peer_identity_ = "";
+    }
+  }
+
+  static std::string GetAuthToken(GrpcContext* context) {
+    const auto client_metadata = context->client_metadata();
+    const auto [auth_header, auth_header_end] =
+        client_metadata.equal_range(kGrpcAuthHeader);
+    if (auth_header == auth_header_end) {
+      return {};
+    }
+    return std::string(auth_header->second.data(), auth_header->second.length());
+  }
+
   std::shared_ptr<ServerAuthHandler> auth_handler_;
   MiddlewareFactoryList middleware_;
+  ValidateTokenFn validate_token_;
 };
 
 ARROW_FLIGHT_EXPORT

@@ -104,8 +104,7 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
           }
         }
         auto future = impl_->base()->ListFlights(flight_context, &criteria);
-        return MakeListFlightsReactor(impl_->executor(), std::move(flight_context),
-                                      std::move(future));
+        return MakeListFlightsReactor(std::move(flight_context), std::move(future));
       });
 }
 
@@ -149,8 +148,7 @@ CallbackFlightService::Handshake(::grpc::CallbackServerContext* context) {
               flight_context.FinishRequest(arrow_status));
         }
         auto future = impl_->base()->DoGet(flight_context, ticket);
-        return MakeDoGetReactor(impl_->executor(), std::move(flight_context),
-                                std::move(future));
+        return MakeDoGetReactor(std::move(flight_context), std::move(future));
       });
 }
 
@@ -173,8 +171,7 @@ CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
       helper_, FlightMethod::ListActions, context,
       [this](GrpcServerCallContext flight_context) {
         auto future = impl_->base()->ListActions(flight_context);
-        return MakeListActionsReactor(impl_->executor(), std::move(flight_context),
-                                      std::move(future));
+        return MakeListActionsReactor(std::move(flight_context), std::move(future));
       });
 }
 
@@ -190,8 +187,7 @@ CallbackFlightService::DoExchange(::grpc::CallbackServerContext* context) {
           return FinishWriteNow<pb::Result>(flight_context.FinishRequest(arrow_status));
         }
         auto future = impl_->base()->DoAction(flight_context, action);
-        return MakeDoActionReactor(impl_->executor(), std::move(flight_context),
-                                   std::move(future));
+        return MakeDoActionReactor(std::move(flight_context), std::move(future));
       });
 }
 

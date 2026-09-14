@@ -56,65 +56,6 @@ static constexpr char kAsyncAuthPassword[] = "p4ssw0rd";
 static constexpr char kAsyncInvalidAuthUsername[] = "wrong-user";
 static constexpr char kAsyncInvalidAuthPassword[] = "wrong-password";
 
-template <typename T, typename Fn>
-Future<T> WrapSyncOutcome(Fn&& fn) {
-  T out{};
-  auto st = fn(&out);
-  if (!st.ok()) {
-    return Future<T>::MakeFinished(std::move(st));
-  }
-  return Future<T>::MakeFinished(std::move(out));
-}
-
-template <typename Fn>
-Future<> WrapSyncStatus(Fn&& fn) {
-  return Future<>::MakeFinished(fn());
-}
-
-Future<std::unique_ptr<AsyncFlightDataStream>> WrapLegacyStream(
-    Future<std::unique_ptr<FlightDataStream>> future) {
-  auto out = Future<std::unique_ptr<AsyncFlightDataStream>>::Make();
-  future.AddCallback(
-      [out](const ::arrow::Result<std::unique_ptr<FlightDataStream>>& result) mutable {
-        if (!result.ok()) {
-          out.MarkFinished(result.status());
-          return;
-        }
-        auto stream =
-            std::move(
-                const_cast<::arrow::Result<std::unique_ptr<FlightDataStream>>&>(result))
-                .MoveValueUnsafe();
-        out.MarkFinished(MakeAsyncFlightDataStreamFromSync(std::move(stream)));
-      });
-  return out;
-}
-
-struct BlockingLegacyStreamState {
-  /// Coordinates a deliberately blocking synchronous schema operation.
-  Future<> started = Future<>::Make();
-  Future<> release = Future<>::Make();
-};
-
-class BlockingLegacyStream final : public FlightDataStream {
- public:
-  explicit BlockingLegacyStream(std::shared_ptr<BlockingLegacyStreamState> state)
-      : state_(std::move(state)) {}
-
-  std::shared_ptr<Schema> schema() override { return arrow::schema({}); }
-
-  ::arrow::Result<FlightPayload> GetSchemaPayload() override {
-    // This models an existing synchronous stream whose schema production blocks.
-    state_->started.MarkFinished();
-    state_->release.Wait();
-    return FlightPayload{};
-  }
-
-  ::arrow::Result<FlightPayload> Next() override { return FlightPayload{}; }
-
- private:
-  std::shared_ptr<BlockingLegacyStreamState> state_;
-};
-
 Future<> DrainAsyncReader(std::shared_ptr<AsyncFlightMessageReader> reader) {
   return ::arrow::Loop([reader = std::move(reader)]() {
            return reader->Next().Then([](FlightStreamChunk chunk) -> ControlFlow<> {
@@ -126,6 +67,128 @@ Future<> DrainAsyncReader(std::shared_ptr<AsyncFlightMessageReader> reader) {
          })
       .Then([](const ::arrow::internal::Empty&) { return Status::OK(); });
 }
+
+/// Serve a vector of items through the async pull-source APIs.
+class SimpleAsyncFlightListing final : public AsyncFlightListing {
+ public:
+  explicit SimpleAsyncFlightListing(std::vector<FlightInfo> infos)
+      : infos_(std::move(infos)) {}
+
+  Future<std::unique_ptr<FlightInfo>> Next() override {
+    if (index_ >= infos_.size()) {
+      return Future<std::unique_ptr<FlightInfo>>::MakeFinished(
+          std::unique_ptr<FlightInfo>{});
+    }
+    return Future<std::unique_ptr<FlightInfo>>::MakeFinished(
+        std::make_unique<FlightInfo>(infos_[index_++]));
+  }
+
+  Future<> Close() override {
+    infos_.clear();
+    return Future<>::MakeFinished();
+  }
+
+ private:
+  std::vector<FlightInfo> infos_;
+  size_t index_ = 0;
+};
+
+class SimpleAsyncResultStream final : public AsyncResultStream {
+ public:
+  explicit SimpleAsyncResultStream(std::vector<Result> results)
+      : results_(std::move(results)) {}
+
+  Future<std::unique_ptr<Result>> Next() override {
+    if (index_ >= results_.size()) {
+      return Future<std::unique_ptr<Result>>::MakeFinished(
+          std::unique_ptr<Result>{});
+    }
+    return Future<std::unique_ptr<Result>>::MakeFinished(
+        std::make_unique<Result>(results_[index_++]));
+  }
+
+  Future<> Close() override {
+    results_.clear();
+    return Future<>::MakeFinished();
+  }
+
+ private:
+  std::vector<Result> results_;
+  size_t index_ = 0;
+};
+
+/// Test helper: drain an in-memory synchronous FlightDataStream up front and
+/// serve its payloads as an AsyncFlightDataStream. All futures resolve inline
+/// and no callback thread is ever blocked.
+class SimpleAsyncFlightDataStream final : public AsyncFlightDataStream {
+ public:
+  explicit SimpleAsyncFlightDataStream(std::unique_ptr<FlightDataStream> stream) {
+    if (!stream) {
+      schema_error_ = Status::Invalid("null stream");
+      return;
+    }
+    auto schema_payload = stream->GetSchemaPayload();
+    if (!schema_payload.ok()) {
+      schema_error_ = schema_payload.status();
+      return;
+    }
+    schema_payload_ = std::move(*schema_payload);
+    while (true) {
+      auto payload = stream->Next();
+      if (!payload.ok()) {
+        error_ = payload.status();
+        break;
+      }
+      if (!payload->ipc_message.metadata) {
+        // End of stream, as produced by the sync RecordBatchStream.
+        break;
+      }
+      payloads_.push_back(std::move(*payload));
+    }
+  }
+
+  Future<FlightPayload> GetSchemaPayload() override {
+    if (!schema_error_.ok()) return Future<FlightPayload>::MakeFinished(schema_error_);
+    return Future<FlightPayload>::MakeFinished(schema_payload_);
+  }
+
+  Future<FlightPayload> Next() override {
+    if (index_ < payloads_.size()) {
+      return Future<FlightPayload>::MakeFinished(payloads_[index_++]);
+    }
+    if (!error_.ok()) return Future<FlightPayload>::MakeFinished(error_);
+    return Future<FlightPayload>::MakeFinished(FlightPayload{});
+  }
+
+  Future<> Close() override { return Future<>::MakeFinished(); }
+
+ private:
+  FlightPayload schema_payload_;
+  std::vector<FlightPayload> payloads_;
+  size_t index_ = 0;
+  // Schema and data errors are tracked separately: the transport driver sends
+  // the schema before pulling data, and the sync stream reports them on
+  // separate calls.
+  Status schema_error_;
+  Status error_;
+};
+
+/// Test-local reader that fails on the first read; mirrors the sync test
+/// server's ErrorRecordBatchReader (which is not exported).
+class ErrorRecordBatchReader : public RecordBatchReader {
+ public:
+  ErrorRecordBatchReader() : schema_(arrow::schema({})) {}
+
+  std::shared_ptr<Schema> schema() const override { return schema_; }
+
+  Status ReadNext(std::shared_ptr<RecordBatch>* out) override {
+    *out = nullptr;
+    return Status::IOError("Expected error");
+  }
+
+ private:
+  std::shared_ptr<Schema> schema_;
+};
 
 Future<> WriteRecordBatchesAsync(std::shared_ptr<AsyncFlightMessageWriter> writer,
                                  RecordBatchVector batches) {
@@ -195,30 +258,102 @@ class GetFlightInfoListener : public AsyncListener<FlightInfo> {
   Future<FlightInfo> future = Future<FlightInfo>::Make();
 };
 
-class AsyncAdapterFlightServer : public AsyncFlightServerBase {
+class AsyncTestServer : public AsyncFlightServerBase {
  public:
-  Future<std::unique_ptr<FlightListing>> ListFlights(const ServerCallContext& context,
-                                                     const Criteria* criteria) override {
-    return WrapSyncOutcome<std::unique_ptr<FlightListing>>(
-        [&](auto* out) { return impl_.ListFlights(context, criteria, out); });
+  Future<std::unique_ptr<AsyncFlightListing>> ListFlights(const ServerCallContext&,
+                                                          const Criteria* criteria) override {
+    std::vector<FlightInfo> flights = ExampleFlightInfo();
+    if (criteria && criteria->expression != "") {
+      // For test purposes, if we get criteria, return no results
+      flights.clear();
+    }
+    return Future<std::unique_ptr<AsyncFlightListing>>::MakeFinished(
+        std::make_unique<SimpleAsyncFlightListing>(std::move(flights)));
   }
 
   Future<std::unique_ptr<FlightInfo>> GetFlightInfo(
-      const ServerCallContext& context, const FlightDescriptor& request) override {
-    return WrapSyncOutcome<std::unique_ptr<FlightInfo>>(
-        [&](auto* out) { return impl_.GetFlightInfo(context, request, out); });
+      const ServerCallContext&, const FlightDescriptor& request) override {
+    if (request.type == FlightDescriptor::DescriptorType::CMD &&
+        request.cmd == "status-outofmemory") {
+      return Future<std::unique_ptr<FlightInfo>>::MakeFinished(
+          Status::OutOfMemory("Sentinel"));
+    }
+    for (const auto& info : ExampleFlightInfo()) {
+      if (info.descriptor().Equals(request)) {
+        return Future<std::unique_ptr<FlightInfo>>::MakeFinished(
+            std::make_unique<FlightInfo>(info));
+      }
+    }
+    return Future<std::unique_ptr<FlightInfo>>::MakeFinished(
+        Status::Invalid("Flight not found: ", request.ToString()));
   }
 
   Future<std::unique_ptr<SchemaResult>> GetSchema(
-      const ServerCallContext& context, const FlightDescriptor& request) override {
-    return WrapSyncOutcome<std::unique_ptr<SchemaResult>>(
-        [&](auto* out) { return impl_.GetSchema(context, request, out); });
+      const ServerCallContext&, const FlightDescriptor& request) override {
+    for (const auto& info : ExampleFlightInfo()) {
+      if (info.descriptor().Equals(request)) {
+        return Future<std::unique_ptr<SchemaResult>>::MakeFinished(
+            std::make_unique<SchemaResult>(info.serialized_schema()));
+      }
+    }
+    return Future<std::unique_ptr<SchemaResult>>::MakeFinished(
+        Status::Invalid("Flight not found: ", request.ToString()));
   }
 
-  Future<std::unique_ptr<AsyncFlightDataStream>> DoGet(const ServerCallContext& context,
+  Future<std::unique_ptr<AsyncFlightDataStream>> DoGet(const ServerCallContext&,
                                                        const Ticket& request) override {
-    return WrapLegacyStream(WrapSyncOutcome<std::unique_ptr<FlightDataStream>>(
-        [&](auto* out) { return impl_.DoGet(context, request, out); }));
+    if (request.ticket == "ARROW-5095-fail") {
+      return Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
+          Status::UnknownError("Server-side error"));
+    }
+    if (request.ticket == "ARROW-5095-success") {
+      // Null stream, mirroring the sync server.
+      return Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
+          std::unique_ptr<AsyncFlightDataStream>{});
+    }
+    std::shared_ptr<RecordBatchReader> reader;
+    if (request.ticket == "ticket-stream-error") {
+      reader = std::make_shared<ErrorRecordBatchReader>();
+    } else if (request.ticket == "ARROW-13253-DoGet-Batch") {
+      auto maybe_batch = VeryLargeBatch();
+      if (!maybe_batch.ok()) {
+        return Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
+            maybe_batch.status());
+      }
+      auto maybe_reader = RecordBatchReader::Make({*maybe_batch});
+      if (!maybe_reader.ok()) {
+        return Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
+            maybe_reader.status());
+      }
+      reader = std::move(*maybe_reader);
+    } else {
+      RecordBatchVector batches;
+      Status st = Status::OK();
+      if (request.ticket == "ticket-ints-1") {
+        st = ExampleIntBatches(&batches);
+      } else if (request.ticket == "ticket-floats-1") {
+        st = ExampleFloatBatches(&batches);
+      } else if (request.ticket == "ticket-dicts-1") {
+        st = ExampleDictBatches(&batches);
+      } else if (request.ticket == "ticket-large-batch-1") {
+        st = ExampleLargeBatches(&batches);
+      } else {
+        return Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
+            Status::NotImplemented("no stream implemented for ticket: ", request.ticket));
+      }
+      if (!st.ok()) {
+        return Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(st);
+      }
+      auto maybe_reader = RecordBatchReader::Make(batches);
+      if (!maybe_reader.ok()) {
+        return Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
+            maybe_reader.status());
+      }
+      reader = std::move(*maybe_reader);
+    }
+    return Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
+        std::make_unique<SimpleAsyncFlightDataStream>(
+            std::make_unique<RecordBatchStream>(std::move(reader))));
   }
 
   Future<> DoPut(const ServerCallContext&,
@@ -263,15 +398,25 @@ class AsyncAdapterFlightServer : public AsyncFlightServerBase {
         Status::NotImplemented("Scenario not implemented: ", cmd));
   }
 
-  Future<std::unique_ptr<ResultStream>> DoAction(const ServerCallContext& context,
-                                                 const Action& action) override {
-    return WrapSyncOutcome<std::unique_ptr<ResultStream>>(
-        [&](auto* out) { return impl_.DoAction(context, action, out); });
+  Future<std::unique_ptr<AsyncResultStream>> DoAction(const ServerCallContext&,
+                                                      const Action& action) override {
+    if (action.type == "action1") {
+      std::vector<Result> results;
+      for (int i = 0; i < 3; ++i) {
+        Result result;
+        result.body = Buffer::FromString(action.body->ToString() + "-part" +
+                                         std::to_string(i));
+        results.push_back(result);
+      }
+      return Future<std::unique_ptr<AsyncResultStream>>::MakeFinished(
+          std::make_unique<SimpleAsyncResultStream>(std::move(results)));
+    }
+    return Future<std::unique_ptr<AsyncResultStream>>::MakeFinished(
+        Status::NotImplemented(action.type));
   }
 
-  Future<std::vector<ActionType>> ListActions(const ServerCallContext& context) override {
-    return WrapSyncOutcome<std::vector<ActionType>>(
-        [&](auto* out) { return impl_.ListActions(context, out); });
+  Future<std::vector<ActionType>> ListActions(const ServerCallContext&) override {
+    return Future<std::vector<ActionType>>::MakeFinished(ExampleActionTypes());
   }
 
  private:
@@ -465,8 +610,6 @@ class AsyncAdapterFlightServer : public AsyncFlightServerBase {
            })
         .Then([](const ::arrow::internal::Empty&) { return Status::OK(); });
   }
-
-  TestFlightServer impl_;
 };
 
 class AsyncDoPutTestServer : public AsyncFlightServerBase {
@@ -539,10 +682,29 @@ class AsyncDoPutTestServer : public AsyncFlightServerBase {
 
 class AsyncAppMetadataTestServer : public AsyncFlightServerBase {
  public:
-  Future<std::unique_ptr<AsyncFlightDataStream>> DoGet(const ServerCallContext& context,
+  Future<std::unique_ptr<AsyncFlightDataStream>> DoGet(const ServerCallContext&,
                                                        const Ticket& request) override {
-    return WrapLegacyStream(WrapSyncOutcome<std::unique_ptr<FlightDataStream>>(
-        [&](auto* out) { return impl_.DoGet(context, request, out); }));
+    RecordBatchVector batches;
+    Status st = Status::OK();
+    if (request.ticket == "dicts") {
+      st = ExampleDictBatches(&batches);
+    } else if (request.ticket == "floats") {
+      st = ExampleFloatBatches(&batches);
+    } else {
+      st = ExampleIntBatches(&batches);
+    }
+    if (!st.ok()) {
+      return Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(st);
+    }
+    auto maybe_reader = RecordBatchReader::Make(batches);
+    if (!maybe_reader.ok()) {
+      return Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
+          maybe_reader.status());
+    }
+    return Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
+        std::make_unique<SimpleAsyncFlightDataStream>(
+            std::make_unique<NumberingStream>(
+                std::make_unique<RecordBatchStream>(std::move(*maybe_reader)))));
   }
 
   Future<> DoPut(const ServerCallContext&,
@@ -577,9 +739,6 @@ class AsyncAppMetadataTestServer : public AsyncFlightServerBase {
            })
         .Then([](const ::arrow::internal::Empty&) { return Status::OK(); });
   }
-
- private:
-  AppMetadataTestServer impl_;
 };
 
 class AsyncIpcOptionsTestServer : public AsyncFlightServerBase {
@@ -590,7 +749,8 @@ class AsyncIpcOptionsTestServer : public AsyncFlightServerBase {
     RETURN_NOT_OK(ExampleNestedBatches(&batches));
     ARROW_ASSIGN_OR_RAISE(auto reader, RecordBatchReader::Make(batches));
     return Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
-        MakeAsyncFlightDataStreamFromSync(std::make_unique<RecordBatchStream>(reader)));
+        std::make_unique<SimpleAsyncFlightDataStream>(
+            std::make_unique<RecordBatchStream>(reader)));
   }
 
   Future<> DoPut(const ServerCallContext&,
@@ -658,18 +818,48 @@ class AsyncIpcOptionsTestServer : public AsyncFlightServerBase {
 
 class AsyncAuthTestServer : public AsyncFlightServerBase {
  public:
-  Future<std::unique_ptr<ResultStream>> DoAction(const ServerCallContext& context,
-                                                 const Action& action) override {
+  AsyncAuthTestServer(std::string username, std::string password)
+      : username_(std::move(username)), password_(std::move(password)) {}
+
+  Future<> Handshake(const ServerCallContext&,
+                     std::unique_ptr<AsyncServerAuthSender> outgoing,
+                     std::unique_ptr<AsyncServerAuthReader> incoming) override {
+    auto sender = std::shared_ptr<AsyncServerAuthSender>(std::move(outgoing));
+    auto reader = std::shared_ptr<AsyncServerAuthReader>(std::move(incoming));
+    return reader->Read().Then([this, sender](const std::string& token) -> Future<> {
+      if (token != password_) {
+        return Future<>::MakeFinished(
+            MakeFlightError(FlightStatusCode::Unauthenticated, "Invalid token"));
+      }
+      return sender->Write(username_);
+    });
+  }
+
+  Status ValidateToken(const ServerCallContext&, const std::string& token,
+                       std::string* peer_identity) override {
+    if (token != password_) {
+      return MakeFlightError(FlightStatusCode::Unauthenticated, "Invalid token");
+    }
+    *peer_identity = username_;
+    return Status::OK();
+  }
+
+  Future<std::unique_ptr<AsyncResultStream>> DoAction(const ServerCallContext& context,
+                                                      const Action& action) override {
     if (action.type == "who-am-i") {
       std::vector<Result> results = {
           Result{Buffer::FromString(context.peer_identity())},
       };
-      return Future<std::unique_ptr<ResultStream>>::MakeFinished(
-          std::make_unique<SimpleResultStream>(std::move(results)));
+      return Future<std::unique_ptr<AsyncResultStream>>::MakeFinished(
+          std::make_unique<SimpleAsyncResultStream>(std::move(results)));
     }
-    return Future<std::unique_ptr<ResultStream>>::MakeFinished(
+    return Future<std::unique_ptr<AsyncResultStream>>::MakeFinished(
         Status::NotImplemented("Expected authenticated action"));
   }
+
+ private:
+  std::string username_;
+  std::string password_;
 };
 
 class AsyncPollFlightInfoTestServer : public AsyncFlightServerBase {
@@ -800,22 +990,22 @@ class AsyncHeaderRecordingClientMiddlewareFactory : public ClientMiddlewareFacto
 
 class AsyncMiddlewareContextTestServer : public AsyncFlightServerBase {
  public:
-  Future<std::unique_ptr<ResultStream>> DoAction(const ServerCallContext& context,
-                                                 const Action& action) override {
+  Future<std::unique_ptr<AsyncResultStream>> DoAction(const ServerCallContext& context,
+                                                      const Action& action) override {
     const auto* middleware = context.GetMiddleware("request_counter");
     if (!middleware || middleware->name() != "AsyncCountingServerMiddleware") {
-      return Future<std::unique_ptr<ResultStream>>::MakeFinished(
+      return Future<std::unique_ptr<AsyncResultStream>>::MakeFinished(
           Status::Invalid("Could not find middleware"));
     }
     if (action.type == "middleware-error") {
-      return Future<std::unique_ptr<ResultStream>>::MakeFinished(
+      return Future<std::unique_ptr<AsyncResultStream>>::MakeFinished(
           Status::Invalid("Expected middleware error"));
     }
     std::vector<Result> results = {
         Result{Buffer::FromString("middleware-ok")},
     };
-    return Future<std::unique_ptr<ResultStream>>::MakeFinished(
-        std::make_unique<SimpleResultStream>(std::move(results)));
+    return Future<std::unique_ptr<AsyncResultStream>>::MakeFinished(
+        std::make_unique<SimpleAsyncResultStream>(std::move(results)));
   }
 };
 
@@ -846,20 +1036,20 @@ class AsyncThreadScalingTestServer : public AsyncFlightServerBase {
 
 class AsyncTlsTestServer : public AsyncFlightServerBase {
  public:
-  Future<std::unique_ptr<ResultStream>> DoAction(const ServerCallContext&,
-                                                 const Action&) override {
+  Future<std::unique_ptr<AsyncResultStream>> DoAction(const ServerCallContext&,
+                                                      const Action&) override {
     std::vector<Result> results = {
         Result{Buffer::FromString("Hello, async TLS!")},
     };
-    return Future<std::unique_ptr<ResultStream>>::MakeFinished(
-        std::make_unique<SimpleResultStream>(std::move(results)));
+    return Future<std::unique_ptr<AsyncResultStream>>::MakeFinished(
+        std::make_unique<SimpleAsyncResultStream>(std::move(results)));
   }
 };
 
 class AsyncConnectivityTest : public ::testing::Test {
  protected:
   void TestGetPort() {
-    auto server = std::make_unique<AsyncAdapterFlightServer>();
+    auto server = std::make_unique<AsyncTestServer>();
     ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
     FlightServerOptions options(location);
     ASSERT_OK(server->Init(options));
@@ -869,7 +1059,7 @@ class AsyncConnectivityTest : public ::testing::Test {
   }
 
   void TestBuilderHook() {
-    auto server = std::make_unique<AsyncAdapterFlightServer>();
+    auto server = std::make_unique<AsyncTestServer>();
     ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
     FlightServerOptions options(location);
     bool builder_hook_run = false;
@@ -888,7 +1078,7 @@ class AsyncConnectivityTest : public ::testing::Test {
     constexpr int kIterations = 10;
     ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
     for (int i = 0; i < kIterations; ++i) {
-      auto server = std::make_unique<AsyncAdapterFlightServer>();
+      auto server = std::make_unique<AsyncTestServer>();
       FlightServerOptions options(location);
       ASSERT_OK(server->Init(options));
       ASSERT_GT(server->port(), 0);
@@ -900,7 +1090,7 @@ class AsyncConnectivityTest : public ::testing::Test {
   }
 
   void TestShutdownWithDeadline() {
-    auto server = std::make_unique<AsyncAdapterFlightServer>();
+    auto server = std::make_unique<AsyncTestServer>();
     ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
     FlightServerOptions options(location);
     ASSERT_OK(server->Init(options));
@@ -911,7 +1101,7 @@ class AsyncConnectivityTest : public ::testing::Test {
   }
 
   void TestShutdownWithActiveExchange() {
-    auto server = std::make_unique<AsyncAdapterFlightServer>();
+    auto server = std::make_unique<AsyncTestServer>();
     ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
     FlightServerOptions options(location);
     ASSERT_OK(server->Init(options));
@@ -937,7 +1127,7 @@ class AsyncConnectivityTest : public ::testing::Test {
   }
 
   void TestBrokenConnection() {
-    auto server = std::make_unique<AsyncAdapterFlightServer>();
+    auto server = std::make_unique<AsyncTestServer>();
     ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
     FlightServerOptions options(location);
     ASSERT_OK(server->Init(options));
@@ -967,7 +1157,7 @@ class AsyncConnectivityTest : public ::testing::Test {
 class AsyncDataTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    server_ = std::make_unique<AsyncAdapterFlightServer>();
+    server_ = std::make_unique<AsyncTestServer>();
     ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
     FlightServerOptions options(location);
     ASSERT_OK(server_->Init(options));
@@ -1733,7 +1923,7 @@ class AsyncRpcCoverageTest : public ::testing::Test {
  protected:
   void SetUp() override {
     ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
-    server_ = std::make_unique<AsyncAdapterFlightServer>();
+    server_ = std::make_unique<AsyncTestServer>();
     FlightServerOptions options(location);
     ASSERT_OK(server_->Init(options));
     ASSERT_OK_AND_ASSIGN(auto client_location,
@@ -1756,13 +1946,9 @@ class AsyncAuthTest : public ::testing::Test {
   void SetUp() override {
     ASSERT_OK_AND_ASSIGN(auto location, Location::ForGrpcTcp("127.0.0.1", 0));
     ASSERT_OK(MakeAsyncServer<AsyncAuthTestServer>(
-        location, &server_, &client_,
-        [](FlightServerOptions* options) {
-          options->auth_handler = std::make_unique<TestServerAuthHandler>(
-              kAsyncAuthUsername, kAsyncAuthPassword);
-          return Status::OK();
-        },
-        [](FlightClientOptions*) { return Status::OK(); }));
+        location, &server_, &client_, [](FlightServerOptions*) { return Status::OK(); },
+        [](FlightClientOptions*) { return Status::OK(); }, kAsyncAuthUsername,
+        kAsyncAuthPassword));
   }
 
   void TearDown() override {
@@ -1981,24 +2167,6 @@ class AsyncNativeStreamApiTest : public ::testing::Test {
   std::unique_ptr<AsyncFlightServerBase> server_;
   AsyncNativeStreamContractServer* server_impl_;
 };
-
-TEST(AsyncFlightDataStreamTest, LegacyAdapterDoesNotBlockCaller) {
-  // The adapter must return immediately and complete only after the synchronous
-  // operation has been released on its background executor.
-  auto state = std::make_shared<BlockingLegacyStreamState>();
-  auto stream =
-      MakeAsyncFlightDataStreamFromSync(std::make_unique<BlockingLegacyStream>(state));
-  std::jthread releaser([state] {
-    state->started.Wait();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    state->release.MarkFinished();
-  });
-
-  auto future = stream->GetSchemaPayload();
-  ASSERT_TRUE(state->started.Wait(1.0));
-  EXPECT_FALSE(future.is_finished());
-  ASSERT_FINISHES_OK(future);
-}
 
 TEST_F(AsyncNativeStreamApiTest, RejectsConcurrentReads) {
   // Two concurrent schema reads are invalid because they share decoder state.
@@ -2228,10 +2396,10 @@ TEST_F(AsyncRpcCoverageTest, DoAction) {
 /// Returns a null result stream, mirroring the sync-server cancellation case.
 class AsyncNullResultStreamTestServer : public AsyncFlightServerBase {
  public:
-  Future<std::unique_ptr<ResultStream>> DoAction(const ServerCallContext&,
-                                                 const Action&) override {
-    return Future<std::unique_ptr<ResultStream>>::MakeFinished(
-        std::unique_ptr<ResultStream>{});
+  Future<std::unique_ptr<AsyncResultStream>> DoAction(const ServerCallContext&,
+                                                      const Action&) override {
+    return Future<std::unique_ptr<AsyncResultStream>>::MakeFinished(
+        std::unique_ptr<AsyncResultStream>{});
   }
 };
 

@@ -33,7 +33,6 @@
 #include "arrow/flight/transport_server_async.h"
 #include "arrow/result.h"
 #include "arrow/status.h"
-#include "arrow/util/thread_pool.h"
 #include "arrow/util/uri.h"
 
 namespace arrow::flight::transport::grpc::async_internal {
@@ -87,8 +86,6 @@ class SelfOwnedReactor {
   std::atomic<bool> finished_{false};
   std::atomic<int> refs_{1};
 };
-
-arrow::Result<std::shared_ptr<arrow::internal::ThreadPool>> MakeAsyncGrpcExecutor();
 
 ::grpc::Status PrepareAuthenticatedCall(const CallbackServiceHelper& helper,
                                         FlightMethod method,
@@ -155,11 +152,9 @@ class AsyncGrpcServerTransport : public arrow::flight::internal::AsyncServerTran
   Location location() const override;
 
   const CallbackServiceHelper& helper() const { return *helper_; }
-  std::shared_ptr<arrow::internal::ThreadPool> executor() const { return executor_pool_; }
   std::shared_ptr<MemoryManager> memory_manager() const { return memory_manager_; }
 
  private:
-  std::shared_ptr<arrow::internal::ThreadPool> executor_pool_;
   std::unique_ptr<CallbackServiceHelper> helper_;
   std::unique_ptr<CallbackFlightService> grpc_service_;
   std::unique_ptr<::grpc::Server> grpc_server_;
@@ -223,21 +218,17 @@ MakeHandshakeReactor(::grpc::CallbackServerContext* context,
     const CallbackServiceHelper& helper);
 
 ::grpc::ServerWriteReactor<pb::FlightInfo>* MakeListFlightsReactor(
-    std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context,
-    Future<std::unique_ptr<FlightListing>> future);
+    Future<std::unique_ptr<AsyncFlightListing>> future);
 
 ::grpc::ServerWriteReactor<pb::ActionType>* MakeListActionsReactor(
-    std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context, Future<std::vector<ActionType>> future);
 
 ::grpc::ServerWriteReactor<pb::Result>* MakeDoActionReactor(
-    std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context,
-    Future<std::unique_ptr<ResultStream>> future);
+    Future<std::unique_ptr<AsyncResultStream>> future);
 
 ::grpc::ServerWriteReactor<pb::FlightData>* MakeDoGetReactor(
-    std::shared_ptr<arrow::internal::ThreadPool> executor,
     GrpcServerCallContext flight_context,
     Future<std::unique_ptr<AsyncFlightDataStream>> future);
 

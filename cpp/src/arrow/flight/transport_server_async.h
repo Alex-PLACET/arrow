@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 
 #include "arrow/flight/server_async.h"
@@ -25,29 +27,25 @@
 #include "arrow/flight/transport_server_internal.h"
 #include "arrow/flight/type_fwd.h"
 #include "arrow/flight/visibility.h"
+#include "arrow/result.h"
+#include "arrow/status.h"
+#include "arrow/util/future.h"
 
-namespace arrow::flight {
+namespace arrow::flight::internal {
 
-namespace internal {
 class AsyncServerTransport;
 
 arrow::Result<std::unique_ptr<AsyncServerTransport>> MakeAsyncServerTransport(
     const std::string& scheme, AsyncFlightServerBase* base,
     std::shared_ptr<MemoryManager> memory_manager);
-}  // namespace internal
-
-}  // namespace arrow::flight
-
-namespace arrow::flight::internal {
 
 /// \brief An implementation of an async Flight server for a particular transport.
 ///
-/// This class (the transport implementation) implements the underlying
-/// async server and handles connections/incoming RPC calls. It should forward
-/// RPC calls to the RPC handlers defined on this class, which work in terms of
-/// the generic ServerDataStream interfaces. The RPC handlers then forward calls
-/// to the underlying AsyncFlightServerBase instance that contains the actual
-/// application RPC method handlers.
+/// Transports implement the server lifecycle (Init/Shutdown/Wait/location)
+/// and convert transport-specific RPC events (e.g. gRPC callback reactors)
+/// into calls on the underlying AsyncFlightServerBase, reusing the generic
+/// orchestration provided here (AsyncStreamDriver, and the async reader and
+/// writer factories of the grpc layer).
 ///
 /// Used by AsyncFlightServerBase to manage the server lifecycle.
 class ARROW_FLIGHT_EXPORT AsyncServerTransport : public ServerTransportBase {
@@ -98,6 +96,63 @@ class ARROW_FLIGHT_EXPORT AsyncServerTransport : public ServerTransportBase {
 
  protected:
   AsyncFlightServerBase* base_;
+};
+
+/// Drives an AsyncFlightDataStream to completion through a write callback.
+///
+/// This is the async version of ServerTransportBase::WriteDataStream. It sends
+/// the schema first, then sends each payload in order. It waits for each write
+/// to finish before pulling the next payload. It closes the stream at the end.
+/// A null stream fails with "No data in this flight". Each payload is validated
+/// before it is sent.
+///
+/// A payload or validation error closes the stream and is returned by Run().
+/// A failed write also closes the stream. In that case, Run() returns the close
+/// status. This treats a lost connection as a clean end, like the sync path.
+/// A payload error takes precedence over the close status.
+///
+/// `is_cancelled` is checked between steps. RequestClose() stops the stream
+/// immediately and is safe to call from any thread. Once closing starts, the
+/// write callback is not called again.
+///
+/// Keep the returned shared_ptr while the stream is running and while
+/// RequestClose() may be called. Call Run() exactly once. Its future is the
+/// only completion signal. WriteFn returns when the transport finishes a
+/// payload, so only one write is pending at a time.
+class AsyncStreamDriver : public std::enable_shared_from_this<AsyncStreamDriver> {
+ public:
+  /// Sink for one serialized payload, the boolean reports write success.
+  using WriteFn = std::function<Future<bool>(FlightPayload)>;
+  /// Polled between steps, true stops the stream.
+  using CancelFn = std::function<bool()>;
+
+  AsyncStreamDriver(std::unique_ptr<AsyncFlightDataStream> stream, CancelFn is_cancelled,
+                    WriteFn write_fn);
+
+  /// Start emitting schema, payloads, and the end-of-stream marker.
+  /// Completes once the stream is closed, with the close status or the
+  /// terminal failure.
+  Future<> Run();
+
+  /// Close the stream (e.g. on RPC cancellation), completing Run() with
+  /// `failure` once the close finishes
+  //  OK reports the close status.
+  void RequestClose(Status failure = Status::OK());
+
+ private:
+  void PullNext(bool first);
+  void StartWrite(FlightPayload payload);
+  void BeginClose(Status failure = Status::OK());
+  void CloseStream();
+
+  std::unique_ptr<AsyncFlightDataStream> stream_;
+  CancelFn is_cancelled_;
+  WriteFn write_fn_;
+  Future<> out_;
+  /// Protects the single terminal close path.
+  std::atomic<bool> close_started_{false};
+  /// Terminal failure reported once the stream is closed (OK = close status).
+  Status close_failure_;
 };
 
 arrow::Result<std::unique_ptr<AsyncServerTransport>> MakeGrpcCallbackServerTransport(
