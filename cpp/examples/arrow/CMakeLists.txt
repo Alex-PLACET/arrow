@@ -141,6 +141,13 @@ if(ARROW_FLIGHT)
                     ${ARROW_PROTOBUF_LIBPROTOBUF}
                     ${GFLAGS_LIBRARIES})
 
+  add_arrow_example(flight_threads_async_example
+                    EXTRA_LINK_LIBS
+                    ${FLIGHT_EXAMPLES_LINK_LIBS}
+                    gRPC::grpc++
+                    ${ARROW_PROTOBUF_LIBPROTOBUF}
+                    ${GFLAGS_LIBRARIES})
+
   if(ARROW_FLIGHT_SQL)
     if(ARROW_BUILD_SHARED AND ARROW_GRPC_USE_SHARED)
       set(FLIGHT_SQL_EXAMPLES_LINK_LIBS arrow_flight_sql_shared)
