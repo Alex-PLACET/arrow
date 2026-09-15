@@ -567,6 +567,7 @@ struct ARROW_FLIGHT_EXPORT Location : public internal::BaseType<Location> {
  private:
   friend class FlightClient;
   friend class FlightServerBase;
+  friend class AsyncFlightServerBase;
   std::shared_ptr<arrow::util::Uri> uri_;
 };
 
@@ -1159,6 +1160,8 @@ class ARROW_FLIGHT_EXPORT ResultStream {
 struct ARROW_FLIGHT_EXPORT FlightStreamChunk {
  public:
   FlightStreamChunk() noexcept;
+  FlightStreamChunk(std::shared_ptr<RecordBatch> data,
+                    std::shared_ptr<Buffer> app_metadata) noexcept;
   ~FlightStreamChunk();
 
   std::shared_ptr<RecordBatch> data;

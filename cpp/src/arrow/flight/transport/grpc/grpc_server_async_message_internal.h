@@ -17,15 +17,19 @@
 
 #pragma once
 
-#include "arrow/flight/client.h"
-#include "arrow/flight/client_auth.h"
-#include "arrow/flight/client_middleware.h"
-#include "arrow/flight/client_tracing_middleware.h"
-#include "arrow/flight/middleware.h"
-#include "arrow/flight/server.h"
-#include "arrow/flight/server_async.h"
-#include "arrow/flight/server_auth.h"
-#include "arrow/flight/server_middleware.h"
-#include "arrow/flight/server_tracing_middleware.h"
-#include "arrow/flight/types.h"
-#include "arrow/flight/types_async.h"
+#include "arrow/flight/transport/grpc/grpc_server_async_internal.h"
+
+namespace arrow::flight::transport::grpc::async_internal {
+
+struct AsyncMessageReaderParts {
+  std::shared_ptr<AsyncFlightMessageReader> reader;
+  std::function<Future<>()> when_idle;
+};
+
+Future<AsyncMessageReaderParts> MakeNativeAsyncMessageReader(
+    AsyncReadFn read_fn, std::shared_ptr<MemoryManager> memory_manager);
+
+std::shared_ptr<AsyncFlightMessageWriter> MakeNativeAsyncMessageWriter(
+    std::function<Future<bool>(FlightPayload)> write_fn);
+
+}  // namespace arrow::flight::transport::grpc::async_internal
