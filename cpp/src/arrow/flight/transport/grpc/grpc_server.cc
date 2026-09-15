@@ -404,8 +404,8 @@ class GrpcServerTransport : public internal::ServerTransport {
   Status Init(const FlightServerOptions& options, const arrow::util::Uri& uri) override {
     grpc_service_.reset(
         new GrpcServiceHandler(options.auth_handler, options.middleware, this));
-    return StartFlightGrpcServer(options, uri, grpc_service_.get(),
-                                 /*callback_api=*/false, &grpc_server_, &location_);
+    return StartFlightGrpcServer(options, uri, grpc_service_.get(), &grpc_server_,
+                                 &location_);
   }
   Status Shutdown() override {
     grpc_server_->Shutdown();

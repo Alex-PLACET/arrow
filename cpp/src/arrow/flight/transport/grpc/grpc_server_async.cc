@@ -54,8 +54,7 @@ Status AsyncGrpcServerTransport::Init(const FlightServerOptions& options,
   grpc_service_ = std::make_unique<CallbackFlightService>(this, *helper_);
 
   return transport::grpc::StartFlightGrpcServer(options, uri, grpc_service_.get(),
-                                                /*callback_api=*/true, &grpc_server_,
-                                                &location_);
+                                                &grpc_server_, &location_);
 }
 
 Status AsyncGrpcServerTransport::Shutdown() {
