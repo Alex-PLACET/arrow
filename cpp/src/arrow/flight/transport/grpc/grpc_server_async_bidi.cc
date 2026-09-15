@@ -18,7 +18,6 @@
 #include "arrow/flight/transport/grpc/grpc_server_async_internal.h"
 
 #include <atomic>
-#include <deque>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -46,7 +45,9 @@ class BidiReactorBase
  private:
   struct ReadState {
     ReadValue buffer;
-    std::deque<ReadValue> messages;
+    /// At most one read completed before a consumer asked for it (the read
+    /// loop stops issuing reads while this is set).
+    std::optional<ReadValue> buffered;
     Future<AsyncReadValue> pending;
     bool pending_active = false;
     bool in_flight = false;
@@ -69,21 +70,22 @@ class BidiReactorBase
       read_state_.in_flight = false;
       if (ok) {
         completed_read.emplace(std::move(read_state_.buffer));
-        if (!read_state_.pending_active) {
-          read_state_.messages.push_back(std::move(*completed_read));
-        }
       } else {
         read_state_.done = true;
       }
+
       if (read_state_.pending_active) {
         pending_future = read_state_.pending;
         read_state_.pending_active = false;
         read_state_.pending = Future<AsyncReadValue>();
         resolve_pending = true;
-        if (ok && !this->cancelled()) {
-          read_state_.in_flight = true;
-          start_next_read = true;
-        }
+      } else if (ok) {
+        // No consumer waiting: buffer the message (at most one is kept).
+        read_state_.buffered.emplace(std::move(*completed_read));
+      }
+      
+      if (ok) {
+        start_next_read = MaybeStartNextReadLocked();
       }
     }
 
@@ -108,7 +110,6 @@ class BidiReactorBase
     ::grpc::Status finish_status;
     std::unique_lock<std::mutex> lock(mutex_);
     write_state_.in_flight = false;
-    write_state_.ok = ok;
     if (write_state_.pending_active) {
       pending_future = write_state_.pending;
       write_state_.pending_active = false;
@@ -163,17 +164,13 @@ class BidiReactorBase
 
   /// Return the next inbound message while enforcing one outstanding read.
   Future<AsyncReadValue> ReadOneAsync() {
-    bool start_read = false;
     std::unique_lock<std::mutex> lock(mutex_);
-    if (!read_state_.messages.empty()) {
-      ReadValue out = std::move(read_state_.messages.front());
-      read_state_.messages.pop_front();
-      if (!read_state_.in_flight && !read_state_.done && !this->cancelled()) {
-        read_state_.in_flight = true;
-        start_read = true;
-      }
+    if (read_state_.buffered.has_value()) {
+      ReadValue out = std::move(*read_state_.buffered);
+      read_state_.buffered.reset();
       auto future =
           Future<AsyncReadValue>::MakeFinished(MakeAsyncReadValue(std::move(out)));
+      const bool start_read = MaybeStartNextReadLocked();
       lock.unlock();
       if (start_read) {
         this->StartRead(GrpcReadBuffer());
@@ -189,11 +186,8 @@ class BidiReactorBase
     }
     read_state_.pending = Future<AsyncReadValue>::Make();
     read_state_.pending_active = true;
-    if (!read_state_.in_flight) {
-      read_state_.in_flight = true;
-      start_read = true;
-    }
     auto future = read_state_.pending;
+    const bool start_read = MaybeStartNextReadLocked();
     lock.unlock();
     if (start_read) {
       this->StartRead(GrpcReadBuffer());
@@ -245,6 +239,18 @@ class BidiReactorBase
     if (finish_now) {
       this->Finish(finish_state_.status);
     }
+  }
+
+  /// The one read-loop rule: keep exactly one read in flight unless a message
+  /// is already buffered, the stream ended, or the RPC was cancelled. Call
+  /// under mutex_; if this returns true, start the read after unlocking.
+  bool MaybeStartNextReadLocked() {
+    if (read_state_.in_flight || read_state_.done || this->cancelled() ||
+        read_state_.buffered.has_value()) {
+      return false;
+    }
+    read_state_.in_flight = true;
+    return true;
   }
 
   /// Return the protobuf storage used by gRPC for the next inbound message.
@@ -299,8 +305,6 @@ class BidiReactorBase
     bool pending_active = false;
     /// Whether a gRPC write is currently active.
     bool in_flight = false;
-    /// Result reported by the most recent completed gRPC write.
-    bool ok = true;
   };
   WriteState write_state_;
   /// Deferred RPC completion requested via FinishFromWorker().
@@ -452,7 +456,7 @@ class Reactor final
   }
 
  private:
-  /// Drive the handshake inline; the async sender/reader never block, so the
+  /// Drive the handshake inline: the async sender/reader never block, so the
   /// callback thread stays free.
   void RunHandshake() {
     auto outgoing = std::make_unique<AsyncGrpcServerAuthSender<pb::HandshakeResponse>>(
