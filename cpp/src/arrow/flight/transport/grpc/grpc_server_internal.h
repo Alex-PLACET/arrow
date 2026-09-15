@@ -281,7 +281,7 @@ Status SetServerLocationFromUri(const arrow::util::Uri& uri, int port,
 ARROW_FLIGHT_EXPORT
 Status StartFlightGrpcServer(const FlightServerOptions& options,
                              const arrow::util::Uri& uri, ::grpc::Service* service,
-                             bool callback_api, std::unique_ptr<::grpc::Server>* server,
+                             std::unique_ptr<::grpc::Server>* server,
                              Location* location);
 
 }  // namespace arrow::flight::transport::grpc

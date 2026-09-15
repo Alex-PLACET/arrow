@@ -100,14 +100,9 @@ Status SetServerLocationFromUri(const arrow::util::Uri& uri, int port,
 
 Status StartFlightGrpcServer(const FlightServerOptions& options,
                              const arrow::util::Uri& uri, ::grpc::Service* service,
-                             bool callback_api, std::unique_ptr<::grpc::Server>* server,
+                             std::unique_ptr<::grpc::Server>* server,
                              Location* location) {
   ::grpc::ServerBuilder builder;
-  if (callback_api) {
-    builder.SetSyncServerOption(::grpc::ServerBuilder::SyncServerOption::NUM_CQS, 0);
-    builder.SetSyncServerOption(::grpc::ServerBuilder::SyncServerOption::MIN_POLLERS, 1);
-    builder.SetSyncServerOption(::grpc::ServerBuilder::SyncServerOption::MAX_POLLERS, 1);
-  }
   int port = 0;
   RETURN_NOT_OK(AddServerListeningPort(options, uri, &builder, location, &port));
   builder.RegisterService(service);
