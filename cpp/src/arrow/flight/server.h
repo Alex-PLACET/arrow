@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/flight/flight_data_decoder.h"
 #include "arrow/flight/server_auth.h"
 #include "arrow/flight/type_fwd.h"
 #include "arrow/flight/types.h"       // IWYU pragma: keep
@@ -168,6 +169,10 @@ class ARROW_FLIGHT_EXPORT FlightServerOptions {
 
   /// \brief An optional memory manager to control where to allocate incoming data.
   std::shared_ptr<MemoryManager> memory_manager;
+
+  bool use_async_grpc = false;
+
+  FlightDataListenerFactory listener_factory;
 
   /// \brief A Flight implementation-specific callback to customize
   /// transport-specific options.

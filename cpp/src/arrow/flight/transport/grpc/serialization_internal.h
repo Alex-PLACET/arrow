@@ -28,11 +28,26 @@
 #include "arrow/result.h"
 
 namespace arrow {
+
+class Buffer;
+
 namespace flight {
 namespace transport {
 namespace grpc {
 
 namespace pb = arrow::flight::protocol;
+
+/// Zero-copy conversion of an Arrow Buffer to a gRPC Slice.
+///
+/// The Buffer lifetime is tied to the Slice (a shared_ptr is attached to the
+/// slice's destructor callback)
+arrow::Result<::grpc::Slice> SliceFromBuffer(const std::shared_ptr<Buffer>& buf);
+
+/// Zero-copy conversion of a gRPC ByteBuffer into an Arrow Buffer.
+///
+/// The Arrow Buffer owns a reference to the gRPC slice, so it stays valid
+/// after the ByteBuffer goes away.
+Status WrapGrpcBuffer(::grpc::ByteBuffer* cpp_buf, std::shared_ptr<Buffer>* out);
 
 /// Write Flight message on gRPC stream with zero-copy optimizations.
 // Returns Invalid if the payload is ill-formed

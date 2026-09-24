@@ -688,6 +688,15 @@ arrow::Result<std::unique_ptr<FlightStreamReader>> FlightClient::DoGet(
   return stream_reader;
 }
 
+void FlightClient::DoGetAsync(const FlightCallOptions& options, const Ticket& ticket,
+                              std::shared_ptr<AsyncDoGetListener> listener) {
+  if (auto status = CheckOpen(); !status.ok()) {
+    listener->OnFinish(std::move(status));
+    return;
+  }
+  transport_->DoGetAsync(options, ticket, std::move(listener));
+}
+
 arrow::Result<FlightClient::DoPutResult> FlightClient::DoPut(
     const FlightCallOptions& options, const FlightDescriptor& descriptor,
     const std::shared_ptr<Schema>& schema) {

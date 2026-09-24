@@ -98,6 +98,10 @@ Status ClientTransport::DoGet(const FlightCallOptions& options, const Ticket& ti
                               std::unique_ptr<ClientDataStream>* stream) {
   return Status::NotImplemented("DoGet for this transport");
 }
+void ClientTransport::DoGetAsync(const FlightCallOptions& options, const Ticket& ticket,
+                                 std::shared_ptr<AsyncDoGetListener> listener) {
+  listener->OnFinish(Status::NotImplemented("Async DoGet for this transport"));
+}
 Status ClientTransport::DoPut(const FlightCallOptions& options,
                               std::unique_ptr<ClientDataStream>* stream) {
   return Status::NotImplemented("DoPut for this transport");
@@ -108,12 +112,17 @@ Status ClientTransport::DoExchange(const FlightCallOptions& options,
 }
 void ClientTransport::SetAsyncRpc(AsyncListenerBase* listener,
                                   std::unique_ptr<AsyncRpc>&& rpc) {
+  auto state_lock = listener->LockRpcState();
   listener->rpc_state_ = std::move(rpc);
 }
 AsyncRpc* ClientTransport::GetAsyncRpc(AsyncListenerBase* listener) {
+  auto state_lock = listener->LockRpcState();
   return listener->rpc_state_.get();
 }
 std::unique_ptr<AsyncRpc> ClientTransport::ReleaseAsyncRpc(AsyncListenerBase* listener) {
+  // Under the state lock: any control call using the state has finished by the
+  // time this returns, so the caller may dispose of the state afterwards.
+  auto state_lock = listener->LockRpcState();
   return std::move(listener->rpc_state_);
 }
 

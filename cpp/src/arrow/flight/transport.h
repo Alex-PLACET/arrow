@@ -63,8 +63,8 @@
 
 #include "arrow/flight/type_fwd.h"
 #include "arrow/flight/types.h"
+#include "arrow/flight/types_async.h"
 #include "arrow/flight/visibility.h"
-#include "arrow/ipc/options.h"
 #include "arrow/type_fwd.h"
 
 namespace arrow {
@@ -194,6 +194,8 @@ class ARROW_FLIGHT_EXPORT ClientTransport {
                              std::unique_ptr<FlightListing>* listing);
   virtual Status DoGet(const FlightCallOptions& options, const Ticket& ticket,
                        std::unique_ptr<ClientDataStream>* stream);
+  virtual void DoGetAsync(const FlightCallOptions& options, const Ticket& ticket,
+                          std::shared_ptr<AsyncDoGetListener> listener);
   virtual Status DoPut(const FlightCallOptions& options,
                        std::unique_ptr<ClientDataStream>* stream);
   virtual Status DoExchange(const FlightCallOptions& options,
@@ -251,6 +253,14 @@ class ARROW_FLIGHT_EXPORT AsyncRpc {
   virtual ~AsyncRpc() = default;
   /// \brief Request cancellation of the RPC.
   virtual void TryCancel() {}
+
+  /// \brief Request one more result (demand-driven reads, DoGetAsync).
+  ///
+  /// Returns OK if the request was accepted.  Nonblocking; callable from any
+  /// thread.  Transports that do not support demand-driven reads reject it.
+  virtual Status RequestNext() {
+    return Status::NotImplemented("this transport does not support demand-driven reads");
+  }
 
   /// Only needed for DoPut/DoExchange
   virtual void Begin(const FlightDescriptor& descriptor, std::shared_ptr<Schema> schema) {

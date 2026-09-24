@@ -35,6 +35,7 @@
 
 #include "arrow/flight/type_fwd.h"
 #include "arrow/flight/types.h"  // IWYU pragma: keep
+#include "arrow/flight/types_async.h"
 #include "arrow/flight/visibility.h"
 
 namespace arrow {
@@ -341,6 +342,17 @@ class ARROW_FLIGHT_EXPORT FlightClient {
       const FlightCallOptions& options, const Ticket& ticket);
   arrow::Result<std::unique_ptr<FlightStreamReader>> DoGet(const Ticket& ticket) {
     return DoGet({}, ticket);
+  }
+
+  /// \brief Asynchronously read a stream (DoGet).
+  ///
+  /// See AsyncDoGetListener: chunks are delivered only in response to
+  /// RequestNext() (one outstanding request at a time); the schema arrives via
+  /// OnSchema() and the RPC ends with exactly one OnFinish().
+  void DoGetAsync(const FlightCallOptions& options, const Ticket& ticket,
+                  std::shared_ptr<AsyncDoGetListener> listener);
+  void DoGetAsync(const Ticket& ticket, std::shared_ptr<AsyncDoGetListener> listener) {
+    return DoGetAsync({}, ticket, std::move(listener));
   }
 
   /// \brief DoPut return value

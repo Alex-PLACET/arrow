@@ -23,6 +23,7 @@ install_headers(
         'client.h',
         'client_middleware.h',
         'client_tracing_middleware.h',
+        'flight_data_decoder.h',
         'middleware.h',
         'otel_logging.h',
         'platform.h',
@@ -81,6 +82,7 @@ arrow_flight_srcs = [
     'client_cookie_middleware.cc',
     'client_tracing_middleware.cc',
     'cookie_internal.cc',
+    'flight_data_decoder.cc',
     'middleware.cc',
     'serialization_internal.cc',
     'server.cc',
@@ -165,6 +167,22 @@ foreach flight_test : flight_tests
     )
     test(test_name, exc)
 endforeach
+
+# Async Flight service over gRPC's generic callback API (C++ build target:
+# arrow-flight-async-grpc-test). Declared on its own because the test lives
+# in transport/grpc/, with the same gtest/gRPC dependencies as the tests
+# above.
+async_grpc_test = executable(
+    'flight-async-grpc-test',
+    sources: [
+        'transport/grpc/async_grpc_test.cc',
+        # async_grpc_test.cc transitively includes Flight.grpc.pb.h
+        # so we must declare that here to avoid a race condition
+        flight_proto_grpc_files[1],
+    ],
+    dependencies: [arrow_test_dep, arrow_flight_test_dep],
+)
+test('flight-async-grpc-test', async_grpc_test)
 
 flight_test_dep_no_main = [
     arrow_dep,

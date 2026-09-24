@@ -1040,6 +1040,9 @@ Status ResultStream::Drain() {
 }
 
 FlightStreamChunk::FlightStreamChunk() noexcept = default;
+FlightStreamChunk::FlightStreamChunk(std::shared_ptr<RecordBatch> data,
+                                     std::shared_ptr<Buffer> app_metadata) noexcept
+    : data(std::move(data)), app_metadata(std::move(app_metadata)) {}
 FlightStreamChunk::~FlightStreamChunk() = default;
 
 arrow::Result<std::vector<std::shared_ptr<RecordBatch>>>
@@ -1198,10 +1201,32 @@ TransportStatusDetail::Unwrap(const Status& status) {
 
 AsyncListenerBase::AsyncListenerBase() = default;
 AsyncListenerBase::~AsyncListenerBase() = default;
+
+std::unique_lock<std::mutex> AsyncListenerBase::LockRpcState() const {
+  return std::unique_lock<std::mutex>(rpc_state_mutex_);
+}
+
 void AsyncListenerBase::TryCancel() {
-  if (rpc_state_) {
-    rpc_state_->TryCancel();
+  // Hold the state lock for the whole call.  A finished RPC has no state left
+  // to cancel (ReleaseAsyncRpc() cleared it under this lock), and while the
+  // state is here the transport cannot release - and so cannot dispose of - it.
+  auto state_lock = LockRpcState();
+  if (auto* rpc = rpc_state()) {
+    rpc->TryCancel();
   }
+}
+
+Status AsyncDoGetListener::RequestNext() {
+  // As in TryCancel(): the state, and the read it arms, are used under the lock
+  // that the transport must take to release the state as the RPC finishes.
+  auto state_lock = LockRpcState();
+  auto* rpc = rpc_state();
+  if (!rpc) {
+    return Status::Invalid(
+        "no RPC in progress: RequestNext() must be called after "
+        "FlightClient::DoGetAsync() and before OnFinish()");
+  }
+  return rpc->RequestNext();
 }
 
 }  // namespace flight

@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "arrow/flight/transport/grpc/async_grpc_service.h"
 #include "arrow/flight/transport/grpc/customize_grpc.h"
 
 #include <grpcpp/grpcpp.h>
@@ -438,14 +439,40 @@ class GrpcServerTransport : public internal::ServerTransport {
   }
 
   Status Init(const FlightServerOptions& options, const arrow::util::Uri& uri) override {
-    grpc_service_.reset(
-        new GrpcServiceHandler(options.auth_handler, options.middleware, this));
+    if (options.use_async_grpc) {
+      // The generic callback service runs neither the auth handler nor the
+      // middleware: refuse to start rather than silently skipping them.
+      if (options.auth_handler) {
+        return Status::NotImplemented(
+            "FlightServerOptions::use_async_grpc does not support an auth handler");
+      }
+      if (!options.middleware.empty()) {
+        return Status::NotImplemented(
+            "FlightServerOptions::use_async_grpc does not support middleware");
+      }
+      async_service_ =
+          std::make_unique<AsyncGenericFlightService>(base(), options.listener_factory);
+    } else {
+      grpc_service_.reset(
+          new GrpcServiceHandler(options.auth_handler, options.middleware, this));
+    }
 
     ::grpc::ServerBuilder builder;
     int port = 0;
     RETURN_NOT_OK(AddServerListeningPort(options, uri, &builder, &location_, &port));
 
-    builder.RegisterService(grpc_service_.get());
+    if (options.use_async_grpc) {
+      // Registering the typed service alongside would NOT work: a method it
+      // claims (DoGet/DoPut) never reaches the generic handler, so the server
+      // would silently keep serving them synchronously. The generic service
+      // must REPLACE it. With no typed service registered, gRPC still routes
+      // unclaimed methods to it (it installs its own UNIMPLEMENTED fallback
+      // only when no generic service is registered at all), so every other
+      // RPC answers UNIMPLEMENTED through our fallback reactor.
+      builder.RegisterCallbackGenericService(async_service_.get());
+    } else {
+      builder.RegisterService(grpc_service_.get());
+    }
     ConfigureServerBuilderOptions(options, &builder);
 
     grpc_server_ = builder.BuildAndStart();
@@ -470,6 +497,9 @@ class GrpcServerTransport : public internal::ServerTransport {
 
  private:
   std::unique_ptr<GrpcServiceHandler> grpc_service_;
+  // Set when FlightServerOptions::use_async_grpc is on. Declared before
+  // grpc_server_ so it outlives it (the server holds a pointer to it).
+  std::unique_ptr<AsyncGenericFlightService> async_service_;
   std::unique_ptr<::grpc::Server> grpc_server_;
   Location location_;
 };
