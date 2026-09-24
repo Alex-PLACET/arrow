@@ -63,8 +63,8 @@
 
 #include "arrow/flight/type_fwd.h"
 #include "arrow/flight/types.h"
+#include "arrow/flight/types_async.h"
 #include "arrow/flight/visibility.h"
-#include "arrow/ipc/options.h"
 #include "arrow/type_fwd.h"
 
 namespace arrow {
@@ -72,6 +72,7 @@ namespace ipc {
 class Message;
 }
 namespace flight {
+class AsyncGenericFlightServerBase;
 class FlightStatusDetail;
 namespace internal {
 
@@ -194,6 +195,8 @@ class ARROW_FLIGHT_EXPORT ClientTransport {
                              std::unique_ptr<FlightListing>* listing);
   virtual Status DoGet(const FlightCallOptions& options, const Ticket& ticket,
                        std::unique_ptr<ClientDataStream>* stream);
+  virtual void DoGetAsync(const FlightCallOptions& options, const Ticket& ticket,
+                          std::shared_ptr<AsyncDoGetListener> listener);
   virtual Status DoPut(const FlightCallOptions& options,
                        std::unique_ptr<ClientDataStream>* stream);
   virtual Status DoExchange(const FlightCallOptions& options,
@@ -216,6 +219,9 @@ class ARROW_FLIGHT_EXPORT TransportRegistry {
   using ClientFactory = std::function<arrow::Result<std::unique_ptr<ClientTransport>>()>;
   using ServerFactory = std::function<arrow::Result<std::unique_ptr<ServerTransport>>(
       FlightServerBase*, std::shared_ptr<MemoryManager> memory_manager)>;
+  using AsyncServerFactory =
+      std::function<arrow::Result<std::unique_ptr<ServerTransport>>(
+          AsyncGenericFlightServerBase*, std::shared_ptr<MemoryManager> memory_manager)>;
 
   TransportRegistry();
   ~TransportRegistry();
@@ -226,8 +232,13 @@ class ARROW_FLIGHT_EXPORT TransportRegistry {
       const std::string& scheme, FlightServerBase* base,
       std::shared_ptr<MemoryManager> memory_manager) const;
 
+  arrow::Result<std::unique_ptr<ServerTransport>> MakeServerAsync(
+      const std::string& scheme, AsyncGenericFlightServerBase* async_base,
+      std::shared_ptr<MemoryManager> memory_manager) const;
+
   Status RegisterClient(const std::string& scheme, ClientFactory factory);
   Status RegisterServer(const std::string& scheme, ServerFactory factory);
+  Status RegisterAsyncServer(const std::string& scheme, AsyncServerFactory factory);
 
  private:
   class Impl;
@@ -251,6 +262,13 @@ class ARROW_FLIGHT_EXPORT AsyncRpc {
   virtual ~AsyncRpc() = default;
   /// \brief Request cancellation of the RPC.
   virtual void TryCancel() {}
+
+  /// \brief Request one more result.
+  /// Must be non blocking.
+  /// \return OK if the request was accepted.
+  virtual Status RequestNext() {
+    return Status::NotImplemented("this transport does not support demand-driven reads");
+  }
 
   /// Only needed for DoPut/DoExchange
   virtual void Begin(const FlightDescriptor& descriptor, std::shared_ptr<Schema> schema) {

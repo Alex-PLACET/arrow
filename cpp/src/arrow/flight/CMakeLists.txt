@@ -179,15 +179,18 @@ set(ARROW_FLIGHT_SRCS
     client_cookie_middleware.cc
     client_tracing_middleware.cc
     cookie_internal.cc
+    flight_data_decoder.cc
     middleware.cc
     serialization_internal.cc
     server.cc
+    server_async.cc
     server_auth.cc
     server_tracing_middleware.cc
     transport.cc
     transport_server.cc
     transport_server_internal.cc
     # Bundle the gRPC impl with libarrow_flight
+    transport/grpc/async_grpc_service.cc
     transport/grpc/grpc_client.cc
     transport/grpc/grpc_server.cc
     transport/grpc/grpc_server_internal.cc
@@ -331,6 +334,15 @@ add_arrow_test(flight_internals_test
                "arrow_flight")
 
 add_arrow_test(flight_test
+               STATIC_LINK_LIBS
+               ${ARROW_FLIGHT_TEST_LINK_LIBS}
+               LABELS
+               "arrow_flight")
+
+# Async Flight server over the gRPC generic callback API
+add_arrow_test(flight_async_grpc_test
+               SOURCES
+               transport/grpc/async_grpc_test.cc
                STATIC_LINK_LIBS
                ${ARROW_FLIGHT_TEST_LINK_LIBS}
                LABELS

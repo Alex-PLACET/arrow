@@ -27,6 +27,7 @@ struct ActionType;
 template <typename T>
 class AsyncListener;
 class AsyncListenerBase;
+class AsyncDoGetListener;
 class AsyncRpc;
 struct BasicAuth;
 class ClientAuthHandler;
