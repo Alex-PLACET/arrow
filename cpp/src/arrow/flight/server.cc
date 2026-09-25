@@ -188,11 +188,10 @@ Status AsyncGenericFlightServerBase::Init(const FlightServerOptions& options) {
   return FlightServerBase::Init(async_options);
 }
 
-Future<> AsyncGenericFlightServerBase::Handshake(const ServerCallContext&,
-                                                 std::unique_ptr<AsyncServerAuthSender>,
-                                                 std::unique_ptr<AsyncServerAuthReader>) {
-  return Future<>::MakeFinished(Status::NotImplemented(
-      "This service does not have an authentication mechanism enabled."));
+Status AsyncGenericFlightServerBase::Handshake(const ServerCallContext&,
+                                               const std::string&, std::string*) {
+  return Status::NotImplemented(
+      "This service does not have an authentication mechanism enabled.");
 }
 
 Status AsyncGenericFlightServerBase::ValidateToken(const ServerCallContext&,

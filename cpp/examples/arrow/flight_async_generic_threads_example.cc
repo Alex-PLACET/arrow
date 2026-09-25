@@ -16,9 +16,9 @@
 // under the License.
 
 #include <fcntl.h>
-#include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <csignal>
 
 #include <algorithm>
 #include <atomic>

@@ -240,36 +240,17 @@ class ExampleServer : public flight::AsyncGenericFlightServerBase {
     return arrow::Status::OK();
   }
 
-  arrow::Future<> Handshake(
-      const flight::ServerCallContext& context,
-      std::unique_ptr<flight::AsyncServerAuthSender> outgoing,
-      std::unique_ptr<flight::AsyncServerAuthReader> incoming) override {
+  arrow::Status Handshake(const flight::ServerCallContext& context,
+                          const std::string& password, std::string* response) override {
     if (!FLAGS_require_token) {
-      return flight::AsyncGenericFlightServerBase::Handshake(context, std::move(outgoing),
-                                                             std::move(incoming));
+      return flight::AsyncGenericFlightServerBase::Handshake(context, password, response);
     }
-    // Nothing here blocks: each step resolves a Future and the continuation
-    // runs on a gRPC callback thread without holding it.
-    auto sender = std::make_shared<std::unique_ptr<flight::AsyncServerAuthSender>>(
-        std::move(outgoing));
-    auto reader = std::make_shared<std::unique_ptr<flight::AsyncServerAuthReader>>(
-        std::move(incoming));
-    auto done = arrow::Future<>::Make();
-    (*reader)->Read().AddCallback(
-        [sender, done](const arrow::Result<std::string>& password) mutable {
-          if (!password.ok()) {
-            done.MarkFinished(password.status());
-            return;
-          }
-          if (*password != kDemoPassword) {
-            done.MarkFinished(flight::MakeFlightError(
-                flight::FlightStatusCode::Unauthenticated, "Invalid token"));
-            return;
-          }
-          (*sender)->Write(kDemoUser).AddCallback(
-              [done](const arrow::Status& status) mutable { done.MarkFinished(status); });
-        });
-    return done;
+    if (password != kDemoPassword) {
+      return flight::MakeFlightError(flight::FlightStatusCode::Unauthenticated,
+                                     "Invalid token");
+    }
+    *response = kDemoUser;
+    return arrow::Status::OK();
   }
 
   arrow::Status ValidateToken(const flight::ServerCallContext& context,

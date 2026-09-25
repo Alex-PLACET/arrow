@@ -1043,7 +1043,8 @@ TEST(FlightMessageDecoder, DescriptorReachesListener) {
   // An upload message carries the descriptor of the DoPut command, the
   // listener sees it before anything else from that message is decoded.
   const auto schema = arrow::schema({arrow::field("a", arrow::int32())});
-  const auto batch = RecordBatch::Make(schema, 1, {ArrayFromJSON(arrow::int32(), "[42]")});
+  const auto batch =
+      RecordBatch::Make(schema, 1, {ArrayFromJSON(arrow::int32(), "[42]")});
   auto reader = RecordBatchReader::Make({batch}).ValueOrDie();
   RecordBatchStream stream(std::move(reader));
 
@@ -1064,7 +1065,8 @@ TEST(FlightMessageDecoder, DescriptorReachesListener) {
 
 TEST(FlightMessageDecoder, DescriptorErrorRejectsUpload) {
   const auto schema = arrow::schema({arrow::field("a", arrow::int32())});
-  const auto batch = RecordBatch::Make(schema, 1, {ArrayFromJSON(arrow::int32(), "[42]")});
+  const auto batch =
+      RecordBatch::Make(schema, 1, {ArrayFromJSON(arrow::int32(), "[42]")});
   auto reader = RecordBatchReader::Make({batch}).ValueOrDie();
   RecordBatchStream stream(std::move(reader));
 

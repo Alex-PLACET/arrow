@@ -363,15 +363,14 @@ class ARROW_FLIGHT_EXPORT AsyncGenericFlightServerBase : public FlightServerBase
 
   /// \brief Handle the handshake protocol with the client.
   ///
-  /// Resolve the returned Future after all sender/reader operations started by
-  /// this hook have completed.  Continuations may run inline on a gRPC callback
-  /// thread: do not block, and await each reader/writer Future before starting
-  /// the next operation.  The application owns the sender and reader for the
-  /// duration of the hook.  The default answers UNIMPLEMENTED, like a server
-  /// with no authentication mechanism.
-  virtual Future<> Handshake(const ServerCallContext& context,
-                             std::unique_ptr<AsyncServerAuthSender> outgoing,
-                             std::unique_ptr<AsyncServerAuthReader> incoming);
+  /// `request` is the client's handshake message; write the response into
+  /// `*response` and the transport sends it as the reply.  Return a non-OK
+  /// status to fail the RPC (FlightStatusCode::Unauthenticated rejects the
+  /// client).  Runs inline on a gRPC callback thread: do not block.  The
+  /// default answers UNIMPLEMENTED, like a server with no authentication
+  /// mechanism.
+  virtual Status Handshake(const ServerCallContext& context, const std::string& request,
+                           std::string* response);
 
   /// \brief Validate the token sent in the `auth-token-bin` header of RPCs
   /// issued after a successful Handshake().

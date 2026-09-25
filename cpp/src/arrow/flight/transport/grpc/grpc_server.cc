@@ -456,13 +456,12 @@ class GrpcServerTransport : public internal::ServerTransport {
       // object.
       auto* async_base = dynamic_cast<AsyncGenericFlightServerBase*>(base());
       using AsyncHelper = GrpcServerCallContextHelper<::grpc::CallbackServerContext>;
-      AsyncHelper::AsyncServerAuthHandshake handshake;
+      AsyncHelper::HandshakeFn handshake;
       AsyncHelper::ValidateTokenFn validate_token;
       if (async_base) {
         handshake = [async_base](const ServerCallContext& context,
-                                 std::unique_ptr<AsyncServerAuthSender> outgoing,
-                                 std::unique_ptr<AsyncServerAuthReader> incoming) {
-          return async_base->Handshake(context, std::move(outgoing), std::move(incoming));
+                                 const std::string& request, std::string* response) {
+          return async_base->Handshake(context, request, response);
         };
         validate_token = [async_base](const ServerCallContext& context,
                                       const std::string& token,

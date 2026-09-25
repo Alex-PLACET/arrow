@@ -56,7 +56,8 @@ class ARROW_FLIGHT_EXPORT AsyncListenerBase {
 
   /// \brief Transport state for this RPC, null until the call has started and
   /// after it finishes. Only valid while holding the LockRpcState() lock.
-  /// \return the transport state for this RPC, or null if the call has not started or has finished.
+  /// \return the transport state for this RPC, or null if the call has not started or has
+  /// finished.
   internal::AsyncRpc* rpc_state() const { return rpc_state_.get(); }
 
  private:
@@ -119,12 +120,13 @@ class ARROW_FLIGHT_EXPORT AsyncDoGetListener : public AsyncListener<FlightStream
   /// \brief Request one more chunk.
   ///
   /// Nonblocking: Safe to call from any thread once FlightClient::DoGetAsync()
-  /// has been called, including from inside OnSchema()/OnNext().  Returns OK if
-  /// the request was accepted; it is then satisfied by exactly one OnNext() call
-  /// (which may carry only Flight app_metadata) or ended by the terminal
-  /// OnFinish().  An overlapping request is rejected and does not affect the
-  /// pending one.  Requests after the RPC finished are rejected.  Rejection never
-  /// suppresses the final OnFinish() or replaces its status.
+  /// has been called, including from inside OnSchema()/OnNext().
+  /// \return Returns OK if the request was accepted; it is then satisfied by exactly one
+  /// OnNext() call (which may carry only Flight app_metadata) or ended by the terminal
+  /// OnFinish().
+  /// An overlapping request is rejected and does not affect the pending one.
+  /// Requests after the RPC finished are rejected.
+  /// Rejection never suppresses the final OnFinish() or replaces its status.
   Status RequestNext();
   /// \brief The schema of the stream.
   ///
