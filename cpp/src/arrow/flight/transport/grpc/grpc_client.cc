@@ -19,9 +19,11 @@
 
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -52,6 +54,7 @@
 #include "arrow/flight/client_auth.h"
 #include "arrow/flight/client_middleware.h"
 #include "arrow/flight/cookie_internal.h"
+#include "arrow/flight/flight_data_decoder.h"
 #include "arrow/flight/middleware.h"
 #include "arrow/flight/serialization_internal.h"
 #include "arrow/flight/transport.h"
@@ -585,20 +588,17 @@ class FinishedFlag {
 // thread and we may attempt to join ourselves (because gRPC
 // apparently refcounts threads).  Avoid that by transferring gRPC
 // resources to a dedicated thread for destruction.
+//
+// The same thread runs deadline actions (RegisterDeadline()), which is what
+// lets a call react to its own expired deadline while gRPC withholds its
+// callbacks - without a thread (or a timer) per call.
 class GrpcGarbageBin {
  public:
+  /// Identifies a registered deadline action; see RegisterDeadline().
+  using DeadlineId = uint64_t;
+
   GrpcGarbageBin() {
-    grpc_destructor_thread_ = std::thread([&]() {
-      while (true) {
-        std::unique_lock<std::mutex> guard(grpc_destructor_mutex_);
-        grpc_destructor_cv_.wait(guard,
-                                 [&]() { return !running_ || !garbage_bin_.empty(); });
-
-        garbage_bin_.clear();
-
-        if (!running_) return;
-      }
-    });
+    grpc_destructor_thread_ = std::thread([&]() { DestructorLoop(); });
   }
 
   void Dispose(std::unique_ptr<internal::AsyncRpc> trash) {
@@ -608,22 +608,135 @@ class GrpcGarbageBin {
     grpc_destructor_cv_.notify_all();
   }
 
+  /// \brief Run `action` on the destructor thread once `when` has passed
+  /// (immediately, if it already has).  Returns an id for UnregisterDeadline();
+  /// a stopped bin runs nothing.
+  ///
+  /// The action runs with no lock of this bin held, so it may take its own
+  /// locks - but it must not call back into this bin while holding one (see
+  /// Finish(), which releases the call's mutex before disposing).
+  DeadlineId RegisterDeadline(std::chrono::system_clock::time_point when,
+                              std::function<void()> action) {
+    std::unique_lock<std::mutex> guard(grpc_destructor_mutex_);
+    const DeadlineId id = next_deadline_id_++;
+    if (running_) {
+      deadlines_.emplace(when, DeadlineEntry{id, std::move(action)});
+      grpc_destructor_cv_.notify_all();
+    }
+    return id;
+  }
+
+  /// \brief Drop a registered action: it is never started after this returns.
+  ///
+  /// An action that already started is not interrupted - its owner makes it a
+  /// no-op by marking its own state first, as Finish() does - and an action
+  /// that started in the instant between being collected and being run cannot
+  /// be recalled either.  Everything else is dropped.
+  void UnregisterDeadline(DeadlineId id) {
+    std::unique_lock<std::mutex> guard(grpc_destructor_mutex_);
+    for (auto it = deadlines_.begin(); it != deadlines_.end(); ++it) {
+      if (it->second.id == id) {
+        deadlines_.erase(it);
+        break;
+      }
+    }
+    collected_.erase(id);
+    grpc_destructor_cv_.notify_all();
+  }
+
   void Stop() {
     {
       std::unique_lock<std::mutex> guard(grpc_destructor_mutex_);
       running_ = false;
+      // The transport is going away: no action may run any more.
+      deadlines_.clear();
+      collected_.clear();
       grpc_destructor_cv_.notify_all();
     }
     grpc_destructor_thread_.join();
   }
 
  private:
+  struct DeadlineEntry {
+    DeadlineId id;
+    std::function<void()> action;
+  };
+
+  void DestructorLoop() {
+    while (true) {
+      // Actions that are due, collected under the lock and run outside of it.
+      std::vector<std::pair<DeadlineId, std::function<void()>>> due;
+      {
+        std::unique_lock<std::mutex> guard(grpc_destructor_mutex_);
+        if (deadlines_.empty()) {
+          // No deadline registered: behave as if this thread only disposes.
+          grpc_destructor_cv_.wait(guard, [&]() {
+            return !running_ || !garbage_bin_.empty() || !deadlines_.empty();
+          });
+        } else {
+          grpc_destructor_cv_.wait_until(guard, deadlines_.begin()->first, [&]() {
+            return !running_ || !garbage_bin_.empty() || deadlines_.empty() ||
+                   deadlines_.begin()->first <= std::chrono::system_clock::now();
+          });
+        }
+
+        const auto now = std::chrono::system_clock::now();
+        while (!deadlines_.empty() && deadlines_.begin()->first <= now) {
+          auto entry = deadlines_.begin();
+          collected_.insert(entry->second.id);
+          due.emplace_back(entry->second.id, std::move(entry->second.action));
+          deadlines_.erase(entry);
+        }
+      }
+
+      for (auto& entry : due) {
+        {
+          std::unique_lock<std::mutex> guard(grpc_destructor_mutex_);
+          // Skip one unregistered (or stopped) while it waited its turn.
+          if (!running_ || collected_.erase(entry.first) == 0) continue;
+        }
+        entry.second();
+      }
+
+      {
+        std::unique_lock<std::mutex> guard(grpc_destructor_mutex_);
+        garbage_bin_.clear();
+        if (!running_) return;
+      }
+    }
+  }
+
   bool running_ = true;
   std::thread grpc_destructor_thread_;
   std::mutex grpc_destructor_mutex_;
   std::condition_variable grpc_destructor_cv_;
   std::deque<std::unique_ptr<internal::AsyncRpc>> garbage_bin_;
+
+  /// Pending deadline actions, earliest first.
+  std::multimap<std::chrono::system_clock::time_point, DeadlineEntry> deadlines_;
+  /// Ids collected for execution, so that UnregisterDeadline() can still drop
+  /// them before they start.
+  std::set<DeadlineId> collected_;
+  DeadlineId next_deadline_id_ = 1;
 };
+
+/// The shared tail of every async call's Finish(): move the listener out, hand
+/// it the combined status, mark the call finished, then hand the gRPC resources
+/// to the garbage bin.  SetAsyncRpc may trigger destruction, so the flag is set
+/// first; the bin keeps the destruction off the callback thread.
+template <typename Listener>
+void FinishAsyncCall(std::shared_ptr<Listener> listener, const ::grpc::Status& status,
+                     Status client_status, ClientRpc* rpc, GrpcGarbageBin* garbage_bin,
+                     FinishedFlag* finished) {
+  listener->OnFinish(
+      CombinedTransportStatus(status, std::move(client_status), &rpc->context));
+  // SetAsyncRpc may trigger destruction, so Finish() first
+  finished->Finish();
+  // Instead of potentially destructing gRPC resources here,
+  // transfer it to a dedicated background thread
+  garbage_bin->Dispose(
+      flight::internal::ClientTransport::ReleaseAsyncRpc(listener.get()));
+}
 
 template <typename Result, typename Request, typename Response>
 class UnaryUnaryAsyncCall : public ::grpc::ClientUnaryReactor, public internal::AsyncRpc {
@@ -660,21 +773,321 @@ class UnaryUnaryAsyncCall : public ::grpc::ClientUnaryReactor, public internal::
   }
 
   void Finish(const ::grpc::Status& status) {
-    auto listener = std::move(this->listener);
-    listener->OnFinish(
-        CombinedTransportStatus(status, std::move(client_status), &rpc.context));
-    // SetAsyncRpc may trigger destruction, so Finish() first
-    finished.Finish();
-    // Instead of potentially destructing gRPC resources here,
-    // transfer it to a dedicated background thread
-    garbage_bin_->Dispose(
-        flight::internal::ClientTransport::ReleaseAsyncRpc(listener.get()));
+    FinishAsyncCall(std::move(listener), status, std::move(client_status), &rpc,
+                    garbage_bin_.get(), &finished);
   }
 };
 
-#  define LISTENER_NOT_OK(LISTENER, EXPR)                 \
+/// An async DoGet call, driven by one-at-a-time application demand.
+///
+/// The RPC starts with no reads outstanding.  RequestNext() admits exactly one
+/// read; it is satisfied by one OnNext() (a metadata-only chunk counts as one)
+/// or ended by the terminal status.  Schema and dictionary messages do not
+/// satisfy demand and are read through, so the reactor reads ahead by at most
+/// one FlightData message beyond what was requested.  A read that returns false
+/// only means the server closed its side of the stream: the terminal status
+/// always arrives through OnDone().
+///
+/// RequestNext() is callable from any thread, so reads are started from
+/// application threads too.  gRPC's callback stream is destroyed as soon as the
+/// call completes - which can happen before OnDone() runs - so a read started
+/// from an application thread has to keep the stream alive: PrepareCall() takes
+/// an AddHold() before StartCall() (the API for operations issued outside of
+/// reactions), and MaybeReleaseHold() drops it - exactly once - as soon as no
+/// application read can be started any more and none is in flight: after
+/// TryCancel(), after a decode failure, after a read reported that the server
+/// closed, or when the call's deadline expires.
+///
+/// Until the hold is dropped gRPC withholds OnDone(), so a terminal status that
+/// arrives while no read is outstanding has to be pushed by something other
+/// than a read.  The deadline is: the reactor registers it with the client's
+/// background thread (GrpcGarbageBin, no thread of its own) and releases the
+/// hold there on expiry - by then gRPC's own deadline has failed the call, so
+/// OnDone() reports the real rich status; nothing is cancelled or synthesized.
+/// A server-side end of stream or error at zero demand still needs another
+/// request (which finds no more data) to be discovered, as before.
+///
+/// Application-thread control calls (RequestNext(), TryCancel()) run under the
+/// listener's state lock (AsyncListenerBase::LockRpcState()): the transport
+/// takes that same lock to clear the state, and it only clears the state - and
+/// only then disposes of this call - once no control call is using it, so a
+/// control call cannot race the disposal even when the deadline finishes the
+/// call without any application action.
+class DoGetAsyncCall : public ::grpc::ClientReadReactor<pb::FlightData>,
+                       public internal::AsyncRpc {
+ public:
+  /// Bridges the push decoder to the user listener.  Only ever called on the
+  /// thread of the read callback; produced_chunk_ records whether the decoded
+  /// message yielded a chunk, which is what satisfies the pending request.
+  ///
+  /// The demand is cleared before the user callback runs: the request is
+  /// satisfied at OnNext() entry, so a reentrant RequestNext() from inside the
+  /// callback must be accepted.
+  class ChunkForwarder : public FlightDataListener {
+   public:
+    explicit ChunkForwarder(DoGetAsyncCall* call) : call_(call) {}
+
+    Status OnSchemaDecoded(std::shared_ptr<Schema> schema) override {
+      call_->listener->OnSchema(std::move(schema));
+      return Status::OK();
+    }
+
+    Status OnNext(FlightStreamChunk chunk) override {
+      {
+        std::lock_guard<std::mutex> guard(call_->mutex_);
+        call_->request_pending_ = false;
+        call_->read_pending_ = false;
+        call_->produced_chunk_ = true;
+      }
+      call_->listener->OnNext(std::move(chunk));
+      return Status::OK();
+    }
+
+   private:
+    DoGetAsyncCall* call_;
+  };
+
+  ClientRpc rpc;
+  std::shared_ptr<AsyncDoGetListener> listener;
+  std::shared_ptr<GrpcGarbageBin> garbage_bin_;
+
+  pb::Ticket pb_request;
+  /// Read target.  SerializationTraits<pb::FlightData> is specialized to fill
+  /// an internal::FlightData directly (as ReadPayload does), so reads are
+  /// zero-copy.
+  internal::FlightData flight_data;
+  std::unique_ptr<FlightMessageDecoder> decoder;
+
+  /// Client-side (decode or user) error to report with the terminal status.
+  /// Only touched on the thread of the read callback.
+  Status client_status;
+  std::mutex mutex_;
+  /// At most one request may be outstanding; read_pending_ is only ever true
+  /// while request_pending_ is.
+  bool request_pending_ = false;
+  bool read_pending_ = false;
+  /// No application-initiated read may be started any more: the RPC was
+  /// cancelled, decoding failed, or the server closed the stream.
+  bool app_reads_done_ = false;
+  /// Set by ChunkForwarder when a message produced a chunk to deliver.
+  bool produced_chunk_ = false;
+  bool done_ = false;
+  /// Whether the hold taken before StartCall (AddHold) is still held; released
+  /// at most once, by MaybeReleaseHold().
+  bool hold_held_ = true;
+  /// The call's deadline, if it has one (FlightCallOptions::timeout), mirrored
+  /// from ClientRpc so that gRPC and the client's background thread agree.
+  bool has_deadline_ = false;
+  std::chrono::system_clock::time_point deadline_;
+  /// Deadline registered with the client's background thread, so an expired
+  /// deadline can release the hold without a read; 0 means not registered.
+  GrpcGarbageBin::DeadlineId deadline_id_ = 0;
+
+  // Destruct last
+  FinishedFlag finished;
+
+  explicit DoGetAsyncCall(const FlightCallOptions& options,
+                          std::shared_ptr<AsyncDoGetListener> listener,
+                          std::shared_ptr<GrpcGarbageBin> garbage_bin)
+      : rpc(options),
+        listener(std::move(listener)),
+        garbage_bin_(std::move(garbage_bin)),
+        decoder(std::make_unique<FlightMessageDecoder>(
+            std::make_shared<ChunkForwarder>(this), options.read_options)) {
+    // Mirror ClientRpc exactly, so the two agree on when the call expires; this
+    // instant is computed after gRPC's, so the hold is only ever dropped once
+    // gRPC's own deadline has already failed the call.
+    //
+    // timeout == 0 (or a millisecond or two) is the edge: PrepareCall() may
+    // register a deadline that is due immediately, so its action can run before
+    // StartCall() even happens.  That is fine - RequestNext() cannot be admitted
+    // before the RPC is published, so no read can be in flight then, and the
+    // guarded, once-only hold release cannot race a later one; gRPC then fails
+    // the call as soon as it starts and OnDone() reports the deadline.
+    if (options.timeout.count() >= 0) {
+      has_deadline_ = true;
+      deadline_ =
+          std::chrono::time_point_cast<std::chrono::system_clock::time_point::duration>(
+              std::chrono::system_clock::now() + options.timeout);
+    }
+  }
+
+  /// Set up what needs the RPC's gRPC reader to exist already: the generated
+  /// stub creates it, so this runs after that call and before StartCall().
+  ///
+  /// The hold keeps the callback stream alive for reads that application threads
+  /// start via RequestNext(): gRPC destroys the stream as soon as the call
+  /// completes, which can happen before OnDone() runs.  Taking it here, before
+  /// activation, is what the RFC requires of externally initiated reads.
+  void PrepareCall() {
+    AddHold();
+    if (has_deadline_) {
+      deadline_id_ =
+          garbage_bin_->RegisterDeadline(deadline_, [this]() { OnDeadline(); });
+    }
+  }
+
+  /// Runs on the client's background thread when the call's deadline expires.
+  /// gRPC has already failed the call; the only thing left is to drop the hold
+  /// so OnDone() is delivered at zero demand.  No TryCancel() and no
+  /// synthesized status: OnDone() reports the real one.
+  void OnDeadline() {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (done_ || app_reads_done_) {
+        return;
+      }
+      // No application-initiated read may start any more, which also stops the
+      // read-ahead pump in OnReadDone() from re-arming: no StartRead() can
+      // follow, so the hold may go even with a read still in flight.
+      app_reads_done_ = true;
+    }
+    MaybeReleaseHold(/*force=*/true);
+  }
+
+  /// Cancel the whole RPC.  No application-initiated read may be started after
+  /// this, so the hold can be dropped and OnDone() can be delivered even with
+  /// no read outstanding.
+  void TryCancel() override {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      app_reads_done_ = true;
+    }
+    MaybeReleaseHold();
+    rpc.context.TryCancel();
+  }
+
+  Status RequestNext() override {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (done_) {
+      return Status::Invalid("the DoGet RPC has already finished");
+    }
+    if (app_reads_done_) {
+      return Status::Invalid("the DoGet RPC was cancelled or the stream ended");
+    }
+    if (request_pending_) {
+      return Status::Invalid("a read request is already pending");
+    }
+    request_pending_ = true;
+    read_pending_ = true;
+    // Started under the lock: dropping the hold can destroy gRPC's reader, and
+    // MaybeReleaseHold() only drops it under this same lock, so the reader is
+    // still there.  gRPC never delivers a read completion inline, so holding the
+    // lock across the arm cannot deadlock.
+    StartRead(reinterpret_cast<pb::FlightData*>(&flight_data));
+    return Status::OK();
+  }
+
+  void OnReadDone(bool ok) override {
+    if (!ok) {
+      // The server closed the stream.  The pending request (if any) stays
+      // unsatisfied and the terminal status arrives in OnDone().
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        app_reads_done_ = true;
+        read_pending_ = false;
+      }
+      MaybeReleaseHold();
+      return;
+    }
+
+    produced_chunk_ = false;
+    // Decode with the existing push decoder; it calls back into our forwarder,
+    // which delivers the chunk (if any) to the user listener.
+    auto status = decoder->Consume(std::move(flight_data));
+    if (!status.ok()) {
+      // Report the failure through OnDone() rather than here, so that OnFinish()
+      // stays the single terminal notification; cancel so that OnDone() follows.
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        app_reads_done_ = true;
+        // This read is done and no further one will start, so the hold may be
+        // dropped: leaving read_pending_ set here would keep gRPC from ever
+        // delivering OnDone().
+        read_pending_ = false;
+        if (client_status.ok()) {
+          client_status = std::move(status);
+        }
+      }
+      rpc.context.TryCancel();
+      MaybeReleaseHold();
+      return;
+    }
+    if (produced_chunk_) {
+      // The chunk satisfied the pending request (a reentrant RequestNext() from
+      // the user callback may already have armed the next read); do not read
+      // ahead.
+      MaybeReleaseHold();
+      return;
+    }
+    // Nothing was delivered (schema or dictionary message): keep reading for the
+    // pending request.  This is the one-message read-ahead.  As in RequestNext(),
+    // the arm is under the lock that MaybeReleaseHold() drops the hold under.
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (request_pending_ && !app_reads_done_) {
+        read_pending_ = true;
+        StartRead(reinterpret_cast<pb::FlightData*>(&flight_data));
+      } else {
+        read_pending_ = false;
+      }
+    }
+    MaybeReleaseHold();
+  }
+
+  /// Drop the hold taken by PrepareCall() once it cannot protect anything any
+  /// more: no application-initiated read may start (app_reads_done_) and none is
+  /// in flight.  Until then gRPC withholds OnDone(), so this is what eventually
+  /// lets the call complete.
+  ///
+  /// `force` is for the deadline path, the one terminal outcome that arrives
+  /// while a read may still be outstanding (the server can hold a requested
+  /// read open forever): app_reads_done_ was set first, which rejects
+  /// RequestNext() and stops the read-ahead pump from re-arming, so the hold is
+  /// no longer covering anything.
+  void MaybeReleaseHold(bool force = false) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!hold_held_ || (!force && read_pending_) || !app_reads_done_) {
+      return;
+    }
+    hold_held_ = false;
+    // Dropped under the lock: this can destroy gRPC's reader (gRPC does that
+    // inside RemoveHold when this is its last outstanding operation), and no
+    // application thread may be arming a read at that moment - RequestNext()
+    // and the pump arm under this same lock.  RemoveHold() never invokes a
+    // callback inline: OnDone is posted to an event engine thread.
+    RemoveHold();
+  }
+
+  void OnDone(const ::grpc::Status& status) override {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      done_ = true;
+    }
+    Finish(status);
+  }
+
+  void Finish(const ::grpc::Status& status) {
+    // Before the object can go away: the deadline action holds a raw this and
+    // must not be able to start once the call has finished.  done_ is already
+    // set above, so an action that is running right now is a no-op.
+    if (deadline_id_ != 0) {
+      const auto id = deadline_id_;
+      deadline_id_ = 0;
+      garbage_bin_->UnregisterDeadline(id);
+    }
+    FinishAsyncCall(std::move(listener), status, std::move(client_status), &rpc,
+                    garbage_bin_.get(), &finished);
+  }
+};
+
+// The call is published only after these checks pass, so a failure here
+// leaves a call that was never started: mark it finished, or its destructor
+// (which waits for the RPC) would block forever.
+#  define LISTENER_NOT_OK(CALL, LISTENER, EXPR)           \
     if (auto arrow_status = (EXPR); !arrow_status.ok()) { \
       (LISTENER)->OnFinish(std::move(arrow_status));      \
+      (CALL)->finished.Finish();                          \
       return;                                             \
     }
 #endif
@@ -1039,11 +1452,30 @@ class GrpcClientImpl : public internal::ClientTransport {
     using AsyncCall =
         UnaryUnaryAsyncCall<FlightInfo, pb::FlightDescriptor, pb::FlightInfo>;
     auto call = std::make_unique<AsyncCall>(options, listener, garbage_bin_);
-    LISTENER_NOT_OK(listener, internal::ToProto(descriptor, &call->pb_request));
-    LISTENER_NOT_OK(listener, call->rpc.SetToken(auth_handler_.get()));
+    LISTENER_NOT_OK(call.get(), listener,
+                    internal::ToProto(descriptor, &call->pb_request));
+    LISTENER_NOT_OK(call.get(), listener, call->rpc.SetToken(auth_handler_.get()));
 
     stub_->experimental_async()->GetFlightInfo(&call->rpc.context, &call->pb_request,
                                                &call->pb_response, call.get());
+    ClientTransport::SetAsyncRpc(listener.get(), std::move(call));
+    arrow::internal::checked_cast<AsyncCall*>(
+        ClientTransport::GetAsyncRpc(listener.get()))
+        ->StartCall();
+  }
+
+  void DoGetAsync(const FlightCallOptions& options, const Ticket& ticket,
+                  std::shared_ptr<AsyncDoGetListener> listener) override {
+    using AsyncCall = DoGetAsyncCall;
+    auto call = std::make_unique<AsyncCall>(options, listener, garbage_bin_);
+    LISTENER_NOT_OK(call.get(), listener, internal::ToProto(ticket, &call->pb_request));
+    LISTENER_NOT_OK(call.get(), listener, call->rpc.SetToken(auth_handler_.get()));
+
+    stub_->experimental_async()->DoGet(&call->rpc.context, &call->pb_request, call.get());
+    // The generated stub has created the gRPC reader by now; take the hold that
+    // keeps the callback stream alive for application-thread reads, and register
+    // the deadline (see DoGetAsyncCall::Begin).
+    call->PrepareCall();
     ClientTransport::SetAsyncRpc(listener.get(), std::move(call));
     arrow::internal::checked_cast<AsyncCall*>(
         ClientTransport::GetAsyncRpc(listener.get()))

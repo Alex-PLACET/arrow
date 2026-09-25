@@ -127,6 +127,22 @@ if(ARROW_FLIGHT)
                     "${CMAKE_CURRENT_BINARY_DIR}/helloworld.pb.cc"
                     "${CMAKE_CURRENT_BINARY_DIR}/helloworld.grpc.pb.cc")
 
+  # Does not use the helloworld proto, so no proto generation is needed.
+  add_arrow_example(flight_async_generic_server_example
+                    EXTRA_LINK_LIBS
+                    ${FLIGHT_EXAMPLES_LINK_LIBS}
+                    gRPC::grpc++
+                    ${ARROW_PROTOBUF_LIBPROTOBUF}
+                    ${GFLAGS_LIBRARIES})
+
+  # Does not use the helloworld proto, so no proto generation is needed.
+  add_arrow_example(flight_async_generic_threads_example
+                    EXTRA_LINK_LIBS
+                    ${FLIGHT_EXAMPLES_LINK_LIBS}
+                    gRPC::grpc++
+                    ${ARROW_PROTOBUF_LIBPROTOBUF}
+                    ${GFLAGS_LIBRARIES})
+
   if(ARROW_FLIGHT_SQL)
     if(ARROW_BUILD_SHARED AND ARROW_GRPC_USE_SHARED)
       set(FLIGHT_SQL_EXAMPLES_LINK_LIBS arrow_flight_sql_shared)

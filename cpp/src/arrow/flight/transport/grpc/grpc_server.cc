@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "arrow/flight/transport/grpc/async_grpc_service.h"
 #include "arrow/flight/transport/grpc/customize_grpc.h"
 
 #include <grpcpp/grpcpp.h>
@@ -438,14 +439,61 @@ class GrpcServerTransport : public internal::ServerTransport {
   }
 
   Status Init(const FlightServerOptions& options, const arrow::util::Uri& uri) override {
-    grpc_service_.reset(
-        new GrpcServiceHandler(options.auth_handler, options.middleware, this));
+    if (options.use_async_grpc) {
+      // The generic callback service runs middleware (through the shared helper)
+      // but cannot run the blocking ServerAuthHandler: it is driven from
+      // callback threads.  Refuse it rather than silently serving
+      // unauthenticated requests.
+      if (options.auth_handler) {
+        return Status::NotImplemented(
+            "FlightServerOptions::use_async_grpc does not support a blocking "
+            "auth handler; derive from AsyncGenericFlightServerBase and "
+            "override Handshake/ValidateToken instead");
+      }
+      // The async hooks come from the server class when it is used; a plain
+      // FlightServerBase + use_async_grpc server simply has none.  The cast
+      // pointer stays valid for the server's lifetime: it IS the user's server
+      // object.
+      auto* async_base = dynamic_cast<AsyncGenericFlightServerBase*>(base());
+      using AsyncHelper = GrpcServerCallContextHelper<::grpc::CallbackServerContext>;
+      AsyncHelper::HandshakeFn handshake;
+      AsyncHelper::ValidateTokenFn validate_token;
+      if (async_base) {
+        handshake = [async_base](const ServerCallContext& context,
+                                 const std::string& request, std::string* response) {
+          return async_base->Handshake(context, request, response);
+        };
+        validate_token = [async_base](const ServerCallContext& context,
+                                      const std::string& token,
+                                      std::string* peer_identity) {
+          return async_base->ValidateToken(context, token, peer_identity);
+        };
+      }
+      async_helper_ = std::make_shared<AsyncHelper>(
+          /*auth_handler=*/nullptr, options.middleware, std::move(validate_token));
+      async_service_ = std::make_unique<AsyncGenericFlightService>(
+          base(), options.listener_factory, async_helper_, std::move(handshake));
+    } else {
+      grpc_service_.reset(
+          new GrpcServiceHandler(options.auth_handler, options.middleware, this));
+    }
 
     ::grpc::ServerBuilder builder;
     int port = 0;
     RETURN_NOT_OK(AddServerListeningPort(options, uri, &builder, &location_, &port));
 
-    builder.RegisterService(grpc_service_.get());
+    if (options.use_async_grpc) {
+      // Registering the typed service alongside would NOT work: a method it
+      // claims (DoGet/DoPut) never reaches the generic handler, so the server
+      // would silently keep serving them synchronously. The generic service
+      // must REPLACE it. With no typed service registered, gRPC still routes
+      // unclaimed methods to it (it installs its own UNIMPLEMENTED fallback
+      // only when no generic service is registered at all), so every other
+      // RPC answers UNIMPLEMENTED through our fallback reactor.
+      builder.RegisterCallbackGenericService(async_service_.get());
+    } else {
+      builder.RegisterService(grpc_service_.get());
+    }
     ConfigureServerBuilderOptions(options, &builder);
 
     grpc_server_ = builder.BuildAndStart();
@@ -470,6 +518,14 @@ class GrpcServerTransport : public internal::ServerTransport {
 
  private:
   std::unique_ptr<GrpcServiceHandler> grpc_service_;
+  // Set when FlightServerOptions::use_async_grpc is on; shared with the service
+  // (and, from task T11 on, with the per-call auth hook). Declared before
+  // async_service_ so it outlives it.
+  std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>>
+      async_helper_;
+  // Set when FlightServerOptions::use_async_grpc is on. Declared before
+  // grpc_server_ so it outlives it (the server holds a pointer to it).
+  std::unique_ptr<AsyncGenericFlightService> async_service_;
   std::unique_ptr<::grpc::Server> grpc_server_;
   Location location_;
 };

@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/flight/flight_data_decoder.h"
 #include "arrow/flight/server_auth.h"
 #include "arrow/flight/type_fwd.h"
 #include "arrow/flight/types.h"       // IWYU pragma: keep
@@ -169,6 +170,17 @@ class ARROW_FLIGHT_EXPORT FlightServerOptions {
   /// \brief An optional memory manager to control where to allocate incoming data.
   std::shared_ptr<MemoryManager> memory_manager;
 
+  /// \brief Use the asynchronous generic callback service for the gRPC
+  /// transport (default false).
+  ///
+  /// Middleware runs on this path.  The blocking `auth_handler` is refused:
+  /// derive from AsyncGenericFlightServerBase to serve Handshake and validate
+  /// per-call tokens, or leave the server with no authentication mechanism
+  /// (Handshake then answers UNIMPLEMENTED).
+  bool use_async_grpc = false;
+
+  FlightDataListenerFactory listener_factory;
+
   /// \brief A Flight implementation-specific callback to customize
   /// transport-specific options.
   ///
@@ -192,7 +204,7 @@ class ARROW_FLIGHT_EXPORT FlightServerBase {
   /// \brief Initialize a Flight server listening at the given location.
   /// This method must be called before any other method.
   /// \param[in] options The configuration for this server.
-  Status Init(const FlightServerOptions& options);
+  virtual Status Init(const FlightServerOptions& options);
 
   /// \brief Get the port that the Flight server is listening on.
   /// This method must only be called after Init().  Will return a
@@ -321,6 +333,55 @@ class ARROW_FLIGHT_EXPORT FlightServerBase {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+};
+
+/// \brief EXPERIMENTAL: a Flight server served by gRPC's async generic
+/// callback service.
+///
+/// Subclass this instead of FlightServerBase to get the async transport: Init()
+/// sets FlightServerOptions::use_async_grpc for you, and servers that
+/// authenticate clients override Handshake() and ValidateToken().  The
+/// synchronous RPC handlers (DoGet/DoPut/...) are inherited from
+/// FlightServerBase and are called from gRPC callback threads: do not block
+/// them.
+///
+/// FlightServerOptions::use_async_grpc remains the switch for servers that
+/// cannot change their base class; this class is the async-facing surface, and
+/// the place async handler APIs will grow.
+class ARROW_FLIGHT_EXPORT AsyncGenericFlightServerBase : public FlightServerBase {
+ public:
+  AsyncGenericFlightServerBase();
+  ~AsyncGenericFlightServerBase() override;
+
+  /// \brief Initialize the server on the async generic gRPC transport.
+  ///
+  /// Forces FlightServerOptions::use_async_grpc, then behaves exactly like
+  /// FlightServerBase::Init().  A blocking FlightServerOptions::auth_handler is
+  /// still refused.
+  Status Init(const FlightServerOptions& options) override;
+
+  /// \brief Handle the handshake protocol with the client.
+  ///
+  /// `request` is the client's handshake message; write the response into
+  /// `*response` and the transport sends it as the reply.  Return a non-OK
+  /// status to fail the RPC (FlightStatusCode::Unauthenticated rejects the
+  /// client).  Runs inline on a gRPC callback thread: do not block.  The
+  /// default answers UNIMPLEMENTED, like a server with no authentication
+  /// mechanism.
+  virtual Status Handshake(const ServerCallContext& context, const std::string& request,
+                           std::string* response);
+
+  /// \brief Validate the token sent in the `auth-token-bin` header of RPCs
+  /// issued after a successful Handshake().
+  ///
+  /// Runs inline on the RPC dispatch path for every method except Handshake, so
+  /// it must be cheap and non-blocking (same contract as
+  /// ServerMiddlewareFactory::StartCall).  On success, set `peer_identity` to
+  /// the authenticated identity.  The default keeps the transport-level (TLS)
+  /// identity and ignores the token, exactly like a server with no auth
+  /// handler; override it together with Handshake() to require a token.
+  virtual Status ValidateToken(const ServerCallContext& context, const std::string& token,
+                               std::string* peer_identity);
 };
 
 }  // namespace flight

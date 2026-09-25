@@ -17,9 +17,17 @@
 
 #include "arrow/flight/test_definitions.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <fstream>
+#include <functional>
+#include <iostream>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
 #include "arrow/array/array_base.h"
@@ -1924,6 +1932,879 @@ void AsyncClientTest::TestListenerLifetime() {
   }
 
   ASSERT_FINISHES_OK(future);
+}
+
+//------------------------------------------------------------
+// Async DoGet (demand-driven client streaming)
+
+namespace {
+
+/// Records the callbacks of one async DoGet and lets the test thread wait for
+/// them with a hard timeout, so a stuck reactor fails the test instead of
+/// hanging the suite.  `events` is the callback sequence: 'S'chema, 'N'ext,
+/// 'F'inish.
+class RecordDoGetListener : public AsyncDoGetListener {
+ public:
+  void OnSchema(std::shared_ptr<Schema> schema) override {
+    std::lock_guard<std::mutex> guard(mutex_);
+    EXPECT_FALSE(finished_) << "no callback may follow OnFinish";
+    schemas_.push_back(std::move(schema));
+    events_ += 'S';
+    cv_.notify_all();
+  }
+
+  void OnNext(FlightStreamChunk chunk) override {
+    std::lock_guard<std::mutex> guard(mutex_);
+    EXPECT_FALSE(finished_) << "no callback may follow OnFinish";
+    chunks_.push_back(std::move(chunk));
+    events_ += 'N';
+    cv_.notify_all();
+  }
+
+  void OnFinish(Status status) override {
+    std::lock_guard<std::mutex> guard(mutex_);
+    EXPECT_FALSE(finished_) << "OnFinish is called exactly once";
+    finished_ = true;
+    status_ = std::move(status);
+    events_ += 'F';
+    cv_.notify_all();
+  }
+
+  /// Wait until `count` chunks arrived or the RPC finished; false on timeout.
+  bool WaitForChunks(size_t count) {
+    std::unique_lock<std::mutex> guard(mutex_);
+    return cv_.wait_for(guard, std::chrono::seconds(10),
+                        [&] { return chunks_.size() >= count || finished_; });
+  }
+
+  /// Wait until chunk `index` arrived.  Unlike WaitForChunks(), a terminal
+  /// status first is a failure, not a pass: chunk(index) would be out of range.
+  bool WaitForChunk(size_t index) {
+    std::unique_lock<std::mutex> guard(mutex_);
+    cv_.wait_for(guard, std::chrono::seconds(10),
+                 [&] { return chunks_.size() > index || finished_; });
+    return chunks_.size() > index;
+  }
+
+  bool WaitForFinish() {
+    std::unique_lock<std::mutex> guard(mutex_);
+    return cv_.wait_for(guard, std::chrono::seconds(10), [&] { return finished_; });
+  }
+
+  FlightStreamChunk chunk(size_t i) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return chunks_[i];
+  }
+  size_t num_chunks() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return chunks_.size();
+  }
+  std::vector<std::shared_ptr<Schema>> schemas() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return schemas_;
+  }
+  std::string events() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return events_;
+  }
+  Status status() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return status_;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::vector<std::shared_ptr<Schema>> schemas_;
+  std::vector<FlightStreamChunk> chunks_;
+  std::string events_;
+  bool finished_ = false;
+  Status status_;
+};
+
+}  // namespace
+
+namespace {
+
+/// An in-process TestFlightServer and a client connected to it.  Construction
+/// never fails a test: `status` carries the setup result, and both are closed on
+/// destruction.  The default TestFlightServer serves the ticket-ints/dicts
+/// tickets.
+struct AsyncTestHarness {
+  std::unique_ptr<FlightServerBase> server;
+  std::unique_ptr<FlightClient> client;
+  Status status;
+
+  AsyncTestHarness() { status = Start(); }
+
+  ~AsyncTestHarness() {
+    if (client != nullptr) {
+      ARROW_WARN_NOT_OK(client->Close(), "Close()");
+    }
+    if (server != nullptr) {
+      ARROW_WARN_NOT_OK(server->Shutdown(), "Shutdown()");
+    }
+  }
+
+  /// False when this gRPC build has no callback API; the test then skips.
+  bool supports_async() const { return client != nullptr && client->supports_async(); }
+
+ private:
+  Status Start() {
+    ARROW_ASSIGN_OR_RAISE(auto location, Location::ForScheme("grpc", "127.0.0.1", 0));
+    server = TestFlightServer::Make();
+    FlightServerOptions server_options(location);
+    RETURN_NOT_OK(server->Init(server_options));
+    ARROW_ASSIGN_OR_RAISE(auto client_location,
+                          Location::ForScheme("grpc", "127.0.0.1", server->port()));
+    ARROW_ASSIGN_OR_RAISE(client, FlightClient::Connect(client_location));
+    return Status::OK();
+  }
+};
+
+/// The fixture every async DoGet test uses: one in-process server/client pair,
+/// and a skip when this gRPC build has no callback API.
+class GrpcAsyncDoGet : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    ASSERT_OK(harness.status);
+    if (!harness.supports_async()) {
+      GTEST_SKIP() << "gRPC was built without the callback API";
+    }
+  }
+
+  AsyncTestHarness harness;
+};
+
+}  // namespace
+
+TEST_F(GrpcAsyncDoGet, SmokeTest) {
+  // One demand-driven DoGet end to end: schema first, one chunk per
+  // RequestNext(), then EOS discovered by a request that yields nothing.
+  RecordBatchVector expected_batches;
+  ASSERT_OK(ExampleIntBatches(&expected_batches));
+  const size_t num_batches = expected_batches.size();
+
+  auto listener = std::make_shared<RecordDoGetListener>();
+  harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
+
+  // Zero demand: the call starts without reading anything.
+  ASSERT_EQ("", listener->events());
+
+  for (size_t i = 0; i < num_batches; ++i) {
+    ASSERT_OK(listener->RequestNext());
+    ASSERT_TRUE(listener->WaitForChunk(i))
+        << "chunk " << i << " missing: " << listener->status().ToString();
+    auto chunk = listener->chunk(i);
+    ASSERT_NE(nullptr, chunk.data) << "chunk " << i << " carries no data";
+    ASSERT_BATCHES_EQUAL(*expected_batches[i], *chunk.data);
+  }
+
+  // Each request was satisfied by exactly one chunk: none arrived unrequested.
+  ASSERT_EQ(num_batches, listener->num_chunks());
+
+  // EOS is not a chunk, and the reactor does not deliver it unsolicited (see
+  // the transport's hold): the request that finds no more data is ended by the
+  // terminal status, which is what this wait observes.  A rejection is equally
+  // acceptable if the RPC has already finished; either way exactly one
+  // OnFinish() arrives.
+  auto next_status = listener->RequestNext();
+  ASSERT_TRUE(next_status.ok() || next_status.IsInvalid()) << next_status.ToString();
+  ASSERT_TRUE(listener->WaitForFinish()) << "timed out waiting for OnFinish";
+  ASSERT_OK(listener->status());
+  ASSERT_EQ(num_batches, listener->num_chunks());
+
+  // One schema before the first chunk, then one terminal callback, last of all.
+  const std::string expected_events = "S" + std::string(num_batches, 'N') + "F";
+  ASSERT_EQ(expected_events, listener->events());
+  ASSERT_EQ(1, static_cast<int>(listener->schemas().size()));
+  ASSERT_TRUE(listener->schemas()[0]->Equals(*ExampleIntSchema()));
+
+  // A request after the RPC finished is rejected, not delivered again.
+  ASSERT_RAISES(Invalid, listener->RequestNext());
+
+  // And nothing follows the terminal callback.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ASSERT_EQ(num_batches, listener->num_chunks());
+  ASSERT_EQ(expected_events, listener->events());
+}
+
+//------------------------------------------------------------
+// Async DoGet contract (RFC section 3.5)
+
+namespace {
+
+/// Generous per-wait timeout: a stuck reactor must fail its test, not hang the
+/// suite.
+constexpr auto kAsyncTimeout = std::chrono::seconds(10);
+
+/// The "Threads:" field of this process's /proc/self/status, or -1 where /proc
+/// is unavailable (the thread count is then not asserted).
+int ReadThreadCount() {
+#ifdef __linux__
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    if (line.rfind("Threads:", 0) == 0) {
+      return std::atoi(line.c_str() + 8);  // strlen("Threads:")
+    }
+  }
+#endif
+  return -1;
+}
+
+/// Terminal notification for the listener-pinning test.  The test owns this
+/// object, because the listener itself may be destroyed as soon as its
+/// OnFinish() returns: observing completion through the listener would be a
+/// use-after-free.
+struct FinishSignal {
+  std::mutex mutex;
+  std::condition_variable cv;
+  size_t schemas = 0;
+  size_t chunks = 0;
+  bool done = false;
+  Status status;
+
+  bool WaitForFinish() {
+    std::unique_lock<std::mutex> lock(mutex);
+    return cv.wait_for(lock, kAsyncTimeout, [&] { return done; });
+  }
+};
+
+/// Drops the application's only reference to itself inside OnFinish(): the rest
+/// of that callback runs on the transport's pin alone.
+class PinningDoGetListener : public AsyncDoGetListener {
+ public:
+  explicit PinningDoGetListener(std::shared_ptr<FinishSignal> signal)
+      : signal_(std::move(signal)) {}
+
+  void OnSchema(std::shared_ptr<Schema> schema) override {
+    std::lock_guard<std::mutex> guard(signal_->mutex);
+    signal_->schemas++;
+  }
+
+  void OnNext(FlightStreamChunk chunk) override {
+    std::lock_guard<std::mutex> guard(signal_->mutex);
+    signal_->chunks++;
+  }
+
+  void OnFinish(Status status) override {
+    if (release_app_reference) release_app_reference();
+    // Everything below touches listener state after the application dropped its
+    // last reference.
+    std::lock_guard<std::mutex> guard(signal_->mutex);
+    signal_->status = std::move(status);
+    signal_->done = true;
+    signal_->cv.notify_all();
+  }
+
+  /// Set by the test to reset its shared_ptr to this listener.
+  std::function<void()> release_app_reference;
+
+ private:
+  std::shared_ptr<FinishSignal> signal_;
+};
+
+/// Shared state for ConcurrentReadsSingleAppThread: every read reports into it,
+/// and one application thread watches all of them through a single condition
+/// variable.
+struct MultiReadState {
+  explicit MultiReadState(size_t num_reads)
+      : chunks(num_reads),
+        schemas(num_reads),
+        finishes(num_reads),
+        finished(num_reads, false),
+        request_outstanding(num_reads, false),
+        statuses(num_reads) {}
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::vector<size_t> chunks;
+  std::vector<size_t> schemas;
+  std::vector<size_t> finishes;
+  std::vector<bool> finished;
+  std::vector<bool> request_outstanding;
+  std::vector<Status> statuses;
+  size_t num_finished = 0;
+  /// Set by any callback of any read: the application thread then services them.
+  bool progress = false;
+};
+
+class MultiReadListener : public AsyncDoGetListener {
+ public:
+  MultiReadListener(std::shared_ptr<MultiReadState> state, size_t index)
+      : state_(std::move(state)), index_(index) {}
+
+  void OnSchema(std::shared_ptr<Schema> schema) override {
+    std::lock_guard<std::mutex> guard(state_->mutex);
+    state_->schemas[index_]++;
+    state_->progress = true;
+    state_->cv.notify_all();
+  }
+
+  void OnNext(FlightStreamChunk chunk) override {
+    std::lock_guard<std::mutex> guard(state_->mutex);
+    state_->chunks[index_]++;
+    state_->request_outstanding[index_] = false;
+    state_->progress = true;
+    state_->cv.notify_all();
+  }
+
+  void OnFinish(Status status) override {
+    std::lock_guard<std::mutex> guard(state_->mutex);
+    state_->finishes[index_]++;
+    state_->finished[index_] = true;
+    state_->request_outstanding[index_] = false;
+    state_->statuses[index_] = std::move(status);
+    state_->num_finished++;
+    state_->progress = true;
+    state_->cv.notify_all();
+  }
+
+ private:
+  std::shared_ptr<MultiReadState> state_;
+  size_t index_;
+};
+
+}  // namespace
+
+TEST_F(GrpcAsyncDoGet, OverlappingRequestRejected) {
+  // RFC 3.2/3.5: an overlapping request is rejected without replacing,
+  // cancelling or queueing behind the first one, and the rejection must not
+  // suppress the final status.
+  RecordBatchVector expected_batches;
+  ASSERT_OK(ExampleIntBatches(&expected_batches));
+  const size_t num_batches = expected_batches.size();
+
+  auto listener = std::make_shared<RecordDoGetListener>();
+  harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
+
+  ASSERT_OK(listener->RequestNext());
+  // Nothing can have been delivered yet: satisfying that request needs a round
+  // trip to the server.
+  ASSERT_EQ(0, static_cast<int>(listener->num_chunks()));
+  ASSERT_RAISES(Invalid, listener->RequestNext()) << "the overlap must be rejected";
+
+  // The rejected request did not disturb the accepted one: exactly one chunk
+  // arrives for it.
+  ASSERT_TRUE(listener->WaitForChunk(0))
+      << "chunk 0 missing: " << listener->status().ToString();
+  ASSERT_BATCHES_EQUAL(*expected_batches[0], *listener->chunk(0).data);
+  ASSERT_EQ(1, static_cast<int>(listener->num_chunks())) << "one request, one chunk";
+
+  // The stream then continues normally.
+  for (size_t i = 1; i < num_batches; ++i) {
+    ASSERT_OK(listener->RequestNext());
+    ASSERT_TRUE(listener->WaitForChunk(i))
+        << "chunk " << i << " missing: " << listener->status().ToString();
+    ASSERT_BATCHES_EQUAL(*expected_batches[i], *listener->chunk(i).data);
+  }
+  ASSERT_EQ(num_batches, listener->num_chunks());
+
+  auto next_status = listener->RequestNext();
+  ASSERT_TRUE(next_status.ok() || next_status.IsInvalid()) << next_status.ToString();
+  ASSERT_TRUE(listener->WaitForFinish()) << "timed out waiting for OnFinish";
+  ASSERT_OK(listener->status());
+
+  // One schema, one chunk per request, one terminal callback - the rejected
+  // overlap replaced neither the pending request nor the final status.
+  const std::string expected_events = "S" + std::string(num_batches, 'N') + "F";
+  ASSERT_EQ(expected_events, listener->events());
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ASSERT_EQ(expected_events, listener->events());
+}
+
+TEST_F(GrpcAsyncDoGet, RequestNextConcurrentlyFromTwoThreads) {
+  // RFC 3.2/3.4: at most one request may be outstanding, so two threads racing
+  // on an idle listener must not both be admitted; the admitted one is
+  // satisfied by exactly one chunk.
+  RecordBatchVector expected_batches;
+  ASSERT_OK(ExampleIntBatches(&expected_batches));
+
+  auto listener = std::make_shared<RecordDoGetListener>();
+  harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
+
+  std::atomic<int> ready{0};
+  std::atomic<bool> go{false};
+  Status results[2];
+  auto request = [&](int index) {
+    ready.fetch_add(1);
+    while (!go.load()) {
+      std::this_thread::yield();
+    }
+    results[index] = listener->RequestNext();
+  };
+  std::thread first(request, 0);
+  std::thread second(request, 1);
+  while (ready.load() < 2) {
+    std::this_thread::yield();
+  }
+  go.store(true);
+  first.join();
+  second.join();
+
+  const int num_accepted = (results[0].ok() ? 1 : 0) + (results[1].ok() ? 1 : 0);
+  ASSERT_EQ(1, num_accepted) << results[0].ToString() << " / " << results[1].ToString();
+  const Status& rejected = results[0].ok() ? results[1] : results[0];
+  ASSERT_TRUE(rejected.IsInvalid()) << rejected.ToString();
+
+  // The admitted request is satisfied by exactly one chunk.
+  ASSERT_TRUE(listener->WaitForChunk(0))
+      << "chunk 0 missing: " << listener->status().ToString();
+  ASSERT_BATCHES_EQUAL(*expected_batches[0], *listener->chunk(0).data);
+  ASSERT_EQ(1, static_cast<int>(listener->num_chunks()));
+
+  listener->TryCancel();
+  ASSERT_TRUE(listener->WaitForFinish());
+}
+
+TEST_F(GrpcAsyncDoGet, MetadataOnlyChunkIsAValue) {
+  // RFC 3.2/3.5.1: a metadata-only chunk is a value, not EOS, and it satisfies a
+  // request just like a batch-bearing one.
+  //
+  // NOT COVERED AT THE TRANSPORT LEVEL HERE: the shared test server serves every
+  // ticket as a RecordBatchStream over a RecordBatchReader
+  // (test_flight_server.cc, TestFlightServer::DoGet), so it cannot put a message
+  // with app_metadata and no IPC metadata on the wire, and a server-side payload
+  // with no IPC metadata ends the stream instead.  The clause is covered at the
+  // level where that shape can be produced: the decoder, see
+  // TEST(FlightMessageDecoder, MetadataOnlyChunkIsAValue) in
+  // flight_internals_test.cc.
+  GTEST_SKIP() << "the shared test server cannot produce this stream shape";
+}
+
+TEST_F(GrpcAsyncDoGet, SchemaOnlyStream) {
+  // RFC 3.2/3.3: OnSchema() leaves the read pending, and a schema-only stream
+  // ends with OnFinish(OK): no fabricated empty batch, no unsolicited chunk.
+  //
+  // NOT COVERED AT THE TRANSPORT LEVEL HERE: the shared test server serves every
+  // ticket as a RecordBatchStream over a RecordBatchReader
+  // (test_flight_server.cc, TestFlightServer::DoGet): it has no stream with a
+  // schema and no batches (an empty stream is an error: see the ARROW-5095
+  // tickets).  The schema-only decode path is covered by
+  // TEST(FlightMessageDecoder, SchemaOnlyStream) in flight_internals_test.cc;
+  // the pending-request-across-OnSchema and terminal-OK halves are not covered
+  // at any level.
+  GTEST_SKIP() << "the shared test server cannot produce this stream shape";
+}
+TEST_F(GrpcAsyncDoGet, DictionaryStream) {
+  // RFC 3.5.1: a dictionary-encoded stream delivers its record batches as
+  // chunks; the dictionary messages in between are read through and are not
+  // user-visible chunks (see flight_data_decoder.cc).
+  RecordBatchVector expected_batches;
+  ASSERT_OK(ExampleDictBatches(&expected_batches));
+  const size_t num_batches = expected_batches.size();
+
+  auto listener = std::make_shared<RecordDoGetListener>();
+  harness.client->DoGetAsync(Ticket{"ticket-dicts-1"}, listener);
+  for (size_t i = 0; i < num_batches; ++i) {
+    ASSERT_OK(listener->RequestNext());
+    ASSERT_TRUE(listener->WaitForChunk(i))
+        << "chunk " << i << " missing: " << listener->status().ToString();
+    auto chunk = listener->chunk(i);
+    ASSERT_NE(nullptr, chunk.data) << "chunk " << i << " is not a record batch";
+    ASSERT_BATCHES_EQUAL(*expected_batches[i], *chunk.data);
+    // This server sends no app_metadata; a chunk here is always a batch.
+    ASSERT_EQ(nullptr, chunk.app_metadata);
+  }
+  // One chunk per batch: the dictionary messages were not delivered.
+  ASSERT_EQ(num_batches, listener->num_chunks());
+
+  auto next_status = listener->RequestNext();
+  ASSERT_TRUE(next_status.ok() || next_status.IsInvalid()) << next_status.ToString();
+  ASSERT_TRUE(listener->WaitForFinish());
+  ASSERT_OK(listener->status());
+  ASSERT_EQ("S" + std::string(num_batches, 'N') + "F", listener->events());
+  ASSERT_EQ(1, static_cast<int>(listener->schemas().size()));
+}
+
+TEST_F(GrpcAsyncDoGet, CancelAtZeroDemand) {
+  // RFC 3.3/3.5.3: TryCancel() is whole-call and must reach the terminal
+  // notification without another read request or server message, even with no
+  // read pending.
+  auto listener = std::make_shared<RecordDoGetListener>();
+  harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
+  ASSERT_EQ("", listener->events()) << "zero demand must produce no callback";
+
+  listener->TryCancel();
+
+  ASSERT_TRUE(listener->WaitForFinish())
+      << "cancel at zero demand must terminate the call without a request";
+  ASSERT_TRUE(listener->status().IsCancelled()) << listener->status().ToString();
+  // Cancellation is classified through the public status, not by the message.
+  const std::shared_ptr<FlightStatusDetail> detail =
+      FlightStatusDetail::UnwrapStatus(listener->status());
+  ASSERT_NE(nullptr, detail) << listener->status().ToString();
+  ASSERT_EQ(FlightStatusCode::Cancelled, detail->code());
+  ASSERT_EQ(0, static_cast<int>(listener->num_chunks()));
+  ASSERT_EQ("F", listener->events()) << "one terminal callback and nothing else";
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ASSERT_EQ("F", listener->events()) << "exactly one OnFinish";
+}
+
+TEST_F(GrpcAsyncDoGet, CancelWithPendingRead) {
+  // RFC 3.3/3.5.3: cancellation with an idle pending read also terminates
+  // without another request.  Whether that read was already satisfied is a
+  // race, so at most one chunk may arrive before the terminal status.
+  auto listener = std::make_shared<RecordDoGetListener>();
+  harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
+  ASSERT_OK(listener->RequestNext());
+  listener->TryCancel();
+
+  ASSERT_TRUE(listener->WaitForFinish())
+      << "cancel with a pending read must terminate the call without a request";
+  ASSERT_TRUE(listener->status().IsCancelled()) << listener->status().ToString();
+
+  const std::string events = listener->events();
+  ASSERT_FALSE(events.empty());
+  ASSERT_EQ('F', events.back()) << "the terminal callback comes last";
+  ASSERT_EQ(1, static_cast<int>(std::count(events.begin(), events.end(), 'F')));
+  ASSERT_LE(static_cast<int>(std::count(events.begin(), events.end(), 'N')), 1)
+      << "at most the read that was in flight";
+  ASSERT_LE(static_cast<int>(listener->num_chunks()), 1);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ASSERT_EQ(events, listener->events()) << "nothing follows OnFinish";
+}
+
+// RFC 3.3/3.5.3: a whole-call deadline has the same no-demand progress
+// requirement as a cancel: the terminal deadline status must arrive without
+// another RequestNext().
+//
+// Mechanism: the reactor registers the deadline with the client's background
+// thread (GrpcGarbageBin, no thread of its own) using the same
+// time_point_cast expression as ClientRpc, and that entry - not a read, and not
+// OnDone, which gRPC withholds while the client hold is held - drops the hold
+// on expiry.  By then gRPC's own deadline has failed the call, so OnDone()
+// reports the real DEADLINE_EXCEEDED status: nothing is cancelled and no status
+// is synthesized.  This is the shape RFC lines 620-623 require (holds released
+// independently of hold-blocked OnDone).
+//
+// One nuance this harness cannot exercise: the shared test server answers a
+// requested read immediately, so by the time a 100 ms deadline expires no read
+// is outstanding (measured: OnDeadline sees read_pending == false here).  A
+// server that stalls a requested read past the deadline is what would exercise
+// the release-while-a-read-is-outstanding branch of MaybeReleaseHold(force).
+TEST_F(GrpcAsyncDoGet, DeadlineAtZeroDemand) {
+  FlightCallOptions options;
+  options.timeout = std::chrono::milliseconds(100);
+  auto listener = std::make_shared<RecordDoGetListener>();
+  harness.client->DoGetAsync(options, Ticket{"ticket-ints-1"}, listener);
+  ASSERT_EQ("", listener->events()) << "zero demand must produce no callback";
+
+  // No demand at all: the deadline alone must terminate the call.
+  ASSERT_TRUE(listener->WaitForFinish())
+      << "the deadline must be delivered without a read request";
+  ASSERT_FALSE(listener->status().ok());
+  const std::shared_ptr<FlightStatusDetail> detail =
+      FlightStatusDetail::UnwrapStatus(listener->status());
+  ASSERT_NE(nullptr, detail) << listener->status().ToString();
+  ASSERT_EQ(FlightStatusCode::TimedOut, detail->code());
+  ASSERT_EQ(0, static_cast<int>(listener->num_chunks()));
+  ASSERT_EQ("F", listener->events());
+}
+
+TEST_F(GrpcAsyncDoGet, DeadlineWithIdlePendingRead) {
+  FlightCallOptions options;
+  options.timeout = std::chrono::milliseconds(100);
+  auto listener = std::make_shared<RecordDoGetListener>();
+  harness.client->DoGetAsync(options, Ticket{"ticket-ints-1"}, listener);
+  ASSERT_OK(listener->RequestNext());
+
+  // The deadline terminates the call while the request is outstanding, without
+  // another request.  Whether the request was satisfied first is a race.
+  ASSERT_TRUE(listener->WaitForFinish())
+      << "the deadline must be delivered without another read request";
+  ASSERT_FALSE(listener->status().ok());
+  const std::shared_ptr<FlightStatusDetail> detail =
+      FlightStatusDetail::UnwrapStatus(listener->status());
+  ASSERT_NE(nullptr, detail) << listener->status().ToString();
+  ASSERT_EQ(FlightStatusCode::TimedOut, detail->code());
+  ASSERT_LE(static_cast<int>(listener->num_chunks()), 1);
+}
+
+TEST_F(GrpcAsyncDoGet, DeadlineRegistrationChurn) {
+  // RFC 3.3/3.5.3: the deadline registration must stay live call after call and
+  // per outcome - cancelled before it fires, satisfied before it fires, expired
+  // while nothing is outstanding - with exactly one terminal callback each.  The
+  // second round uses a new client (and so a new background thread) after the
+  // first one was closed with its registrations dropped.
+  for (int round = 0; round < 2; ++round) {
+    AsyncTestHarness harness;
+    ASSERT_OK(harness.status);
+    if (!harness.supports_async()) {
+      GTEST_SKIP() << "gRPC was built without the callback API";
+    }
+
+    constexpr int kCalls = 30;
+    for (int i = 0; i < kCalls; ++i) {
+      FlightCallOptions options;
+      options.timeout = std::chrono::milliseconds(10);
+      auto listener = std::make_shared<RecordDoGetListener>();
+      harness.client->DoGetAsync(options, Ticket{"ticket-ints-1"}, listener);
+      ASSERT_EQ("", listener->events()) << "call " << i << ": callback before demand";
+
+      const int outcome = i % 3;
+      if (outcome == 0) {
+        // Cancelled first: the registration must be dropped, not fire.
+        listener->TryCancel();
+      } else if (outcome == 1) {
+        // Satisfied first: how far it gets is a race with the deadline, but the
+        // call must end terminally either way.
+        size_t chunk = 0;
+        while (listener->RequestNext().ok() && listener->WaitForChunks(++chunk)) {
+        }
+      }
+      // outcome == 2: left alone, the deadline alone must terminate the call.
+
+      ASSERT_TRUE(listener->WaitForFinish()) << "call " << i << " never finished";
+      if (outcome == 2) {
+        // Nothing else can end this call, so the deadline did - which is what
+        // makes this a test of the registration path rather than of EOS.
+        const std::shared_ptr<FlightStatusDetail> detail =
+            FlightStatusDetail::UnwrapStatus(listener->status());
+        ASSERT_NE(nullptr, detail) << listener->status().ToString();
+        ASSERT_EQ(FlightStatusCode::TimedOut, detail->code())
+            << listener->status().ToString();
+      }
+
+      // Give a stray deadline firing on the finished call time to surface.
+      std::this_thread::sleep_for(std::chrono::milliseconds(15));
+      const std::string events = listener->events();
+      ASSERT_EQ(1, static_cast<int>(std::count(events.begin(), events.end(), 'F')))
+          << "call " << i << ": " << events;
+      ASSERT_EQ('F', events.back()) << "call " << i << ": " << events;
+    }
+  }
+}
+
+TEST_F(GrpcAsyncDoGet, ListenerPinnedThroughFinish) {
+  // RFC 3.4/3.5.4: the transport pins the listener through every callback's
+  // return, so a worker posted from OnFinish() may drop the application's last
+  // reference before that callback returns.
+  RecordBatchVector expected_batches;
+  ASSERT_OK(ExampleIntBatches(&expected_batches));
+  const size_t num_batches = expected_batches.size();
+
+  auto signal = std::make_shared<FinishSignal>();
+  auto listener = std::make_shared<PinningDoGetListener>(signal);
+  std::weak_ptr<PinningDoGetListener> weak = listener;
+  // From here on the test drives the call through this raw pointer: dropping
+  // the shared_ptr happens inside the terminal callback.
+  PinningDoGetListener* raw = listener.get();
+  listener->release_app_reference = [&listener] {
+    // Only the transport's reference keeps the listener alive now.
+    listener.reset();
+  };
+  harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
+
+  for (size_t i = 0; i < num_batches; ++i) {
+    ASSERT_OK(raw->RequestNext());
+    // Wait on the transport, not on the listener's own state.
+    while (signal->chunks < i + 1 && !signal->done) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_FALSE(signal->done) << "the stream ended early";
+  }
+  auto next_status = raw->RequestNext();
+  ASSERT_TRUE(next_status.ok() || next_status.IsInvalid()) << next_status.ToString();
+
+  // The callback that drops the application's reference completes normally.
+  ASSERT_TRUE(signal->WaitForFinish()) << "timed out waiting for OnFinish";
+  ASSERT_TRUE(signal->status.ok()) << signal->status.ToString();
+  ASSERT_EQ(num_batches, signal->chunks);
+  ASSERT_EQ(1, static_cast<int>(signal->schemas));
+
+  // The transport's pin ended with the callback: the application's reference was
+  // the last one, so the listener is gone and nothing leaked.
+  const auto deadline = std::chrono::steady_clock::now() + kAsyncTimeout;
+  while (!weak.expired() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(weak.expired()) << "the listener outlived OnFinish(): leaked";
+}
+
+TEST_F(GrpcAsyncDoGet, ConcurrentReadsSingleAppThread) {
+  // RFC 3.5.5: many concurrent reads must not park (or spawn) an application
+  // thread per read.  32 reads are driven from this single thread in
+  // round-robin, waiting on one condition variable for any of their callbacks.
+  constexpr size_t kReads = 32;
+
+  RecordBatchVector expected_batches;
+  ASSERT_OK(ExampleIntBatches(&expected_batches));
+  const size_t num_batches = expected_batches.size();
+
+  // Warm the transport up (channel, completion queues, server threads) and take
+  // the baseline in that steady state, so the comparison isolates the reads.
+  {
+    auto warmup = std::make_shared<RecordDoGetListener>();
+    harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, warmup);
+    ASSERT_OK(warmup->RequestNext());
+    ASSERT_TRUE(warmup->WaitForChunks(1));
+    warmup->TryCancel();
+    ASSERT_TRUE(warmup->WaitForFinish());
+  }
+  const int threads_before = ReadThreadCount();
+
+  auto state = std::make_shared<MultiReadState>(kReads);
+  std::vector<std::shared_ptr<AsyncDoGetListener>> listeners;
+  for (size_t i = 0; i < kReads; ++i) {
+    auto listener = std::make_shared<MultiReadListener>(state, i);
+    listeners.push_back(listener);
+    harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, std::move(listener));
+  }
+
+  // Kick off one request per read before waiting: nothing can progress until a
+  // request is outstanding, and the wait below is for callbacks, not for new
+  // work.  The flags go in under the lock first so that a callback landing
+  // immediately cannot be mistaken for an already-outstanding request.
+  {
+    std::lock_guard<std::mutex> guard(state->mutex);
+    for (size_t i = 0; i < kReads; ++i) {
+      state->request_outstanding[i] = true;
+    }
+  }
+  for (size_t i = 0; i < kReads; ++i) {
+    ASSERT_OK(listeners[i]->RequestNext()) << "read " << i;
+  }
+
+  {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    while (state->num_finished < kReads) {
+      ASSERT_TRUE(
+          state->cv.wait_for(lock, kAsyncTimeout, [&] { return state->progress; }))
+          << "timed out with " << state->num_finished << " of " << kReads
+          << " reads finished";
+      state->progress = false;
+      // Round-robin: every read that has nothing outstanding gets one more
+      // request.  The requests are issued without a lock, so a callback that
+      // lands in the meantime cannot deadlock.
+      std::vector<size_t> to_request;
+      for (size_t i = 0; i < kReads; ++i) {
+        if (!state->finished[i] && !state->request_outstanding[i]) {
+          state->request_outstanding[i] = true;
+          to_request.push_back(i);
+        }
+      }
+      lock.unlock();
+      for (size_t i : to_request) {
+        Status status = listeners[i]->RequestNext();
+        if (!status.ok()) {
+          // Only a race with the terminal status can reject a request here.
+          std::lock_guard<std::mutex> guard(state->mutex);
+          ASSERT_TRUE(status.IsInvalid()) << status.ToString();
+          state->request_outstanding[i] = false;
+        }
+      }
+      lock.lock();
+    }
+  }
+
+  for (size_t i = 0; i < kReads; ++i) {
+    ASSERT_EQ(num_batches, state->chunks[i]) << "read " << i;
+    ASSERT_EQ(1, static_cast<int>(state->schemas[i])) << "read " << i;
+    ASSERT_EQ(1, static_cast<int>(state->finishes[i]))
+        << "read " << i << " must finish exactly once";
+    ASSERT_OK(state->statuses[i]) << "read " << i;
+  }
+
+  const int threads_after = ReadThreadCount();
+  std::cout << "[thread-count] " << kReads << " concurrent reads: before "
+            << threads_before << ", after " << threads_after << std::endl;
+  ASSERT_GE(threads_before, 0) << "cannot read the thread count";
+  // A parked thread per read would show up as +32; gRPC's own pools may move by
+  // a thread or two, and this process also owns the server.
+  ASSERT_LE(threads_after, threads_before + 2)
+      << "threads before: " << threads_before << ", after: " << threads_after;
+}
+
+TEST_F(GrpcAsyncDoGet, RequestNextBeforeStartAndAfterFinish) {
+  // RFC 3.2/3.4: requests on a listener with no RPC - and TryCancel() after the
+  // RPC finished - are rejected or no-ops, never a crash or a second terminal
+  // callback.
+  auto never_started = std::make_shared<RecordDoGetListener>();
+  ASSERT_RAISES(Invalid, never_started->RequestNext());
+  never_started->TryCancel();  // Safe no-op: there is no RPC to cancel.
+  ASSERT_EQ("", never_started->events());
+
+  RecordBatchVector expected_batches;
+  ASSERT_OK(ExampleIntBatches(&expected_batches));
+  const size_t num_batches = expected_batches.size();
+
+  auto listener = std::make_shared<RecordDoGetListener>();
+  harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
+  for (size_t i = 0; i < num_batches; ++i) {
+    ASSERT_OK(listener->RequestNext());
+    ASSERT_TRUE(listener->WaitForChunks(i + 1));
+  }
+  auto next_status = listener->RequestNext();
+  ASSERT_TRUE(next_status.ok() || next_status.IsInvalid()) << next_status.ToString();
+  ASSERT_TRUE(listener->WaitForFinish());
+  ASSERT_OK(listener->status());
+  const std::string expected_events = "S" + std::string(num_batches, 'N') + "F";
+  ASSERT_EQ(expected_events, listener->events());
+
+  // After finish: a request is rejected and TryCancel() is a no-op.
+  ASSERT_RAISES(Invalid, listener->RequestNext());
+  listener->TryCancel();
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ASSERT_EQ(expected_events, listener->events()) << "no callback may follow OnFinish";
+}
+
+TEST_F(GrpcAsyncDoGet, ServerErrorIsTerminalAndRich) {
+  // RFC 3.3: exactly one OnFinish() carries startup/server failures too, with
+  // the full status preserved.  The failure is discovered by the request that
+  // finds the stream already closed (the hold withholds OnDone() until a read
+  // or a cancel releases it), as with EOS.
+  auto listener = std::make_shared<RecordDoGetListener>();
+  harness.client->DoGetAsync(Ticket{"ARROW-5095-fail"}, listener);
+
+  auto next_status = listener->RequestNext();
+  ASSERT_TRUE(next_status.ok() || next_status.IsInvalid()) << next_status.ToString();
+  ASSERT_TRUE(listener->WaitForFinish()) << "the server failure must be terminal";
+  ASSERT_TRUE(listener->status().IsUnknownError()) << listener->status().ToString();
+  ASSERT_THAT(listener->status().ToString(), ::testing::HasSubstr("Server-side error"));
+  ASSERT_EQ(0, static_cast<int>(listener->num_chunks()));
+  ASSERT_EQ("F", listener->events());
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ASSERT_EQ("F", listener->events()) << "exactly one OnFinish";
+}
+
+namespace {
+
+/// A client auth handler with no usable token: SetToken() fails before the RPC
+/// is published, which is the path a call object must survive without waiting
+/// for an RPC that never starts.
+class FailingTokenHandler : public ClientAuthHandler {
+ public:
+  Status Authenticate(ClientAuthSender*, ClientAuthReader*) override {
+    return Status::OK();
+  }
+  Status GetToken(std::string*) override { return Status::Invalid("no token available"); }
+};
+
+}  // namespace
+
+TEST_F(GrpcAsyncDoGet, FailingTokenIsReportedAndDoesNotHang) {
+  // A call that fails before it is published must still report through
+  // OnFinish(), and destroying it must not block: the call object waits for its
+  // RPC in its destructor, and this RPC never started.  SetToken() is the check
+  // that can fail here - the token comes from the handler.
+  FlightCallOptions call_options;
+  // The handshake is unimplemented on this server (it has no auth handler); the
+  // handler is installed before it runs, which is all the per-call token needs.
+  const auto handshake_status =
+      harness.client->Authenticate(call_options, std::make_unique<FailingTokenHandler>());
+  ARROW_UNUSED(handshake_status);
+
+  auto listener = std::make_shared<RecordDoGetListener>();
+  harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
+
+  ASSERT_TRUE(listener->WaitForFinish()) << "the failure must be reported";
+  ASSERT_TRUE(listener->status().IsInvalid()) << listener->status().ToString();
+  ASSERT_THAT(listener->status().ToString(), ::testing::HasSubstr("no token available"));
 }
 
 }  // namespace flight

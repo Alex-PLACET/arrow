@@ -34,3 +34,27 @@ your current working directory or you need to add it to your path, e.g.
 ```
 PATH=debug:$PATH debug/flight-test
 ```
+
+## Experimental: async server over gRPC's generic callback API
+
+`FlightServerOptions::use_async_grpc` (default off) serves Flight over gRPC's
+generic callback API instead of the default synchronous typed service.
+
+- `DoGet` is served through the server's `FlightServerBase::DoGet`: the
+  request is parsed as a `Ticket` and the `FlightDataStream` it returns is
+  pumped one payload at a time. It runs on a bidi-shaped reactor used
+  write-only, because the generic callback API has no server-streaming
+  reactor (see apache/arrow#49339 and GH-37937 for the background).
+- `DoPut` is served through a per-RPC `FlightDataListener` obtained from
+  `FlightServerOptions::listener_factory`, which also hands the upload's
+  descriptor to the listener through `FlightDataListener::OnDescriptor`.
+  Without a factory, uploads answer `UNIMPLEMENTED`.
+- Every other RPC answers `UNIMPLEMENTED`. The flag replaces the synchronous
+  typed service rather than adding to it: a method claimed by a registered
+  typed service never reaches the generic handler.
+- Middleware runs on this path: `ServerMiddlewareFactory::StartCall`, the
+  SendingHeaders hook and CallCompleted are all invoked. The blocking
+  `ServerAuthHandler` is still refused by `Init()`: to serve the handshake
+  and check a per-call token, derive from `AsyncGenericFlightServerBase`
+  (`server.h`), which forces this flag and carries the `Handshake` /
+  `ValidateToken` virtuals.

@@ -179,6 +179,7 @@ set(ARROW_FLIGHT_SRCS
     client_cookie_middleware.cc
     client_tracing_middleware.cc
     cookie_internal.cc
+    flight_data_decoder.cc
     middleware.cc
     serialization_internal.cc
     server.cc
@@ -331,6 +332,15 @@ add_arrow_test(flight_internals_test
                "arrow_flight")
 
 add_arrow_test(flight_test
+               STATIC_LINK_LIBS
+               ${ARROW_FLIGHT_TEST_LINK_LIBS}
+               LABELS
+               "arrow_flight")
+
+# Async Flight server over the gRPC generic callback API
+add_arrow_test(flight_async_grpc_test
+               SOURCES
+               transport/grpc/async_grpc_test.cc
                STATIC_LINK_LIBS
                ${ARROW_FLIGHT_TEST_LINK_LIBS}
                LABELS
