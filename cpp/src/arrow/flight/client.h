@@ -35,7 +35,6 @@
 
 #include "arrow/flight/type_fwd.h"
 #include "arrow/flight/types.h"  // IWYU pragma: keep
-#include "arrow/flight/types_async.h"
 #include "arrow/flight/visibility.h"
 
 namespace arrow {

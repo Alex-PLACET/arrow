@@ -177,7 +177,6 @@ class FlightMessageDecoder::FlightMessageDecoderImpl {
     }
 
     // This has to be a Dictionary batch.
-    // TODO: Add unit test validating assumption.
     if (app_metadata && app_metadata->size() > 0) {
       FlightStreamChunk chunk{nullptr, std::move(app_metadata)};
       return listener_->OnNext(std::move(chunk));

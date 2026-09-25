@@ -720,6 +720,24 @@ class GrpcGarbageBin {
   DeadlineId next_deadline_id_ = 1;
 };
 
+/// The shared tail of every async call's Finish(): move the listener out, hand
+/// it the combined status, mark the call finished, then hand the gRPC resources
+/// to the garbage bin.  SetAsyncRpc may trigger destruction, so the flag is set
+/// first; the bin keeps the destruction off the callback thread.
+template <typename Listener>
+void FinishAsyncCall(std::shared_ptr<Listener> listener, const ::grpc::Status& status,
+                     Status client_status, ClientRpc* rpc, GrpcGarbageBin* garbage_bin,
+                     FinishedFlag* finished) {
+  listener->OnFinish(
+      CombinedTransportStatus(status, std::move(client_status), &rpc->context));
+  // SetAsyncRpc may trigger destruction, so Finish() first
+  finished->Finish();
+  // Instead of potentially destructing gRPC resources here,
+  // transfer it to a dedicated background thread
+  garbage_bin->Dispose(
+      flight::internal::ClientTransport::ReleaseAsyncRpc(listener.get()));
+}
+
 template <typename Result, typename Request, typename Response>
 class UnaryUnaryAsyncCall : public ::grpc::ClientUnaryReactor, public internal::AsyncRpc {
  public:
@@ -755,15 +773,8 @@ class UnaryUnaryAsyncCall : public ::grpc::ClientUnaryReactor, public internal::
   }
 
   void Finish(const ::grpc::Status& status) {
-    auto listener = std::move(this->listener);
-    listener->OnFinish(
-        CombinedTransportStatus(status, std::move(client_status), &rpc.context));
-    // SetAsyncRpc may trigger destruction, so Finish() first
-    finished.Finish();
-    // Instead of potentially destructing gRPC resources here,
-    // transfer it to a dedicated background thread
-    garbage_bin_->Dispose(
-        flight::internal::ClientTransport::ReleaseAsyncRpc(listener.get()));
+    FinishAsyncCall(std::move(listener), status, std::move(client_status), &rpc,
+                    garbage_bin_.get(), &finished);
   }
 };
 
@@ -882,7 +893,7 @@ class DoGetAsyncCall : public ::grpc::ClientReadReactor<pb::FlightData>,
         listener(std::move(listener)),
         garbage_bin_(std::move(garbage_bin)),
         decoder(std::make_unique<FlightMessageDecoder>(
-            std::make_shared<ChunkForwarder>(this))) {
+            std::make_shared<ChunkForwarder>(this), options.read_options)) {
     // Mirror ClientRpc exactly, so the two agree on when the call expires; this
     // instant is computed after gRPC's, so the hold is only ever dropped once
     // gRPC's own deadline has already failed the call.
@@ -1065,21 +1076,18 @@ class DoGetAsyncCall : public ::grpc::ClientReadReactor<pb::FlightData>,
       deadline_id_ = 0;
       garbage_bin_->UnregisterDeadline(id);
     }
-    auto listener = std::move(this->listener);
-    listener->OnFinish(
-        CombinedTransportStatus(status, std::move(client_status), &rpc.context));
-    // SetAsyncRpc may trigger destruction, so Finish() first
-    finished.Finish();
-    // Instead of potentially destructing gRPC resources here,
-    // transfer it to a dedicated background thread
-    garbage_bin_->Dispose(
-        flight::internal::ClientTransport::ReleaseAsyncRpc(listener.get()));
+    FinishAsyncCall(std::move(listener), status, std::move(client_status), &rpc,
+                    garbage_bin_.get(), &finished);
   }
 };
 
-#  define LISTENER_NOT_OK(LISTENER, EXPR)                 \
+// The call is published only after these checks pass, so a failure here
+// leaves a call that was never started: mark it finished, or its destructor
+// (which waits for the RPC) would block forever.
+#  define LISTENER_NOT_OK(CALL, LISTENER, EXPR)           \
     if (auto arrow_status = (EXPR); !arrow_status.ok()) { \
       (LISTENER)->OnFinish(std::move(arrow_status));      \
+      (CALL)->finished.Finish();                          \
       return;                                             \
     }
 #endif
@@ -1444,8 +1452,9 @@ class GrpcClientImpl : public internal::ClientTransport {
     using AsyncCall =
         UnaryUnaryAsyncCall<FlightInfo, pb::FlightDescriptor, pb::FlightInfo>;
     auto call = std::make_unique<AsyncCall>(options, listener, garbage_bin_);
-    LISTENER_NOT_OK(listener, internal::ToProto(descriptor, &call->pb_request));
-    LISTENER_NOT_OK(listener, call->rpc.SetToken(auth_handler_.get()));
+    LISTENER_NOT_OK(call.get(), listener,
+                    internal::ToProto(descriptor, &call->pb_request));
+    LISTENER_NOT_OK(call.get(), listener, call->rpc.SetToken(auth_handler_.get()));
 
     stub_->experimental_async()->GetFlightInfo(&call->rpc.context, &call->pb_request,
                                                &call->pb_response, call.get());
@@ -1459,8 +1468,8 @@ class GrpcClientImpl : public internal::ClientTransport {
                   std::shared_ptr<AsyncDoGetListener> listener) override {
     using AsyncCall = DoGetAsyncCall;
     auto call = std::make_unique<AsyncCall>(options, listener, garbage_bin_);
-    LISTENER_NOT_OK(listener, internal::ToProto(ticket, &call->pb_request));
-    LISTENER_NOT_OK(listener, call->rpc.SetToken(auth_handler_.get()));
+    LISTENER_NOT_OK(call.get(), listener, internal::ToProto(ticket, &call->pb_request));
+    LISTENER_NOT_OK(call.get(), listener, call->rpc.SetToken(auth_handler_.get()));
 
     stub_->experimental_async()->DoGet(&call->rpc.context, &call->pb_request, call.get());
     // The generated stub has created the gRPC reader by now; take the hold that

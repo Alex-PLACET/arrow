@@ -30,7 +30,6 @@
 #include "arrow/flight/server_auth.h"
 #include "arrow/flight/server_middleware.h"
 #include "arrow/flight/transport/grpc/util_internal.h"
-#include "arrow/util/future.h"
 #include "arrow/util/uri.h"
 
 namespace arrow::flight::transport::grpc {

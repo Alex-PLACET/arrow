@@ -2024,29 +2024,69 @@ class RecordDoGetListener : public AsyncDoGetListener {
 
 }  // namespace
 
-TEST(GrpcAsyncDoGet, SmokeTest) {
-  // One demand-driven DoGet end to end: schema first, one chunk per
-  // RequestNext(), then EOS discovered by a request that yields nothing.
-  ASSERT_OK_AND_ASSIGN(auto location, Location::ForScheme("grpc", "127.0.0.1", 0));
-  auto server = TestFlightServer::Make();
-  FlightServerOptions server_options(location);
-  ASSERT_OK(server->Init(server_options));
+namespace {
 
-  ASSERT_OK_AND_ASSIGN(auto client_location,
-                       Location::ForScheme("grpc", "127.0.0.1", server->port()));
-  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
-  if (!client->supports_async()) {
-    ASSERT_OK(client->Close());
-    ASSERT_OK(server->Shutdown());
-    GTEST_SKIP() << "gRPC was built without the callback API";
+/// An in-process TestFlightServer and a client connected to it.  Construction
+/// never fails a test: `status` carries the setup result, and both are closed on
+/// destruction.  The default TestFlightServer serves the ticket-ints/dicts
+/// tickets.
+struct AsyncTestHarness {
+  std::unique_ptr<FlightServerBase> server;
+  std::unique_ptr<FlightClient> client;
+  Status status;
+
+  AsyncTestHarness() { status = Start(); }
+
+  ~AsyncTestHarness() {
+    if (client != nullptr) {
+      ARROW_WARN_NOT_OK(client->Close(), "Close()");
+    }
+    if (server != nullptr) {
+      ARROW_WARN_NOT_OK(server->Shutdown(), "Shutdown()");
+    }
   }
 
+  /// False when this gRPC build has no callback API; the test then skips.
+  bool supports_async() const { return client != nullptr && client->supports_async(); }
+
+ private:
+  Status Start() {
+    ARROW_ASSIGN_OR_RAISE(auto location, Location::ForScheme("grpc", "127.0.0.1", 0));
+    server = TestFlightServer::Make();
+    FlightServerOptions server_options(location);
+    RETURN_NOT_OK(server->Init(server_options));
+    ARROW_ASSIGN_OR_RAISE(auto client_location,
+                          Location::ForScheme("grpc", "127.0.0.1", server->port()));
+    ARROW_ASSIGN_OR_RAISE(client, FlightClient::Connect(client_location));
+    return Status::OK();
+  }
+};
+
+/// The fixture every async DoGet test uses: one in-process server/client pair,
+/// and a skip when this gRPC build has no callback API.
+class GrpcAsyncDoGet : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    ASSERT_OK(harness.status);
+    if (!harness.supports_async()) {
+      GTEST_SKIP() << "gRPC was built without the callback API";
+    }
+  }
+
+  AsyncTestHarness harness;
+};
+
+}  // namespace
+
+TEST_F(GrpcAsyncDoGet, SmokeTest) {
+  // One demand-driven DoGet end to end: schema first, one chunk per
+  // RequestNext(), then EOS discovered by a request that yields nothing.
   RecordBatchVector expected_batches;
   ASSERT_OK(ExampleIntBatches(&expected_batches));
   const size_t num_batches = expected_batches.size();
 
   auto listener = std::make_shared<RecordDoGetListener>();
-  client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
+  harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
 
   // Zero demand: the call starts without reading anything.
   ASSERT_EQ("", listener->events());
@@ -2087,9 +2127,6 @@ TEST(GrpcAsyncDoGet, SmokeTest) {
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   ASSERT_EQ(num_batches, listener->num_chunks());
   ASSERT_EQ(expected_events, listener->events());
-
-  ASSERT_OK(client->Close());
-  ASSERT_OK(server->Shutdown());
 }
 
 //------------------------------------------------------------
@@ -2100,45 +2137,6 @@ namespace {
 /// Generous per-wait timeout: a stuck reactor must fail its test, not hang the
 /// suite.
 constexpr auto kAsyncTimeout = std::chrono::seconds(10);
-
-/// An in-process TestFlightServer and a client connected to it.  Construction
-/// never fails a test: `status` carries the setup result, and both are closed on
-/// destruction.  `make_server` selects the server (the default TestFlightServer
-/// serves the ticket-ints/dicts tickets).
-struct AsyncTestHarness {
-  std::unique_ptr<FlightServerBase> server;
-  std::unique_ptr<FlightClient> client;
-  Status status;
-
-  explicit AsyncTestHarness(std::function<std::unique_ptr<FlightServerBase>()>
-                                make_server = TestFlightServer::Make) {
-    status = Start(std::move(make_server));
-  }
-
-  ~AsyncTestHarness() {
-    if (client != nullptr) {
-      ARROW_WARN_NOT_OK(client->Close(), "Close()");
-    }
-    if (server != nullptr) {
-      ARROW_WARN_NOT_OK(server->Shutdown(), "Shutdown()");
-    }
-  }
-
-  /// False when this gRPC build has no callback API; the test then skips.
-  bool supports_async() const { return client != nullptr && client->supports_async(); }
-
- private:
-  Status Start(std::function<std::unique_ptr<FlightServerBase>()> make_server) {
-    ARROW_ASSIGN_OR_RAISE(auto location, Location::ForScheme("grpc", "127.0.0.1", 0));
-    server = make_server();
-    FlightServerOptions server_options(location);
-    RETURN_NOT_OK(server->Init(server_options));
-    ARROW_ASSIGN_OR_RAISE(auto client_location,
-                          Location::ForScheme("grpc", "127.0.0.1", server->port()));
-    ARROW_ASSIGN_OR_RAISE(client, FlightClient::Connect(client_location));
-    return Status::OK();
-  }
-};
 
 /// The "Threads:" field of this process's /proc/self/status, or -1 where /proc
 /// is unavailable (the thread count is then not asserted).
@@ -2270,16 +2268,10 @@ class MultiReadListener : public AsyncDoGetListener {
 
 }  // namespace
 
-TEST(GrpcAsyncDoGet, OverlappingRequestRejected) {
+TEST_F(GrpcAsyncDoGet, OverlappingRequestRejected) {
   // RFC 3.2/3.5: an overlapping request is rejected without replacing,
   // cancelling or queueing behind the first one, and the rejection must not
   // suppress the final status.
-  AsyncTestHarness harness;
-  ASSERT_OK(harness.status);
-  if (!harness.supports_async()) {
-    GTEST_SKIP() << "gRPC was built without the callback API";
-  }
-
   RecordBatchVector expected_batches;
   ASSERT_OK(ExampleIntBatches(&expected_batches));
   const size_t num_batches = expected_batches.size();
@@ -2322,16 +2314,10 @@ TEST(GrpcAsyncDoGet, OverlappingRequestRejected) {
   ASSERT_EQ(expected_events, listener->events());
 }
 
-TEST(GrpcAsyncDoGet, RequestNextConcurrentlyFromTwoThreads) {
+TEST_F(GrpcAsyncDoGet, RequestNextConcurrentlyFromTwoThreads) {
   // RFC 3.2/3.4: at most one request may be outstanding, so two threads racing
   // on an idle listener must not both be admitted; the admitted one is
   // satisfied by exactly one chunk.
-  AsyncTestHarness harness;
-  ASSERT_OK(harness.status);
-  if (!harness.supports_async()) {
-    GTEST_SKIP() << "gRPC was built without the callback API";
-  }
-
   RecordBatchVector expected_batches;
   ASSERT_OK(ExampleIntBatches(&expected_batches));
 
@@ -2372,7 +2358,7 @@ TEST(GrpcAsyncDoGet, RequestNextConcurrentlyFromTwoThreads) {
   ASSERT_TRUE(listener->WaitForFinish());
 }
 
-TEST(GrpcAsyncDoGet, MetadataOnlyChunkIsAValue) {
+TEST_F(GrpcAsyncDoGet, MetadataOnlyChunkIsAValue) {
   // RFC 3.2/3.5.1: a metadata-only chunk is a value, not EOS, and it satisfies a
   // request just like a batch-bearing one.
   //
@@ -2387,7 +2373,7 @@ TEST(GrpcAsyncDoGet, MetadataOnlyChunkIsAValue) {
   GTEST_SKIP() << "the shared test server cannot produce this stream shape";
 }
 
-TEST(GrpcAsyncDoGet, SchemaOnlyStream) {
+TEST_F(GrpcAsyncDoGet, SchemaOnlyStream) {
   // RFC 3.2/3.3: OnSchema() leaves the read pending, and a schema-only stream
   // ends with OnFinish(OK): no fabricated empty batch, no unsolicited chunk.
   //
@@ -2401,16 +2387,10 @@ TEST(GrpcAsyncDoGet, SchemaOnlyStream) {
   // at any level.
   GTEST_SKIP() << "the shared test server cannot produce this stream shape";
 }
-TEST(GrpcAsyncDoGet, DictionaryStream) {
+TEST_F(GrpcAsyncDoGet, DictionaryStream) {
   // RFC 3.5.1: a dictionary-encoded stream delivers its record batches as
   // chunks; the dictionary messages in between are read through and are not
   // user-visible chunks (see flight_data_decoder.cc).
-  AsyncTestHarness harness;
-  ASSERT_OK(harness.status);
-  if (!harness.supports_async()) {
-    GTEST_SKIP() << "gRPC was built without the callback API";
-  }
-
   RecordBatchVector expected_batches;
   ASSERT_OK(ExampleDictBatches(&expected_batches));
   const size_t num_batches = expected_batches.size();
@@ -2438,16 +2418,10 @@ TEST(GrpcAsyncDoGet, DictionaryStream) {
   ASSERT_EQ(1, static_cast<int>(listener->schemas().size()));
 }
 
-TEST(GrpcAsyncDoGet, CancelAtZeroDemand) {
+TEST_F(GrpcAsyncDoGet, CancelAtZeroDemand) {
   // RFC 3.3/3.5.3: TryCancel() is whole-call and must reach the terminal
   // notification without another read request or server message, even with no
   // read pending.
-  AsyncTestHarness harness;
-  ASSERT_OK(harness.status);
-  if (!harness.supports_async()) {
-    GTEST_SKIP() << "gRPC was built without the callback API";
-  }
-
   auto listener = std::make_shared<RecordDoGetListener>();
   harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
   ASSERT_EQ("", listener->events()) << "zero demand must produce no callback";
@@ -2469,16 +2443,10 @@ TEST(GrpcAsyncDoGet, CancelAtZeroDemand) {
   ASSERT_EQ("F", listener->events()) << "exactly one OnFinish";
 }
 
-TEST(GrpcAsyncDoGet, CancelWithPendingRead) {
+TEST_F(GrpcAsyncDoGet, CancelWithPendingRead) {
   // RFC 3.3/3.5.3: cancellation with an idle pending read also terminates
   // without another request.  Whether that read was already satisfied is a
   // race, so at most one chunk may arrive before the terminal status.
-  AsyncTestHarness harness;
-  ASSERT_OK(harness.status);
-  if (!harness.supports_async()) {
-    GTEST_SKIP() << "gRPC was built without the callback API";
-  }
-
   auto listener = std::make_shared<RecordDoGetListener>();
   harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
   ASSERT_OK(listener->RequestNext());
@@ -2518,13 +2486,7 @@ TEST(GrpcAsyncDoGet, CancelWithPendingRead) {
 // is outstanding (measured: OnDeadline sees read_pending == false here).  A
 // server that stalls a requested read past the deadline is what would exercise
 // the release-while-a-read-is-outstanding branch of MaybeReleaseHold(force).
-TEST(GrpcAsyncDoGet, DeadlineAtZeroDemand) {
-  AsyncTestHarness harness;
-  ASSERT_OK(harness.status);
-  if (!harness.supports_async()) {
-    GTEST_SKIP() << "gRPC was built without the callback API";
-  }
-
+TEST_F(GrpcAsyncDoGet, DeadlineAtZeroDemand) {
   FlightCallOptions options;
   options.timeout = std::chrono::milliseconds(100);
   auto listener = std::make_shared<RecordDoGetListener>();
@@ -2543,13 +2505,7 @@ TEST(GrpcAsyncDoGet, DeadlineAtZeroDemand) {
   ASSERT_EQ("F", listener->events());
 }
 
-TEST(GrpcAsyncDoGet, DeadlineWithIdlePendingRead) {
-  AsyncTestHarness harness;
-  ASSERT_OK(harness.status);
-  if (!harness.supports_async()) {
-    GTEST_SKIP() << "gRPC was built without the callback API";
-  }
-
+TEST_F(GrpcAsyncDoGet, DeadlineWithIdlePendingRead) {
   FlightCallOptions options;
   options.timeout = std::chrono::milliseconds(100);
   auto listener = std::make_shared<RecordDoGetListener>();
@@ -2568,7 +2524,7 @@ TEST(GrpcAsyncDoGet, DeadlineWithIdlePendingRead) {
   ASSERT_LE(static_cast<int>(listener->num_chunks()), 1);
 }
 
-TEST(GrpcAsyncDoGet, DeadlineRegistrationChurn) {
+TEST_F(GrpcAsyncDoGet, DeadlineRegistrationChurn) {
   // RFC 3.3/3.5.3: the deadline registration must stay live call after call and
   // per outcome - cancelled before it fires, satisfied before it fires, expired
   // while nothing is outstanding - with exactly one terminal callback each.  The
@@ -2623,16 +2579,10 @@ TEST(GrpcAsyncDoGet, DeadlineRegistrationChurn) {
   }
 }
 
-TEST(GrpcAsyncDoGet, ListenerPinnedThroughFinish) {
+TEST_F(GrpcAsyncDoGet, ListenerPinnedThroughFinish) {
   // RFC 3.4/3.5.4: the transport pins the listener through every callback's
   // return, so a worker posted from OnFinish() may drop the application's last
   // reference before that callback returns.
-  AsyncTestHarness harness;
-  ASSERT_OK(harness.status);
-  if (!harness.supports_async()) {
-    GTEST_SKIP() << "gRPC was built without the callback API";
-  }
-
   RecordBatchVector expected_batches;
   ASSERT_OK(ExampleIntBatches(&expected_batches));
   const size_t num_batches = expected_batches.size();
@@ -2675,17 +2625,11 @@ TEST(GrpcAsyncDoGet, ListenerPinnedThroughFinish) {
   ASSERT_TRUE(weak.expired()) << "the listener outlived OnFinish(): leaked";
 }
 
-TEST(GrpcAsyncDoGet, ConcurrentReadsSingleAppThread) {
+TEST_F(GrpcAsyncDoGet, ConcurrentReadsSingleAppThread) {
   // RFC 3.5.5: many concurrent reads must not park (or spawn) an application
   // thread per read.  32 reads are driven from this single thread in
   // round-robin, waiting on one condition variable for any of their callbacks.
   constexpr size_t kReads = 32;
-
-  AsyncTestHarness harness;
-  ASSERT_OK(harness.status);
-  if (!harness.supports_async()) {
-    GTEST_SKIP() << "gRPC was built without the callback API";
-  }
 
   RecordBatchVector expected_batches;
   ASSERT_OK(ExampleIntBatches(&expected_batches));
@@ -2775,7 +2719,7 @@ TEST(GrpcAsyncDoGet, ConcurrentReadsSingleAppThread) {
       << "threads before: " << threads_before << ", after: " << threads_after;
 }
 
-TEST(GrpcAsyncDoGet, RequestNextBeforeStartAndAfterFinish) {
+TEST_F(GrpcAsyncDoGet, RequestNextBeforeStartAndAfterFinish) {
   // RFC 3.2/3.4: requests on a listener with no RPC - and TryCancel() after the
   // RPC finished - are rejected or no-ops, never a crash or a second terminal
   // callback.
@@ -2783,12 +2727,6 @@ TEST(GrpcAsyncDoGet, RequestNextBeforeStartAndAfterFinish) {
   ASSERT_RAISES(Invalid, never_started->RequestNext());
   never_started->TryCancel();  // Safe no-op: there is no RPC to cancel.
   ASSERT_EQ("", never_started->events());
-
-  AsyncTestHarness harness;
-  ASSERT_OK(harness.status);
-  if (!harness.supports_async()) {
-    GTEST_SKIP() << "gRPC was built without the callback API";
-  }
 
   RecordBatchVector expected_batches;
   ASSERT_OK(ExampleIntBatches(&expected_batches));
@@ -2814,17 +2752,11 @@ TEST(GrpcAsyncDoGet, RequestNextBeforeStartAndAfterFinish) {
   ASSERT_EQ(expected_events, listener->events()) << "no callback may follow OnFinish";
 }
 
-TEST(GrpcAsyncDoGet, ServerErrorIsTerminalAndRich) {
+TEST_F(GrpcAsyncDoGet, ServerErrorIsTerminalAndRich) {
   // RFC 3.3: exactly one OnFinish() carries startup/server failures too, with
   // the full status preserved.  The failure is discovered by the request that
   // finds the stream already closed (the hold withholds OnDone() until a read
   // or a cancel releases it), as with EOS.
-  AsyncTestHarness harness;
-  ASSERT_OK(harness.status);
-  if (!harness.supports_async()) {
-    GTEST_SKIP() << "gRPC was built without the callback API";
-  }
-
   auto listener = std::make_shared<RecordDoGetListener>();
   harness.client->DoGetAsync(Ticket{"ARROW-5095-fail"}, listener);
 
@@ -2838,6 +2770,41 @@ TEST(GrpcAsyncDoGet, ServerErrorIsTerminalAndRich) {
 
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   ASSERT_EQ("F", listener->events()) << "exactly one OnFinish";
+}
+
+namespace {
+
+/// A client auth handler with no usable token: SetToken() fails before the RPC
+/// is published, which is the path a call object must survive without waiting
+/// for an RPC that never starts.
+class FailingTokenHandler : public ClientAuthHandler {
+ public:
+  Status Authenticate(ClientAuthSender*, ClientAuthReader*) override {
+    return Status::OK();
+  }
+  Status GetToken(std::string*) override { return Status::Invalid("no token available"); }
+};
+
+}  // namespace
+
+TEST_F(GrpcAsyncDoGet, FailingTokenIsReportedAndDoesNotHang) {
+  // A call that fails before it is published must still report through
+  // OnFinish(), and destroying it must not block: the call object waits for its
+  // RPC in its destructor, and this RPC never started.  SetToken() is the check
+  // that can fail here - the token comes from the handler.
+  FlightCallOptions call_options;
+  // The handshake is unimplemented on this server (it has no auth handler); the
+  // handler is installed before it runs, which is all the per-call token needs.
+  const auto handshake_status =
+      harness.client->Authenticate(call_options, std::make_unique<FailingTokenHandler>());
+  ARROW_UNUSED(handshake_status);
+
+  auto listener = std::make_shared<RecordDoGetListener>();
+  harness.client->DoGetAsync(Ticket{"ticket-ints-1"}, listener);
+
+  ASSERT_TRUE(listener->WaitForFinish()) << "the failure must be reported";
+  ASSERT_TRUE(listener->status().IsInvalid()) << listener->status().ToString();
+  ASSERT_THAT(listener->status().ToString(), ::testing::HasSubstr("no token available"));
 }
 
 }  // namespace flight

@@ -42,7 +42,7 @@
 #include "arrow/flight/server_middleware.h"
 #include "arrow/flight/transport/grpc/grpc_server_internal.h"
 #include "arrow/flight/transport/grpc/serialization_internal.h"
-#include "arrow/util/future.h"
+#include "arrow/util/logging.h"
 
 namespace arrow::flight::transport::grpc {
 
@@ -61,6 +61,25 @@ namespace {
 arrow::Status Internal(std::string message) {
   return arrow::Status::IOError(std::move(message))
       .WithDetail(std::make_shared<FlightStatusDetail>(FlightStatusCode::Internal));
+}
+
+// Copy a gRPC ByteBuffer's slices into one contiguous string. 
+// Dump() copies the bytes out, so the result does not alias the request buffer.
+// \param[in] buffer The gRPC ByteBuffer to copy from.
+// \param[in] error_message The error message to use if the buffer cannot be dumped.
+// \return A contiguous string containing the buffer's bytes, or an Internal status on failure.
+arrow::Result<std::string> BytesFromBuffer(const ::grpc::ByteBuffer& buffer,
+                                           std::string_view error_message) {
+  std::vector<::grpc::Slice> slices;
+  if (!buffer.Dump(&slices).ok()) {
+    return Internal(std::string(error_message));
+  }
+  std::string bytes;
+  bytes.reserve(buffer.Length());
+  for (const auto& slice : slices) {
+    bytes.append(reinterpret_cast<const char*>(slice.begin()), slice.size());
+  }
+  return bytes;
 }
 
 // The Arrow-side call context every reactor on this path carries; it is built
@@ -106,16 +125,15 @@ FlightMethod MethodFromName(std::string_view method) {
 /// \brief Serve one DoGet RPC over the generic callback API.
 ///
 /// The generic callback API has no server-streaming reactor, so DoGet is
-/// served on a bidi reactor used write-only
-//  The request is read once, then one payload is written per OnWriteDone turn until the
-//  FlightDataStream
+/// served on a bidi reactor used write-only: the request is read once, then
+/// one payload is written per OnWriteDone turn until the FlightDataStream
 /// ends. The payload sequence mirrors the sync transport
 /// (ServerTransportBase::WriteDataStream): schema payload first, then Next()
 /// until the last payload, which has no metadata.
 class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
  public:
   /// `flight_context` is prepared by the service (middleware/auth already
-  /// ran); the underlying gRPC context is owned by gRPC and outlives the
+  /// ran), the underlying gRPC context is owned by gRPC and outlives the
   /// reactor (the reactor is deleted in OnDone, before the context is
   /// destroyed).
   DoGetReactor(AsyncCallContext flight_context, FlightServerBase* base)
@@ -144,7 +162,6 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
       return;
     }
     if (data_stream_ == nullptr) {
-      // Same as the sync transport, ServerTransportBase::WriteDataStream.
       Finish(flight_context_.FinishRequest(
           arrow::Status::KeyError("No data in this flight")));
       return;
@@ -176,7 +193,9 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
     if (data_stream_ != nullptr) {
       const auto status = data_stream_->Close();
       if (!status.ok()) {
-        // TODO:Log the error or handle it as needed.
+        ARROW_LOG(WARNING) << "DoGet: closing the data stream after a client "
+                              "cancel failed: "
+                           << status;
       }
     }
   }
@@ -189,15 +208,8 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   /// Parse the request ByteBuffer as the pb::Ticket of the DoGet request.
   /// \return A Result containing the parsed Ticket, or an error if parsing failed.
   arrow::Result<Ticket> ParseTicket() {
-    std::vector<::grpc::Slice> slices;
-    if (!request_buf_.Dump(&slices).ok()) {
-      return Internal("Failed to read request");
-    }
-    std::string bytes;
-    bytes.reserve(request_buf_.Length());
-    for (const auto& slice : slices) {
-      bytes.append(reinterpret_cast<const char*>(slice.begin()), slice.size());
-    }
+    ARROW_ASSIGN_OR_RAISE(std::string bytes,
+                          BytesFromBuffer(request_buf_, "Failed to read request"));
     pb::Ticket pb_ticket;
     if (!pb_ticket.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
       return arrow::Status::Invalid("Failed to parse Ticket");
@@ -228,25 +240,17 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
       return;
     }
 
-    const auto buffers = payload.SerializeToBuffers();
-    if (!buffers.ok()) {
-      Finish(flight_context_.FinishRequest(buffers.status()));
+    // Serialize with the shared zero-copy helper, the same one the sync
+    // transport's typed path uses.
+    bool own_buffer = false;
+    const ::grpc::Status grpc_status =
+        FlightDataSerialize(payload, &write_buf_, &own_buffer);
+    if (!grpc_status.ok()) {
+      Finish(flight_context_.FinishRequest(Internal(grpc_status.error_message())));
       return;
     }
 
-    std::vector<::grpc::Slice> slices;
-    slices.reserve(buffers->size());
-    for (const auto& buffer : *buffers) {
-      auto slice = SliceFromBuffer(buffer);
-      if (!slice.ok()) {
-        Finish(flight_context_.FinishRequest(slice.status()));
-        return;
-      }
-      slices.push_back(std::move(*slice));
-    }
-
     // StartWrite requires the buffer to remain valid until OnWriteDone.
-    write_buf_ = ::grpc::ByteBuffer(slices.data(), slices.size());
     StartWrite(&write_buf_);
   }
 
@@ -386,8 +390,7 @@ class HandshakeReactor : public ::grpc::ServerGenericBidiReactor {
     pb_response.set_payload(std::move(response));
     const std::string bytes = pb_response.SerializeAsString();
     ::grpc::Slice slice(bytes);
-    // Not a local: StartWrite requires the buffer to remain valid until
-    // OnWriteDone.
+    // Not a local: StartWrite requires the buffer to remain valid until OnWriteDone.
     write_buf_ = ::grpc::ByteBuffer(&slice, 1);
     StartWrite(&write_buf_);
   }
@@ -409,15 +412,9 @@ class HandshakeReactor : public ::grpc::ServerGenericBidiReactor {
   /// Parse the request ByteBuffer as the pb::HandshakeRequest of the handshake
   /// and return its payload (the client's password).
   arrow::Result<std::string> ParseRequest() {
-    std::vector<::grpc::Slice> slices;
-    if (!request_buf_.Dump(&slices).ok()) {
-      return Internal("Failed to read HandshakeRequest");
-    }
-    std::string bytes;
-    bytes.reserve(request_buf_.Length());
-    for (const auto& slice : slices) {
-      bytes.append(reinterpret_cast<const char*>(slice.begin()), slice.size());
-    }
+    ARROW_ASSIGN_OR_RAISE(
+        std::string bytes,
+        BytesFromBuffer(request_buf_, "Failed to read HandshakeRequest"));
     pb::HandshakeRequest request;
     if (!request.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
       return arrow::Status::Invalid("Failed to parse HandshakeRequest");
@@ -429,10 +426,6 @@ class HandshakeReactor : public ::grpc::ServerGenericBidiReactor {
   HandshakeFn handshake_handler_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer write_buf_;
-  bool read_in_flight_ = false;
-  bool write_in_flight_ = false;
-  arrow::Future<std::string> read_pending_;
-  arrow::Future<bool> write_pending_;
 };
 
 // Reject unknown methods.  Finish() in the constructor is fine: gRPC backlogs
@@ -517,12 +510,9 @@ class AsyncGenericFlightService : public ::grpc::CallbackGenericService {
     // DoPut needs a listener to hand the incoming batches to, so a server
     // built without a factory does not accept uploads.
     if (method == kDoPutMethod) {
-      if (!listener_factory_) {
-        return new Unimplemented(
-            ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
-                           "DoPut is not implemented: no listener available"));
-      }
-      if (auto listener = listener_factory_()) {
+      // A server built without a factory, or whose factory declined this RPC,
+      // does not accept uploads.
+      if (auto listener = listener_factory_ ? listener_factory_() : nullptr) {
         return new DoPutReactor(std::move(flight_context), std::move(listener));
       }
       return new Unimplemented(

@@ -34,7 +34,6 @@
 #include "arrow/ipc/dictionary.h"
 #include "arrow/ipc/options.h"
 #include "arrow/record_batch.h"
-#include "arrow/util/future.h"
 
 namespace arrow {
 

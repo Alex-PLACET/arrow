@@ -24,7 +24,6 @@
 #include "arrow/flight/type_fwd.h"
 #include "arrow/flight/visibility.h"
 #include "arrow/status.h"
-#include "arrow/util/future.h"
 
 namespace arrow {
 

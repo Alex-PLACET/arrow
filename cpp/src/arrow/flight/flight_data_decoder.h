@@ -68,7 +68,7 @@ class ARROW_FLIGHT_EXPORT FlightMessageDecoder {
       ipc::IpcReadOptions options = ipc::IpcReadOptions::Defaults());
   ~FlightMessageDecoder();
 
-  /// \brief Decode one FlightData message directly from abuffer.
+  /// \brief Decode one FlightData message directly from a buffer.
   ///
   /// Fires listener->OnSchemaDecoded() on the first message containing
   /// a schema, listener->OnNext() for each subsequent record batch,
