@@ -24,22 +24,35 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <grpcpp/generic/callback_generic_service.h>
 
 #include "arrow/flight/flight_data_decoder.h"
+#include "arrow/flight/middleware.h"
 #include "arrow/flight/serialization_internal.h"
 #include "arrow/flight/server.h"
+#include "arrow/flight/server_auth.h"
+#include "arrow/flight/server_middleware.h"
 #include "arrow/flight/transport/grpc/grpc_server_internal.h"
 #include "arrow/flight/transport/grpc/serialization_internal.h"
+#include "arrow/util/future.h"
 
 namespace arrow::flight::transport::grpc {
 
 namespace pb = arrow::flight::protocol;
+
+// The shared helper's async handshake hook: one Handshake RPC adapted to the
+// server class's Handshake virtual.
+using AsyncServerAuthHandshake =
+    GrpcServerCallContextHelper<::grpc::CallbackServerContext>::AsyncServerAuthHandshake;
 
 namespace {
 
@@ -51,18 +64,43 @@ arrow::Status Internal(std::string message) {
       .WithDetail(std::make_shared<FlightStatusDetail>(FlightStatusCode::Internal));
 }
 
-// Every finish, success or error, goes through the transport's own Arrow ->
-// gRPC status conversion.
-//
-// GrpcServerCallContext<...>::FinishRequest(const Status&) is the natural
-// route (it also runs the middleware CallCompleted hook), but this branch
-// declares ToGrpcStatus(const Status&, ::grpc::CallbackServerContext*)
-// without defining it - only the ::grpc::ServerContext* overload exists - so
-// instantiating it fails to link. The middleware hook is inert on this path
-// anyway: the context is constructed directly instead of through
-// GrpcServerCallContextHelper::MakeCallContext, so its middleware list is
-// empty. Switch to FinishRequest when middleware/auth are wired up.
-::grpc::Status FinishStatus(const arrow::Status& status) { return ToGrpcStatus(status); }
+// The Arrow-side call context every reactor on this path carries; it is built
+// by the shared helper (which runs middleware and auth) from the raw gRPC
+// context, and every finish goes through its FinishRequest.
+using AsyncCallContext = GrpcServerCallContext<::grpc::CallbackServerContext>;
+
+constexpr std::string_view kPrefix = "/arrow.flight.protocol.FlightService/";
+constexpr std::string_view kHandshakeMethod = "Handshake";
+constexpr std::string_view kDoGetMethod = "DoGet";
+constexpr std::string_view kDoPutMethod = "DoPut";
+
+// Map a gRPC method name to the middleware-visible Flight method; unknown
+// names become FlightMethod::Invalid.
+FlightMethod MethodFromName(std::string_view method) {
+  if (!method.starts_with(kPrefix)) {
+    return FlightMethod::Invalid;
+  }
+  method.remove_prefix(kPrefix.size());
+  constexpr std::pair<std::string_view, FlightMethod> kMethods[] = {
+      {"Handshake", FlightMethod::Handshake},
+      {"ListFlights", FlightMethod::ListFlights},
+      {"GetFlightInfo", FlightMethod::GetFlightInfo},
+      {"GetSchema", FlightMethod::GetSchema},
+      {"DoGet", FlightMethod::DoGet},
+      {"DoPut", FlightMethod::DoPut},
+      {"DoAction", FlightMethod::DoAction},
+      {"ListActions", FlightMethod::ListActions},
+      {"DoExchange", FlightMethod::DoExchange},
+      {"PollFlightInfo", FlightMethod::PollFlightInfo},
+  };
+
+  const auto it = std::ranges::find_if(
+      kMethods, [method](const auto& pair) { return pair.first == method; });
+  if (it != std::end(kMethods)) {
+    return it->second;
+  }
+  return FlightMethod::Invalid;
+}
 
 }  // namespace
 
@@ -77,10 +115,12 @@ arrow::Status Internal(std::string message) {
 /// until the last payload, which has no metadata.
 class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
  public:
-  /// `context` is owned by gRPC and outlives the reactor (the reactor is
-  /// deleted in OnDone, before the context is destroyed).
-  DoGetReactor(::grpc::CallbackServerContext* context, FlightServerBase* base)
-      : flight_context_(context), base_(base) {
+  /// `flight_context` is prepared by the service (middleware/auth already
+  /// ran); the underlying gRPC context is owned by gRPC and outlives the
+  /// reactor (the reactor is deleted in OnDone, before the context is
+  /// destroyed).
+  DoGetReactor(AsyncCallContext flight_context, FlightServerBase* base)
+      : flight_context_(std::move(flight_context)), base_(base) {
     StartRead(&request_buf_);
   }
 
@@ -89,24 +129,25 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   void OnReadDone(bool ok) override {
     // Request has been read.
     if (!ok) {
-      Finish(FinishStatus(Internal("Failed to read request")));
+      Finish(flight_context_.FinishRequest(Internal("Failed to read request")));
       return;
     }
 
     const auto ticket = ParseTicket();
     if (!ticket.ok()) {
-      Finish(FinishStatus(ticket.status()));
+      Finish(flight_context_.FinishRequest(ticket.status()));
       return;
     }
 
     const auto status = base_->DoGet(flight_context_, *ticket, &data_stream_);
     if (!status.ok()) {
-      Finish(FinishStatus(status));
+      Finish(flight_context_.FinishRequest(status));
       return;
     }
     if (data_stream_ == nullptr) {
       // Same as the sync transport, ServerTransportBase::WriteDataStream.
-      Finish(FinishStatus(arrow::Status::KeyError("No data in this flight")));
+      Finish(flight_context_.FinishRequest(
+          arrow::Status::KeyError("No data in this flight")));
       return;
     }
 
@@ -120,7 +161,7 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
     // We have finished writing. We can write the next payload or finish the
     // stream.
     if (!ok) {
-      Finish(FinishStatus(Internal("Write failed")));
+      Finish(flight_context_.FinishRequest(Internal("Write failed")));
       return;
     }
     // Continue writing the next payload.
@@ -176,7 +217,7 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
     arrow::Result<FlightPayload> next =
         wrote_schema_ ? data_stream_->Next() : data_stream_->GetSchemaPayload();
     if (!next.ok()) {
-      Finish(FinishStatus(next.status()));
+      Finish(flight_context_.FinishRequest(next.status()));
       return;
     }
     wrote_schema_ = true;
@@ -184,13 +225,13 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
 
     // End of stream: the last payload has no metadata.
     if (payload.ipc_message.metadata == nullptr) {
-      Finish(FinishStatus(data_stream_->Close()));
+      Finish(flight_context_.FinishRequest(data_stream_->Close()));
       return;
     }
 
     const auto buffers = payload.SerializeToBuffers();
     if (!buffers.ok()) {
-      Finish(FinishStatus(buffers.status()));
+      Finish(flight_context_.FinishRequest(buffers.status()));
       return;
     }
 
@@ -199,7 +240,7 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
     for (const auto& buffer : *buffers) {
       auto slice = SliceFromBuffer(buffer);
       if (!slice.ok()) {
-        Finish(FinishStatus(slice.status()));
+        Finish(flight_context_.FinishRequest(slice.status()));
         return;
       }
       slices.push_back(std::move(*slice));
@@ -228,12 +269,13 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
 /// client's DoPut return.
 class DoPutReactor : public ::grpc::ServerGenericBidiReactor {
  public:
-  /// \param `context` is owned by gRPC and outlives the reactor (the reactor is
+  /// \param `flight_context` is prepared by the service (middleware/auth ran); the raw
+  /// context is owned by gRPC and outlives the reactor (the reactor is
   /// deleted in OnDone, before the context is destroyed).
   /// \param `listener` is the per-RPC listener that will receive the uploaded data.
-  DoPutReactor(::grpc::CallbackServerContext* context,
+  DoPutReactor(AsyncCallContext flight_context,
                std::shared_ptr<FlightDataListener> listener)
-      : flight_context_(context), decoder_(std::move(listener)) {
+      : flight_context_(std::move(flight_context)), decoder_(std::move(listener)) {
     StartRead(&request_buf_);
   }
 
@@ -259,8 +301,8 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor {
     std::shared_ptr<arrow::Buffer> arrow_buf;
     const Status wrap_status = WrapGrpcBuffer(&request_buf_, &arrow_buf);
     if (!wrap_status.ok()) {
-      Finish(
-          FinishStatus(Internal("Failed to wrap gRPC buffer: " + wrap_status.message())));
+      Finish(flight_context_.FinishRequest(
+          Internal("Failed to wrap gRPC buffer: " + wrap_status.message())));
       return;
     }
 
@@ -269,7 +311,7 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor {
     const Status decode_status = decoder_.Consume(std::move(arrow_buf));
     if (!decode_status.ok()) {
       // The listener's status is the transport error rejecting the upload.
-      Finish(FinishStatus(decode_status));
+      Finish(flight_context_.FinishRequest(decode_status));
       return;
     }
 
@@ -283,10 +325,10 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor {
   void OnWriteDone(bool ok) override {
     if (!ok) {
       // The client closed its half of the stream before the write could complete.
-      Finish(FinishStatus(Internal("Write failed")));
+      Finish(flight_context_.FinishRequest(Internal("Write failed")));
       return;
     }
-    Finish(FinishStatus(arrow::Status::OK()));
+    Finish(flight_context_.FinishRequest(arrow::Status::OK()));
   }
 
   /// \brief Called when the client cancels the RPC.
@@ -306,55 +348,352 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor {
   ::grpc::ByteBuffer write_buf_;
 };
 
-// Reject unknown methods.
-  class Unimplemented : public ::grpc::ServerGenericBidiReactor {
-    public:
-    explicit Unimplemented(std::string_view error_message) { Finish(::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, error_message)); }
-    void OnDone() override { delete this; }
-  };
+namespace {
 
+/// Adapt a handshake response write to the reactor's write operation.
+class HandshakeAuthSender final : public AsyncServerAuthSender {
+ public:
+  using WriteFn = std::function<arrow::Future<bool>(pb::HandshakeResponse)>;
+  explicit HandshakeAuthSender(WriteFn write_fn) : write_fn_(std::move(write_fn)) {}
+
+  arrow::Future<> Write(const std::string& token) override {
+    pb::HandshakeResponse response;
+    response.set_payload(token);
+    return write_fn_(std::move(response)).Then([](bool ok) -> arrow::Status {
+      return ok ? arrow::Status::OK() : arrow::Status::IOError("Stream was closed.");
+    });
+  }
+
+ private:
+  WriteFn write_fn_;
+};
+
+/// Adapt a handshake request read to the reactor's read operation.
+class HandshakeAuthReader final : public AsyncServerAuthReader {
+ public:
+  using ReadFn = std::function<arrow::Future<std::string>()>;
+  explicit HandshakeAuthReader(ReadFn read_fn) : read_fn_(std::move(read_fn)) {}
+
+  arrow::Future<std::string> Read() override { return read_fn_(); }
+
+ private:
+  ReadFn read_fn_;
+};
+
+}  // namespace
+
+/// \brief A self-owned callback reactor: one reference for gRPC plus one per
+/// background continuation.
+///
+/// gRPC's *client* callback API provides holds (AddHold/MaybeReleaseHold) but
+/// its *server* API does not, so this reactor deletes itself only when every
+/// reference is gone.  Ported from branch `async_grpc_server`
+/// (`grpc_server_async_internal.h`, `SelfOwnedReactor`).
+template <typename Derived>
+class SelfOwnedReactor {
+ public:
+  /// Retain this reactor across an asynchronous continuation.
+  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
+  /// Release a reference acquired with Hold(); deletes the reactor when last.
+  void ReleaseHold() { ReleaseRef(); }
+  /// Finish the RPC at most once, even if several async paths fail together.
+  void FinishOnce(::grpc::Status status) {
+    bool expected = false;
+    if (finished_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      static_cast<Derived*>(this)->Finish(std::move(status));
+    }
+  }
+  void ReleaseRef() {
+    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete static_cast<Derived*>(this);
+    }
+  }
+
+ private:
+  std::atomic<bool> finished_{false};
+  /// The initial reference belongs to gRPC and is released in OnDone().
+  std::atomic<int> refs_{1};
+};
+
+/// \brief Serve the Handshake RPC over the generic callback API.
+///
+/// The generic API has no typed auth stream, so this reactor reads request
+/// ByteBuffers and writes response ByteBuffers, exposing both through
+/// future-returning AsyncServerAuthSender/Reader adapters.  One read and one
+/// write are outstanding at most: the application must await each returned
+/// Future before starting the next operation, and violations are rejected
+/// loudly rather than silently interleaved.
+class HandshakeReactor : public ::grpc::ServerGenericBidiReactor,
+                         public SelfOwnedReactor<HandshakeReactor> {
+ public:
+  /// `flight_context` is prepared by the service (middleware ran; the token
+  /// check does not apply to Handshake), and `handshake_handler` is the server
+  /// class's Handshake hook.  The raw gRPC context is owned by gRPC and
+  /// outlives the reactor (which is deleted in OnDone).
+  HandshakeReactor(AsyncCallContext flight_context,
+                   AsyncServerAuthHandshake handshake_handler)
+      : flight_context_(std::move(flight_context)),
+        handshake_handler_(std::move(handshake_handler)) {
+    // The hook resolves its Future from a transport callback or from its own
+    // thread; the extra reference keeps this reactor alive until that
+    // continuation ran (gRPC's own reference is released in OnDone()).
+    Hold();
+    Run();
+  }
+
+  /// \brief Called when a read operation has completed.
+  /// \param[in] ok Whether the read was successful.
+  void OnReadDone(bool ok) override {
+    arrow::Future<std::string> pending;
+    arrow::Status error;
+    std::string payload;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!read_in_flight_) return;  // stale completion after OnCancel
+      read_in_flight_ = false;
+      pending = read_pending_;
+      if (ok) {
+        auto parsed = ParseRequest();
+        if (parsed.ok()) {
+          payload = std::move(*parsed);
+        } else {
+          error = std::move(parsed).status();
+        }
+      } else {
+        error = arrow::Status::IOError("Stream is closed.");
+      }
+    }
+    // Resolve outside the lock: the hook's continuation runs inline here and
+    // may start the next read/write, which takes the same mutex.
+    if (error.ok()) {
+      pending.MarkFinished(std::move(payload));
+    } else {
+      pending.MarkFinished(std::move(error));
+    }
+  }
+
+  /// \brief Called when a write operation has completed.
+  /// \param[in] ok Whether the write was successful.
+  void OnWriteDone(bool ok) override {
+    arrow::Future<bool> pending;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!write_in_flight_) return;  // stale completion after OnCancel
+      write_in_flight_ = false;
+      pending = write_pending_;
+    }
+    pending.MarkFinished(ok);
+  }
+
+  /// The client went away: fail everything outstanding so the hook can finish
+  /// and release the hold.  gRPC may call this concurrently with OnWriteDone.
+  void OnCancel() override {
+    arrow::Future<std::string> read_pending;
+    arrow::Future<bool> write_pending;
+    bool read_in_flight = false;
+    bool write_in_flight = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      read_in_flight = read_in_flight_;
+      write_in_flight = write_in_flight_;
+      read_in_flight_ = false;
+      write_in_flight_ = false;
+      if (read_in_flight) read_pending = read_pending_;
+      if (write_in_flight) write_pending = write_pending_;
+    }
+    if (read_in_flight) read_pending.MarkFinished(arrow::Status::Cancelled());
+    if (write_in_flight) write_pending.MarkFinished(false);
+  }
+
+  /// \brief Called when the RPC is fully done, regardless of success or
+  /// cancellation.  This is the last callback that will be invoked for this
+  /// RPC; the last reference deletes the reactor.
+  void OnDone() override { ReleaseRef(); }
+
+ private:
+  /// Parse the request ByteBuffer as the pb::HandshakeRequest of the handshake
+  /// and return its payload (the client's password).
+  arrow::Result<std::string> ParseRequest() {
+    std::vector<::grpc::Slice> slices;
+    if (!request_buf_.Dump(&slices).ok()) {
+      return Internal("Failed to read HandshakeRequest");
+    }
+    std::string bytes;
+    bytes.reserve(request_buf_.Length());
+    for (const auto& slice : slices) {
+      bytes.append(reinterpret_cast<const char*>(slice.begin()), slice.size());
+    }
+    pb::HandshakeRequest request;
+    if (!request.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
+      return arrow::Status::Invalid("Failed to parse HandshakeRequest");
+    }
+    return request.payload();
+  }
+
+  /// Read one request message; the returned Future must be awaited before the
+  /// next read.
+  arrow::Future<std::string> ReadOne() {
+    arrow::Future<std::string> pending;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (read_in_flight_) {
+        return arrow::Future<std::string>::MakeFinished(arrow::Status::Invalid(
+            "overlapping Handshake reads: await the previous Future first"));
+      }
+      read_in_flight_ = true;
+      pending = arrow::Future<std::string>::Make();
+      read_pending_ = pending;
+    }
+    StartRead(&request_buf_);
+    return pending;
+  }
+
+  /// Write one response message; the returned Future must be awaited before
+  /// the next write.
+  arrow::Future<bool> WriteOne(pb::HandshakeResponse response) {
+    const std::string bytes = response.SerializeAsString();
+    arrow::Future<bool> pending;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (write_in_flight_) {
+        return arrow::Future<bool>::MakeFinished(arrow::Status::Invalid(
+            "overlapping Handshake writes: await the previous Future first"));
+      }
+      write_in_flight_ = true;
+      pending = arrow::Future<bool>::Make();
+      write_pending_ = pending;
+      ::grpc::Slice slice(bytes);
+      // Not a local: StartWrite requires the buffer to remain valid until
+      // OnWriteDone.
+      write_buf_ = ::grpc::ByteBuffer(&slice, 1);
+    }
+    StartWrite(&write_buf_);
+    return pending;
+  }
+
+  /// Hand the transport's async view of the handshake to the server's hook.
+  void Run() {
+    auto outgoing = std::make_unique<HandshakeAuthSender>(
+        [this](pb::HandshakeResponse response) { return WriteOne(std::move(response)); });
+    auto incoming = std::make_unique<HandshakeAuthReader>([this] { return ReadOne(); });
+    handshake_handler_(flight_context_, std::move(outgoing), std::move(incoming))
+        .AddCallback([this](const Status& status) {
+          // FinishOnce: a cancel racing this continuation must not Finish twice.
+          FinishOnce(flight_context_.FinishRequest(status));
+          // Last statement: this reference is what keeps `this` alive to here.
+          ReleaseHold();
+        });
+  }
+
+  AsyncCallContext flight_context_;
+  AsyncServerAuthHandshake handshake_handler_;
+  std::mutex mutex_;
+  ::grpc::ByteBuffer request_buf_;
+  ::grpc::ByteBuffer write_buf_;
+  bool read_in_flight_ = false;
+  bool write_in_flight_ = false;
+  arrow::Future<std::string> read_pending_;
+  arrow::Future<bool> write_pending_;
+};
+
+// Reject unknown methods.  Finish() in the constructor is fine: gRPC backlogs
+// operations issued before the reactor is returned to it.
+class Unimplemented : public ::grpc::ServerGenericBidiReactor {
+ public:
+  explicit Unimplemented(::grpc::Status status) : status_(std::move(status)) {
+    Finish(status_);
+  }
+  void OnDone() override { delete this; }
+
+ private:
+  ::grpc::Status status_;
+};
 
 /// \brief Generic callback service dispatching Flight methods to reactors.
 ///
-/// Constructed with the FlightServerBase whose methods are served; the
-/// server's auth handler and middleware are NOT run on this path (see the
-/// FinishStatus note). DoPut additionally needs a listener factory (one
-/// listener per RPC); without it, DoPut is answered UNIMPLEMENTED.
+/// Constructed with the FlightServerBase whose methods are served.  The
+/// server's middleware runs for every call, through the shared context
+/// ⟪HERMES-CONTEXT-COMPRESSION: 370 of 570 chars omitted here by Hermes's context
+/// compressor. This is NOT part of the original tool call and must never be reproduced in
+/// new output — always write full, untruncated content.⟫
 class AsyncGenericFlightService : public ::grpc::CallbackGenericService {
  public:
   /// `listener_factory` creates the FlightDataListener serving one DoPut RPC;
   /// the service consults it per RPC and refuses uploads when it is empty.
   /// \param base is the FlightServerBase whose methods are served.
-  /// \param listener_factory is used to create FlightDataListener instances for DoPut RPCs.
-  explicit AsyncGenericFlightService(FlightServerBase* base,
-                                     FlightDataListenerFactory listener_factory = {})
-      : base_(base), listener_factory_(std::move(listener_factory)) {}
+  /// \param listener_factory is used to create FlightDataListener instances for DoPut
+  /// RPCs. \param handshake_handler is the server's Handshake hook; an empty hook means
+  /// the server has no authentication mechanism.
+  AsyncGenericFlightService(
+      FlightServerBase* base, FlightDataListenerFactory listener_factory,
+      std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>> helper,
+      AsyncServerAuthHandshake handshake_handler = {})
+      : base_(base),
+        listener_factory_(std::move(listener_factory)),
+        helper_(std::move(helper)),
+        handshake_handler_(std::move(handshake_handler)) {}
 
   /// \brief Creates a reactor for the incoming RPC.
   /// \param context is the gRPC callback server context for the RPC.
-  /// \return a new reactor handling the RPC, or an Unimplemented reactor if the method is unknown.
+  /// \return a new reactor handling the RPC, or an Unimplemented reactor if the method is
+  /// unknown.
   ::grpc::ServerGenericBidiReactor* CreateReactor(
       ::grpc::GenericCallbackServerContext* context) override {
-    if (context->method() == "/arrow.flight.protocol.FlightService/DoGet") {
-      return new DoGetReactor(context, base_);
+    const std::string method = context->method();
+    // The enum keeps middleware able to switch on the method;
+    // unknown names map to FlightMethod::Invalid.
+    const FlightMethod flight_method = MethodFromName(method);
+    AsyncCallContext flight_context(context);
+
+    // Handshake is how a client obtains a token: middleware runs, the token
+    // check does not.  Every other method - implemented here or not - is
+    // authenticated first, so an unauthenticated caller never learns whether
+    // a method exists.
+    const auto prepare_status =
+        method == kHandshakeMethod
+            ? helper_->MakeCallContext(flight_method, context, &flight_context)
+            : helper_->CheckAuth(flight_method, context, &flight_context);
+    if (!prepare_status.ok()) {
+      return new Unimplemented(prepare_status);
+    }
+
+    if (method == kHandshakeMethod) {
+      if (!handshake_handler_) {
+        return new Unimplemented(::grpc::Status(
+            ::grpc::StatusCode::UNIMPLEMENTED,
+            "This service does not have an authentication mechanism enabled."));
+      }
+      return new HandshakeReactor(std::move(flight_context), handshake_handler_);
+    }
+
+    if (method == kDoGetMethod) {
+      return new DoGetReactor(std::move(flight_context), base_);
     }
     // DoPut needs a listener to hand the incoming batches to, so a server
     // built without a factory does not accept uploads.
-    if (context->method() == "/arrow.flight.protocol.FlightService/DoPut") {
+    if (method == kDoPutMethod) {
       if (!listener_factory_) {
-        return new Unimplemented("DoPut is not implemented: no listener available");
+        return new Unimplemented(
+            ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
+                           "DoPut is not implemented: no listener available"));
       }
-      auto listener = listener_factory_();
-      if (listener) {
-        return new DoPutReactor(context, std::move(listener));
+      if (auto listener = listener_factory_()) {
+        return new DoPutReactor(std::move(flight_context), std::move(listener));
       }
+      return new Unimplemented(
+          ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
+                         "DoPut is not implemented: no listener available"));
     }
-    return new Unimplemented("Unknown method");
+    return new Unimplemented(
+        ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "Unknown method"));
   }
 
  private:
   FlightServerBase* base_;
   FlightDataListenerFactory listener_factory_;
+  std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>> helper_;
+  /// The server class's Handshake hook; empty when the server has none.
+  AsyncServerAuthHandshake handshake_handler_;
 };
 
 }  // namespace arrow::flight::transport::grpc

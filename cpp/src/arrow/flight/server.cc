@@ -36,6 +36,7 @@
 #include "arrow/flight/types.h"
 #include "arrow/status.h"
 #include "arrow/type.h"
+#include "arrow/util/future.h"
 
 namespace arrow {
 namespace flight {
@@ -176,6 +177,28 @@ Status FlightServerBase::GetSchema(const ServerCallContext& context,
                                    const FlightDescriptor& request,
                                    std::unique_ptr<SchemaResult>* schema) {
   return Status::NotImplemented("NYI");
+}
+
+AsyncGenericFlightServerBase::AsyncGenericFlightServerBase() = default;
+AsyncGenericFlightServerBase::~AsyncGenericFlightServerBase() = default;
+
+Status AsyncGenericFlightServerBase::Init(const FlightServerOptions& options) {
+  FlightServerOptions async_options = options;
+  async_options.use_async_grpc = true;
+  return FlightServerBase::Init(async_options);
+}
+
+Future<> AsyncGenericFlightServerBase::Handshake(const ServerCallContext&,
+                                                 std::unique_ptr<AsyncServerAuthSender>,
+                                                 std::unique_ptr<AsyncServerAuthReader>) {
+  return Future<>::MakeFinished(Status::NotImplemented(
+      "This service does not have an authentication mechanism enabled."));
+}
+
+Status AsyncGenericFlightServerBase::ValidateToken(const ServerCallContext&,
+                                                   const std::string&, std::string*) {
+  // Keep the transport-level (TLS) identity; ignore the token.
+  return Status::OK();
 }
 
 // ----------------------------------------------------------------------

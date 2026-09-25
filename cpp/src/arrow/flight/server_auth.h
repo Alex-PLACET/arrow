@@ -24,6 +24,7 @@
 #include "arrow/flight/type_fwd.h"
 #include "arrow/flight/visibility.h"
 #include "arrow/status.h"
+#include "arrow/util/future.h"
 
 namespace arrow {
 
@@ -43,6 +44,28 @@ class ARROW_FLIGHT_EXPORT ServerAuthSender {
  public:
   virtual ~ServerAuthSender() = default;
   virtual Status Write(const std::string& message) = 0;
+};
+
+/// \brief An async writer for handshake messages, provided to the async
+/// handshake hook.
+///
+/// Write() completes once the message was sent; the returned Future must be
+/// awaited before the next operation on the same call.
+class ARROW_FLIGHT_EXPORT AsyncServerAuthSender {
+ public:
+  virtual ~AsyncServerAuthSender() = default;
+  virtual Future<> Write(const std::string& message) = 0;
+};
+
+/// \brief An async reader for handshake messages, provided to the async
+/// handshake hook.
+///
+/// Read() completes with one message, or fails with IOError if the client
+/// closed the stream.
+class ARROW_FLIGHT_EXPORT AsyncServerAuthReader {
+ public:
+  virtual ~AsyncServerAuthReader() = default;
+  virtual Future<std::string> Read() = 0;
 };
 
 /// \brief An authentication implementation for a Flight service.

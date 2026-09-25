@@ -440,18 +440,40 @@ class GrpcServerTransport : public internal::ServerTransport {
 
   Status Init(const FlightServerOptions& options, const arrow::util::Uri& uri) override {
     if (options.use_async_grpc) {
-      // The generic callback service runs neither the auth handler nor the
-      // middleware: refuse to start rather than silently skipping them.
+      // The generic callback service runs middleware (through the shared helper)
+      // but cannot run the blocking ServerAuthHandler: it is driven from
+      // callback threads.  Refuse it rather than silently serving
+      // unauthenticated requests.
       if (options.auth_handler) {
         return Status::NotImplemented(
-            "FlightServerOptions::use_async_grpc does not support an auth handler");
+            "FlightServerOptions::use_async_grpc does not support a blocking "
+            "auth handler; derive from AsyncGenericFlightServerBase and "
+            "override Handshake/ValidateToken instead");
       }
-      if (!options.middleware.empty()) {
-        return Status::NotImplemented(
-            "FlightServerOptions::use_async_grpc does not support middleware");
+      // The async hooks come from the server class when it is used; a plain
+      // FlightServerBase + use_async_grpc server simply has none.  The cast
+      // pointer stays valid for the server's lifetime: it IS the user's server
+      // object.
+      auto* async_base = dynamic_cast<AsyncGenericFlightServerBase*>(base());
+      using AsyncHelper = GrpcServerCallContextHelper<::grpc::CallbackServerContext>;
+      AsyncHelper::AsyncServerAuthHandshake handshake;
+      AsyncHelper::ValidateTokenFn validate_token;
+      if (async_base) {
+        handshake = [async_base](const ServerCallContext& context,
+                                 std::unique_ptr<AsyncServerAuthSender> outgoing,
+                                 std::unique_ptr<AsyncServerAuthReader> incoming) {
+          return async_base->Handshake(context, std::move(outgoing), std::move(incoming));
+        };
+        validate_token = [async_base](const ServerCallContext& context,
+                                      const std::string& token,
+                                      std::string* peer_identity) {
+          return async_base->ValidateToken(context, token, peer_identity);
+        };
       }
-      async_service_ =
-          std::make_unique<AsyncGenericFlightService>(base(), options.listener_factory);
+      async_helper_ = std::make_shared<AsyncHelper>(
+          /*auth_handler=*/nullptr, options.middleware, std::move(validate_token));
+      async_service_ = std::make_unique<AsyncGenericFlightService>(
+          base(), options.listener_factory, async_helper_, std::move(handshake));
     } else {
       grpc_service_.reset(
           new GrpcServiceHandler(options.auth_handler, options.middleware, this));
@@ -497,6 +519,11 @@ class GrpcServerTransport : public internal::ServerTransport {
 
  private:
   std::unique_ptr<GrpcServiceHandler> grpc_service_;
+  // Set when FlightServerOptions::use_async_grpc is on; shared with the service
+  // (and, from task T11 on, with the per-call auth hook). Declared before
+  // async_service_ so it outlives it.
+  std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>>
+      async_helper_;
   // Set when FlightServerOptions::use_async_grpc is on. Declared before
   // grpc_server_ so it outlives it (the server holds a pointer to it).
   std::unique_ptr<AsyncGenericFlightService> async_service_;
