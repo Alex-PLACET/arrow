@@ -97,6 +97,51 @@ FlightMethod MethodFromName(std::string_view method) {
   return FlightMethod::Invalid;
 }
 
+/// Serialize one proto message into a ByteBuffer the caller must keep alive
+/// until the write completes (a reactor member, never a local).
+template <typename ProtoT>
+::grpc::ByteBuffer MakeWriteBuffer(const ProtoT& message) {
+  const std::string bytes = message.SerializeAsString();
+  ::grpc::Slice slice(bytes);
+  return ::grpc::ByteBuffer(&slice, 1);
+}
+
+/// \brief Read `buf` as the proto message `PbT`.
+/// \param[in] what names the message in the "Failed to read/parse <what>"
+/// errors ("Ticket", "FlightDescriptor", …).
+template <typename PbT>
+arrow::Result<PbT> ParseProtoRequest(const ::grpc::ByteBuffer& buf,
+                                     std::string_view what) {
+  ARROW_ASSIGN_OR_RAISE(std::string bytes,
+                        BytesFromBuffer(buf, "Failed to read request"));
+  PbT pb;
+  if (!pb.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
+    return arrow::Status::Invalid("Failed to parse ", what);
+  }
+  return pb;
+}
+
+/// \brief Read `buf` as the proto message `PbT` and convert it to `T`.
+template <typename PbT, typename T>
+arrow::Result<T> ParseProtoRequest(const ::grpc::ByteBuffer& buf,
+                                   std::string_view what) {
+  ARROW_ASSIGN_OR_RAISE(auto pb, ParseProtoRequest<PbT>(buf, what));
+  T out;
+  ARROW_RETURN_NOT_OK(internal::FromProto(pb, &out));
+  return out;
+}
+
+/// \brief Serialize `value` into `*out`, or answer what the sync transport
+/// answers for a handler that returned OK without setting its result
+/// (grpc_server.cc: "Flight not found").
+template <typename T, typename PbT>
+arrow::Status SerializeOrNotFound(const std::unique_ptr<T>& value, PbT* out) {
+  if (value == nullptr) {
+    return arrow::Status::KeyError("Flight not found");
+  }
+  return internal::ToProto(*value, out);
+}
+
 /// \brief Serve one DoGet RPC over the generic callback API.
 ///
 /// The generic callback API has no server-streaming reactor, so DoGet is
@@ -206,18 +251,7 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   /// Parse the request ByteBuffer as the pb::Ticket of the DoGet request.
   /// \return A Result containing the parsed Ticket, or an error if parsing failed.
   arrow::Result<Ticket> ParseTicket() {
-    ARROW_ASSIGN_OR_RAISE(std::string bytes,
-                          BytesFromBuffer(request_buf_, "Failed to read request"));
-    pb::Ticket pb_ticket;
-    if (!pb_ticket.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
-      return arrow::Status::Invalid("Failed to parse Ticket");
-    }
-    Ticket ticket;
-    const auto status = internal::FromProto(pb_ticket, &ticket);
-    if (!status.ok()) {
-      return status;
-    }
-    return ticket;
+    return ParseProtoRequest<pb::Ticket, Ticket>(request_buf_, "Ticket");
   }
 
   /// \brief Ensures that gRPC's Finish is called at most once, and never after OnDone.
@@ -244,6 +278,11 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   /// NextAsync() is the server's code: the payload can complete on any thread,
   /// so the reactor holds itself across that callback and never touches the call
   /// context once the RPC is dead.
+  ///
+  /// The payload sequence mirrors the sync DoGet contract,
+  /// ServerTransportBase::WriteDataStream (transport_server_internal.cc): schema
+  /// payload first, the end of the stream is the payload whose
+  /// ipc_message.metadata is null, Close() last.
   void WriteNextPayload() {
     if (cancelled_) {
       FinishOnce(flight_context_.FinishRequest(arrow::Status::Cancelled()));
@@ -338,10 +377,9 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor {
       // The client closed its half of the stream: acknowledge the upload.
       // The client's DoPut does not return until it has read this message.
       pb::PutResult pb_result;
-      ::grpc::Slice slice(pb_result.SerializeAsString());
       // Not a local variable: StartWrite requires the ByteBuffer to remain
       // valid until OnWriteDone.
-      write_buf_ = ::grpc::ByteBuffer(&slice, 1);
+      write_buf_ = MakeWriteBuffer(pb_result);
       StartWrite(&write_buf_);
       return;
     }
@@ -438,10 +476,8 @@ class HandshakeReactor : public ::grpc::ServerGenericBidiReactor {
     }
     pb::HandshakeResponse pb_response;
     pb_response.set_payload(std::move(response));
-    const std::string bytes = pb_response.SerializeAsString();
-    ::grpc::Slice slice(bytes);
     // Not a local: StartWrite requires the buffer to remain valid until OnWriteDone.
-    write_buf_ = ::grpc::ByteBuffer(&slice, 1);
+    write_buf_ = MakeWriteBuffer(pb_response);
     StartWrite(&write_buf_);
   }
 
@@ -464,12 +500,8 @@ class HandshakeReactor : public ::grpc::ServerGenericBidiReactor {
   /// and return its payload (the client's password).
   arrow::Result<std::string> ParseRequest() {
     ARROW_ASSIGN_OR_RAISE(
-        std::string bytes,
-        BytesFromBuffer(request_buf_, "Failed to read HandshakeRequest"));
-    pb::HandshakeRequest request;
-    if (!request.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
-      return arrow::Status::Invalid("Failed to parse HandshakeRequest");
-    }
+        auto request,
+        ParseProtoRequest<pb::HandshakeRequest>(request_buf_, "HandshakeRequest"));
     return request.payload();
   }
 
@@ -479,23 +511,22 @@ class HandshakeReactor : public ::grpc::ServerGenericBidiReactor {
   ::grpc::ByteBuffer write_buf_;
 };
 
-/// Serialize one proto message into a ByteBuffer the caller must keep alive
-/// until the write completes (a reactor member, never a local).
-template <typename ProtoT>
-::grpc::ByteBuffer MakeWriteBuffer(const ProtoT& message) {
-  const std::string bytes = message.SerializeAsString();
-  ::grpc::Slice slice(bytes);
-  return ::grpc::ByteBuffer(&slice, 1);
-}
-
 /// One request message in, one response message out, then finish.
 ///
-/// The unary RPCs differ only in how the request is converted, which server
-/// class method runs, and which response is serialized.
-class UnaryReactor : public ::grpc::ServerGenericBidiReactor {
+/// The RPCs served here (the three whose request is a FlightDescriptor:
+/// GetFlightInfo, GetSchema, PollFlightInfo) differ only in the server class
+/// method that runs and the response type, so the handler supplied by the
+/// service does both while the reactor does the request parsing, the
+/// "handler returned nothing" answer and the serialization.
+template <typename PbResponseT>
+class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
  public:
-  UnaryReactor(AsyncCallContext flight_context, AsyncGenericFlightServerBase* base)
-      : flight_context_(std::move(flight_context)), base_(base) {
+  /// Convert the request, call the server class, serialize the response.
+  using HandlerFn = std::function<arrow::Status(
+      const ServerCallContext&, const FlightDescriptor&, PbResponseT*)>;
+
+  UnaryReactor(AsyncCallContext flight_context, HandlerFn handler)
+      : flight_context_(std::move(flight_context)), handler_(std::move(handler)) {
     StartRead(&request_buf_);
   }
 
@@ -505,11 +536,19 @@ class UnaryReactor : public ::grpc::ServerGenericBidiReactor {
           MakeFlightError(FlightStatusCode::Internal, "Failed to read request")));
       return;
     }
-    const auto status = HandleRequest();
+    const auto descriptor = ParseProtoRequest<pb::FlightDescriptor, FlightDescriptor>(
+        request_buf_, "FlightDescriptor");
+    if (!descriptor.ok()) {
+      Finish(flight_context_.FinishRequest(descriptor.status()));
+      return;
+    }
+    PbResponseT response;
+    const auto status = handler_(flight_context_, *descriptor, &response);
     if (!status.ok()) {
       Finish(flight_context_.FinishRequest(status));
       return;
     }
+    response_buf_ = MakeWriteBuffer(response);
     StartWrite(&response_buf_);
   }
 
@@ -523,106 +562,17 @@ class UnaryReactor : public ::grpc::ServerGenericBidiReactor {
 
   void OnDone() override { delete this; }
 
- protected:
-  /// Convert the request, call the server class, serialize the response into
-  /// `response_buf_`.
-  virtual arrow::Status HandleRequest() = 0;
-
+ private:
   AsyncCallContext flight_context_;
-  AsyncGenericFlightServerBase* base_;
+  HandlerFn handler_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer response_buf_;
-};
-
-/// \brief Serve one GetFlightInfo RPC: parse the descriptor, call the server
-/// class, serialize the FlightInfo back.
-class GetFlightInfoReactor final : public UnaryReactor {
- public:
-  using UnaryReactor::UnaryReactor;
-
- protected:
-  arrow::Status HandleRequest() override {
-    ARROW_ASSIGN_OR_RAISE(std::string bytes,
-                          BytesFromBuffer(request_buf_, "Failed to read request"));
-    pb::FlightDescriptor pb_descriptor;
-    if (!pb_descriptor.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
-      return arrow::Status::Invalid("Failed to parse FlightDescriptor");
-    }
-    FlightDescriptor descriptor;
-    ARROW_RETURN_NOT_OK(internal::FromProto(pb_descriptor, &descriptor));
-    std::unique_ptr<FlightInfo> info;
-    ARROW_RETURN_NOT_OK(base_->GetFlightInfo(flight_context_, descriptor, &info));
-    if (info == nullptr) {
-      return MakeFlightError(FlightStatusCode::Internal, "GetFlightInfo returned null");
-    }
-    pb::FlightInfo pb_info;
-    ARROW_RETURN_NOT_OK(internal::ToProto(*info, &pb_info));
-    response_buf_ = MakeWriteBuffer(pb_info);
-    return arrow::Status::OK();
-  }
-};
-
-/// \brief Serve one GetSchema RPC. Same shape as GetFlightInfoReactor; the
-/// response is a SchemaResult.
-class GetSchemaReactor final : public UnaryReactor {
- public:
-  using UnaryReactor::UnaryReactor;
-
- protected:
-  arrow::Status HandleRequest() override {
-    ARROW_ASSIGN_OR_RAISE(std::string bytes,
-                          BytesFromBuffer(request_buf_, "Failed to read request"));
-    pb::FlightDescriptor pb_descriptor;
-    if (!pb_descriptor.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
-      return arrow::Status::Invalid("Failed to parse FlightDescriptor");
-    }
-    FlightDescriptor descriptor;
-    ARROW_RETURN_NOT_OK(internal::FromProto(pb_descriptor, &descriptor));
-    std::unique_ptr<SchemaResult> schema_result;
-    ARROW_RETURN_NOT_OK(base_->GetSchema(flight_context_, descriptor, &schema_result));
-    if (schema_result == nullptr) {
-      return MakeFlightError(FlightStatusCode::Internal, "GetSchema returned null");
-    }
-    pb::SchemaResult pb_schema;
-    ARROW_RETURN_NOT_OK(internal::ToProto(*schema_result, &pb_schema));
-    response_buf_ = MakeWriteBuffer(pb_schema);
-    return arrow::Status::OK();
-  }
-};
-
-/// \brief Serve one PollFlightInfo RPC. Same shape again; the response is a
-/// PollInfo.
-class PollFlightInfoReactor final : public UnaryReactor {
- public:
-  using UnaryReactor::UnaryReactor;
-
- protected:
-  arrow::Status HandleRequest() override {
-    ARROW_ASSIGN_OR_RAISE(std::string bytes,
-                          BytesFromBuffer(request_buf_, "Failed to read request"));
-    pb::FlightDescriptor pb_descriptor;
-    if (!pb_descriptor.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
-      return arrow::Status::Invalid("Failed to parse FlightDescriptor");
-    }
-    FlightDescriptor descriptor;
-    ARROW_RETURN_NOT_OK(internal::FromProto(pb_descriptor, &descriptor));
-    std::unique_ptr<PollInfo> poll_info;
-    ARROW_RETURN_NOT_OK(base_->PollFlightInfo(flight_context_, descriptor, &poll_info));
-    if (poll_info == nullptr) {
-      return MakeFlightError(FlightStatusCode::Internal, "PollFlightInfo returned null");
-    }
-    pb::PollInfo pb_info;
-    ARROW_RETURN_NOT_OK(internal::ToProto(*poll_info, &pb_info));
-    response_buf_ = MakeWriteBuffer(pb_info);
-    return arrow::Status::OK();
-  }
 };
 
 /// One request message in, N response messages out, then finish.
 ///
 /// One message is in flight at a time: OnWriteDone asks for the next, so the
 /// loop costs one callback per message and no extra state.
-template <typename ProtoT>
 class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
  public:
   StreamingReactor(AsyncCallContext flight_context, AsyncGenericFlightServerBase* base)
@@ -685,7 +635,7 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
 
 /// \brief Serve one ListActions RPC: the server's action types are collected
 /// up front (a plain vector, no iterator) and written one per OnWriteDone.
-class ListActionsReactor final : public StreamingReactor<pb::ActionType> {
+class ListActionsReactor final : public StreamingReactor {
  public:
   using StreamingReactor::StreamingReactor;
 
@@ -716,26 +666,23 @@ class ListActionsReactor final : public StreamingReactor<pb::ActionType> {
 
 /// \brief Serve one DoAction RPC: the server's ResultStream is pulled one
 /// Result per OnWriteDone until it reports the end of stream.
-class DoActionReactor final : public StreamingReactor<pb::Result> {
+class DoActionReactor final : public StreamingReactor {
  public:
   using StreamingReactor::StreamingReactor;
 
  protected:
   arrow::Status HandleRequest() override {
-    ARROW_ASSIGN_OR_RAISE(std::string bytes,
-                          BytesFromBuffer(request_buf_, "Failed to read request"));
-    pb::Action pb_action;
-    if (!pb_action.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
-      return arrow::Status::Invalid("Failed to parse Action");
-    }
-    Action action;
-    ARROW_RETURN_NOT_OK(internal::FromProto(pb_action, &action));
+    ARROW_ASSIGN_OR_RAISE(auto action, (ParseProtoRequest<pb::Action, Action>(
+                                           request_buf_, "Action")));
     return base_->DoAction(flight_context_, action, &results_);
   }
 
   arrow::Result<bool> NextMessage() override {
     if (results_ == nullptr) {
-      return false;
+      // A handler that returned OK without a stream answers CANCELLED on the
+      // sync transport (grpc_server.cc:404-406), before any message is
+      // written: same answer, same place.
+      return arrow::Status::Cancelled();
     }
     ARROW_ASSIGN_OR_RAISE(auto result, results_->Next());
     // A null Result is the end-of-stream sentinel, as in the sync
@@ -755,20 +702,14 @@ class DoActionReactor final : public StreamingReactor<pb::Result> {
 
 /// \brief Serve one ListFlights RPC: the server's FlightListing is pulled one
 /// FlightInfo per OnWriteDone until it is exhausted.
-class ListFlightsReactor final : public StreamingReactor<pb::FlightInfo> {
+class ListFlightsReactor final : public StreamingReactor {
  public:
   using StreamingReactor::StreamingReactor;
 
  protected:
   arrow::Status HandleRequest() override {
-    ARROW_ASSIGN_OR_RAISE(std::string bytes,
-                          BytesFromBuffer(request_buf_, "Failed to read request"));
-    pb::Criteria pb_criteria;
-    if (!pb_criteria.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) {
-      return arrow::Status::Invalid("Failed to parse Criteria");
-    }
-    Criteria criteria;
-    ARROW_RETURN_NOT_OK(internal::FromProto(pb_criteria, &criteria));
+    ARROW_ASSIGN_OR_RAISE(auto criteria, (ParseProtoRequest<pb::Criteria, Criteria>(
+                                             request_buf_, "Criteria")));
     return base_->ListFlights(flight_context_, &criteria, &listing_);
   }
 
@@ -826,10 +767,9 @@ class ListFlightsReactor final : public StreamingReactor<pb::FlightInfo> {
 // ponytail: holding the callback thread for the whole exchange is the accepted
 // tradeoff (matches the sync transport's thread-per-exchange behaviour). The
 // cost is real -- a long exchange occupies one thread from the pool, and the
-// pool grows ~1 thread/s while it is held (see
-// ASYNC_GENERIC_SERVER.md §6) -- but it buys a synchronous handler with no
-// extra thread per exchange and no new public API.  Upgrade path: run the
-// handler on a Flight thread pool and keep a Hold() on the reactor, if
+// pool grows ~1 thread/s while it is held -- but it buys a synchronous handler
+// with no extra thread per exchange and no new public API.  Upgrade path: run
+// the handler on a Flight thread pool and keep a Hold() on the reactor, if
 // DoExchange throughput ever matters.
 class ExchangeReactor;
 
@@ -1193,15 +1133,39 @@ AsyncGenericFlightService::AsyncGenericFlightService(
   }
 
   if (method == kGetFlightInfoMethod) {
-    return new GetFlightInfoReactor(std::move(flight_context), base_);
+    return new UnaryReactor<pb::FlightInfo>(
+        std::move(flight_context),
+        [base = base_](const ServerCallContext& context,
+                       const FlightDescriptor& descriptor,
+                       pb::FlightInfo* out) -> arrow::Status {
+          std::unique_ptr<FlightInfo> info;
+          ARROW_RETURN_NOT_OK(base->GetFlightInfo(context, descriptor, &info));
+          return SerializeOrNotFound(info, out);
+        });
   }
 
   if (method == kGetSchemaMethod) {
-    return new GetSchemaReactor(std::move(flight_context), base_);
+    return new UnaryReactor<pb::SchemaResult>(
+        std::move(flight_context),
+        [base = base_](const ServerCallContext& context,
+                       const FlightDescriptor& descriptor,
+                       pb::SchemaResult* out) -> arrow::Status {
+          std::unique_ptr<SchemaResult> schema;
+          ARROW_RETURN_NOT_OK(base->GetSchema(context, descriptor, &schema));
+          return SerializeOrNotFound(schema, out);
+        });
   }
 
   if (method == kPollFlightInfoMethod) {
-    return new PollFlightInfoReactor(std::move(flight_context), base_);
+    return new UnaryReactor<pb::PollInfo>(
+        std::move(flight_context),
+        [base = base_](const ServerCallContext& context,
+                       const FlightDescriptor& descriptor,
+                       pb::PollInfo* out) -> arrow::Status {
+          std::unique_ptr<PollInfo> info;
+          ARROW_RETURN_NOT_OK(base->PollFlightInfo(context, descriptor, &info));
+          return SerializeOrNotFound(info, out);
+        });
   }
 
   if (method == kListActionsMethod) {

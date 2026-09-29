@@ -225,6 +225,11 @@ class TestFlightServer : public FlightServerBase {
     if (request == FlightDescriptor::Command("fail")) {
       return arrow::Status::KeyError("no such flight");
     }
+    if (request == FlightDescriptor::Command("null-info")) {
+      // Answered OK without a response: the transport must answer what the
+      // sync transport does for that case (grpc_server.cc: "Flight not found").
+      return arrow::Status::OK();
+    }
     ARROW_ASSIGN_OR_RAISE(
         auto made,
         FlightInfo::Make(*arrow::schema({arrow::field("value", arrow::int64())}),
@@ -270,6 +275,11 @@ class TestFlightServer : public FlightServerBase {
     last_action_type_ = action.type;
     if (action.type == "fail-mid-stream") {
       *results = std::make_unique<MidStreamErrorResultStream>();
+      return arrow::Status::OK();
+    }
+    if (action.type == "null-result-stream") {
+      // Answered OK without a stream: the sync transport answers CANCELLED for
+      // that case (grpc_server.cc:404-406), before writing anything.
       return arrow::Status::OK();
     }
     std::vector<Result> made;
@@ -944,6 +954,30 @@ TEST(AsyncGrpcTest, GetFlightInfoIsServedAsync) {
   ASSERT_EQ("ping", inner_server.last_descriptor().cmd);
 }
 
+TEST(AsyncGrpcTest, GetFlightInfoWithNullResponseIsNotFound) {
+  // A handler that answers OK without setting the response: the sync transport
+  // answers NOT_FOUND with "Flight not found" (grpc_server.cc:282-286), and the
+  // async reactor must answer the same, not INTERNAL.
+  TestFlightServer inner_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  TestServerAsyncAdapter flight_server(&inner_server);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  const auto status =
+      client->GetFlightInfo(FlightDescriptor::Command("null-info")).status();
+  ASSERT_RAISES(KeyError, status);
+  ASSERT_THAT(status.message(), ::testing::HasSubstr("Flight not found"));
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
 TEST(AsyncGrpcTest, GetSchemaIsServedAsync) {
   TestFlightServer inner_server;
   ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
@@ -1155,6 +1189,36 @@ TEST(AsyncGrpcTest, DoActionMidStreamErrorFinishesTheRpc) {
   ASSERT_EQ(second.status().code(), arrow::StatusCode::IOError);
   ASSERT_THAT(second.status().message(),
               ::testing::HasSubstr("mid-stream action failure"));
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, DoActionWithNullResultStreamIsCancelled) {
+  // A handler that answers OK without a ResultStream answers CANCELLED on the
+  // sync transport (grpc_server.cc:404-406), before any message is written; the
+  // async reactor must answer the same.  The client may see it on DoAction() or
+  // on the first Next(), so both surfaces are accepted.
+  TestFlightServer inner_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  TestServerAsyncAdapter flight_server(&inner_server);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  const Action action{"null-result-stream", Buffer::FromString("")};
+  auto results = client->DoAction(action);
+  if (results.ok()) {
+    // The stream was handed out before the status arrived: CANCELLED is then
+    // reported by the first read.
+    ASSERT_RAISES(Cancelled, (*results)->Next());
+  } else {
+    ASSERT_RAISES(Cancelled, results.status());
+  }
 
   ASSERT_OK(client->Close());
   ASSERT_OK(flight_server.Shutdown());

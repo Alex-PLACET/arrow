@@ -38,8 +38,7 @@ AsyncFlightDataStream::~AsyncFlightDataStream() = default;
 
 
 struct AsyncGenericFlightServerBase::Impl {
-  std::unique_ptr<internal::ServerTransport> transport;
-  internal::ServerSignalState signal_state;
+  internal::ServerLifecycle lifecycle{"AsyncGenericFlightServerBase"};
 };
 
 AsyncGenericFlightServerBase::AsyncGenericFlightServerBase() : impl_(new Impl) {}
@@ -50,78 +49,35 @@ Status AsyncGenericFlightServerBase::Init(const FlightServerOptions& options) {
   flight::transport::grpc::InitializeFlightGrpcServer();
 
   const auto scheme = options.location.scheme();
-  ARROW_ASSIGN_OR_RAISE(impl_->transport,
+  ARROW_ASSIGN_OR_RAISE(auto transport,
                         internal::GetDefaultTransportRegistry()->MakeServerAsync(
                             scheme, this, options.memory_manager));
-  ARROW_ASSIGN_OR_RAISE(auto uri, internal::ParseLocationUri(options.location));
-  return impl_->transport->Init(options, uri);
+  return impl_->lifecycle.Init(options, std::move(transport));
 }
 
-// The five lifecycle methods below mirror FlightServerBase's (server.cc:89-140).
-int AsyncGenericFlightServerBase::port() const {
-  return internal::PortFromLocation(location());
-}
+int AsyncGenericFlightServerBase::port() const { return impl_->lifecycle.port(); }
 
 Location AsyncGenericFlightServerBase::location() const {
-  return impl_->transport->location();
+  return impl_->lifecycle.location();
 }
 
 Status AsyncGenericFlightServerBase::SetShutdownOnSignals(
     const std::vector<int> signals) {
-  return impl_->signal_state.SetShutdownOnSignals(signals);
+  return impl_->lifecycle.SetShutdownOnSignals(signals);
 }
 
-Status AsyncGenericFlightServerBase::Serve() {
-  return impl_->signal_state.Serve(
-      [this]() -> Status {
-        if (!impl_->transport) {
-          return Status::UnknownError("Server did not start properly");
-        }
-        return impl_->transport->Wait();
-      },
-      [this](const std::chrono::system_clock::time_point* deadline) -> Status {
-        if (!impl_->transport) {
-          return Status::Invalid(
-              "Shutdown() on uninitialized AsyncGenericFlightServerBase");
-        }
-        if (deadline) {
-          return impl_->transport->Shutdown(*deadline);
-        }
-        return impl_->transport->Shutdown();
-      },
-      "Server did not start properly", "Error shutting down server");
-}
+Status AsyncGenericFlightServerBase::Serve() { return impl_->lifecycle.Serve(); }
 
 int AsyncGenericFlightServerBase::GotSignal() const {
-  return impl_->signal_state.GotSignal();
+  return impl_->lifecycle.GotSignal();
 }
 
 Status AsyncGenericFlightServerBase::Shutdown(
     const std::chrono::system_clock::time_point* deadline) {
-  // Shutdown() takes the callback and the deadline only; the two message strings
-  // belong to Serve() alone.
-  return impl_->signal_state.Shutdown(
-      [this](const std::chrono::system_clock::time_point* maybe_deadline) -> Status {
-        if (!impl_->transport) {
-          return Status::Invalid(
-              "Shutdown() on uninitialized AsyncGenericFlightServerBase");
-        }
-        if (maybe_deadline) {
-          return impl_->transport->Shutdown(*maybe_deadline);
-        }
-        return impl_->transport->Shutdown();
-      },
-      deadline);
+  return impl_->lifecycle.Shutdown(deadline);
 }
 
-Status AsyncGenericFlightServerBase::Wait() {
-  return impl_->signal_state.Wait([this] {
-    if (!impl_->transport) {
-      return Status::Invalid("Wait() on uninitialized AsyncGenericFlightServerBase");
-    }
-    return impl_->transport->Wait();
-  });
-}
+Status AsyncGenericFlightServerBase::Wait() { return impl_->lifecycle.Wait(); }
 
 // --- handler defaults: the same answers FlightServerBase's defaults give ---
 

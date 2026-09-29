@@ -15,14 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Async Flight service implemented on top of gRPC's generic callback API
-// (apache/arrow#49339). Experimental: DoGet and DoPut for now, every other
-// method is answered UNIMPLEMENTED.
-//
-// This is an internal header (no ARROW_FLIGHT_EXPORT): the service is an
-// implementation detail of the gRPC transport, and its reactors live in
-// async_grpc_service.cc.
-
 #pragma once
 
 #include <memory>
