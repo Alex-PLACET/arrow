@@ -128,9 +128,7 @@ AsyncGenericFlightServerBase::DoGetAsync(const ServerCallContext&, const Ticket&
 
 std::shared_ptr<FlightDataListener> AsyncGenericFlightServerBase::CreateDoPutListener(
     const ServerCallContext&) {
-  // The default refuses uploads; a server that accepts them overrides this, or
-  // sets FlightServerOptions::listener_factory (see the service's DoPut
-  // dispatch, which consults the factory when this returns nullptr).
+  // The default refuses uploads; a server that accepts them overrides this.
   return nullptr;
 }
 

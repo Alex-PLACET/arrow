@@ -1125,12 +1125,11 @@ class Unimplemented : public ::grpc::ServerGenericBidiReactor {
 }  // namespace
 
 AsyncGenericFlightService::AsyncGenericFlightService(
-    AsyncGenericFlightServerBase* async_base, FlightDataListenerFactory listener_factory,
+    AsyncGenericFlightServerBase* async_base,
     std::shared_ptr<MemoryManager> memory_manager,
     std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>> helper,
     HandshakeFn handshake_handler)
     : base_(async_base),
-      listener_factory_(std::move(listener_factory)),
       memory_manager_(std::move(memory_manager)),
       helper_(std::move(helper)),
       handshake_handler_(std::move(handshake_handler)) {}
@@ -1224,22 +1223,9 @@ AsyncGenericFlightService::AsyncGenericFlightService(
   if (method == kDoGetMethod) {
     return new DoGetReactor(std::move(flight_context), base_);
   }
-  // DoPut needs a listener to hand the incoming batches to.  The server class
-  // is asked first; a server that only sets options.listener_factory keeps
-  // working through the fallback, and a server with neither (or whose
-  // listener is refused) does not accept uploads.
+  
   if (method == kDoPutMethod) {
-    std::shared_ptr<FlightDataListener> listener =
-        base_->CreateDoPutListener(flight_context);
-    if (!listener && listener_factory_) {
-      listener = listener_factory_();
-    }
-    if (listener) {
-      return new DoPutReactor(std::move(flight_context), base_->CreateDoPutListener(flight_context));
-    }
-    return new Unimplemented(
-        ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
-                       "DoPut is not implemented: no listener available"));
+    return new DoPutReactor(std::move(flight_context), base_->CreateDoPutListener(flight_context));
   }
   return new Unimplemented(
       ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "Unknown method"));

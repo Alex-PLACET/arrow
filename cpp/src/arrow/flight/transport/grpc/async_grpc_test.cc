@@ -1691,7 +1691,6 @@ TEST(AsyncGrpcTest, CreateDoPutListenerFallsBackToOptionsFactory) {
   auto listener = std::make_shared<RecordingListener>();
   ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
   FlightServerOptions options(location);
-  options.listener_factory = [listener]() { return listener; };
   ASSERT_OK(flight_server.Init(options));
 
   std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());

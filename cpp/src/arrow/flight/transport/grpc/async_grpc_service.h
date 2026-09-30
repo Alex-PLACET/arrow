@@ -44,8 +44,6 @@ class AsyncGenericFlightService : public ::grpc::CallbackGenericService {
  public:
   /// \param async_base is the async server whose handlers are served; it must
   /// outlive the service.
-  /// \param listener_factory creates the FlightDataListener serving one DoPut
-  /// RPC; the service consults it per RPC and refuses uploads when it is empty.
   /// \param memory_manager is the server transport's memory manager; the
   /// DoExchange reader uses it to view the bodies it reads.
   /// \param helper runs middleware and auth and builds the call context.
@@ -53,7 +51,6 @@ class AsyncGenericFlightService : public ::grpc::CallbackGenericService {
   /// means the server has no authentication mechanism.
   AsyncGenericFlightService(
       AsyncGenericFlightServerBase* async_base,
-      FlightDataListenerFactory listener_factory,
       std::shared_ptr<MemoryManager> memory_manager,
       std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>> helper,
       HandshakeFn handshake_handler = {});
@@ -67,7 +64,6 @@ class AsyncGenericFlightService : public ::grpc::CallbackGenericService {
 
  private:
   AsyncGenericFlightServerBase* base_;
-  FlightDataListenerFactory listener_factory_;
   /// The server transport's memory manager; only DoExchange's reader uses it.
   std::shared_ptr<MemoryManager> memory_manager_;
   std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>> helper_;
