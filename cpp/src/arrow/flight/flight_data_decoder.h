@@ -110,43 +110,26 @@ class ARROW_FLIGHT_EXPORT FlightDataListener : public ipc::Listener {
   /// Finishes the RPC with that status without waiting for the client to end
   /// the upload: the client's pending write or Close() reports it.  Use for a
   /// server-side rejection discovered mid-upload (quota, bad batch, upstream
-  /// error).  Idempotent and safe to call from any thread at any time: after
-  /// the upload finished it is a no-op, and only the first call takes effect.
+  /// error).  Safe to call from any thread at any time: once the upload is no
+  /// longer in flight this reports Invalid instead of reaching a finished RPC.
   /// \return OK when the cancel was handed to the transport, or Invalid when
-  /// the upload is not in flight (before it started or after it finished).
+  /// there is no upload in flight.
   Status Cancel(Status status);
-
- protected:
-  /// \brief Lock the transport state of this RPC for the duration of a control
-  /// call (Cancel()).
-  ///
-  /// As in the client-side AsyncListenerBase::LockRpcState: the transport takes
-  /// this lock to install and to clear the state, so the state cannot be
-  /// destroyed under a control call.
-  std::unique_lock<std::mutex> LockTransport() const;
-
-  /// \brief The transport state of this RPC, or null if none is installed.
-  /// Only valid while holding the LockTransport() lock.
-  internal::FlightDataListenerTransport* transport() const { return transport_; }
 
  private:
   /// The transport installs and clears the state through
   /// FlightDataListenerTransport::Install/Clear, both under this lock.
   friend class internal::FlightDataListenerTransport;
 
-  /// Whether OnFinish was already reported; guarded by transport_mutex_.
-  bool finished_ = false;
+  /// Whether OnFinish was already reported.  Atomic (not guarded by
+  /// transport_mutex_) on purpose: Cancel() holds that lock across its call
+  /// into the transport, and the transport reports the ending from inside it.
+  std::atomic<bool> finished_{false};
 
   mutable std::mutex transport_mutex_;
   /// Not owned: the transport's own RPC state, valid until Clear().
   internal::FlightDataListenerTransport* transport_ = nullptr;
 };
-
-/// \brief Creates the FlightDataListener that serves one upload.
-///
-/// The transport calls this once per DoPut RPC. Return nullptr to refuse the
-/// upload.
-using FlightDataListenerFactory = std::function<std::shared_ptr<FlightDataListener>()>;
 
 /// \brief Push style stream decoder that turns raw arrow Buffers into
 /// FlightStreamChunks.

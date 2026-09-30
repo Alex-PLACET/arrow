@@ -227,42 +227,32 @@ void FlightDataListenerTransport::Clear(
 Status FlightDataListenerTransport::ReportFinish(
     const std::shared_ptr<FlightDataListener>& listener, Status status) {
   if (listener == nullptr) return Status::OK();
-  {
-    std::lock_guard<std::mutex> lock(listener->transport_mutex_);
-    if (listener->finished_) {
-      // The first ending wins: a cancel racing the client's own end (or the
-      // transport cleaning up) must notify once.
-      return Status::OK();
-    }
-    listener->finished_ = true;
+  // First ending wins.  Atomic and lock-free: Cancel() holds the listener's
+  // transport lock across its call into the transport, and the ending it
+  // triggers reports from inside that call.
+  bool expected = false;
+  if (!listener->finished_.compare_exchange_strong(expected, true)) {
+    return Status::OK();
   }
-  // Outside the lock: the listener's OnFinish is application code, and it may
-  // call back into the listener (as Cancel() does).
+  // OnFinish is application code; it may call back into the listener (as
+  // Cancel() does), which is why nothing is held here.
   return listener->OnFinish(std::move(status));
 }
 
 }  // namespace internal
 
-std::unique_lock<std::mutex> FlightDataListener::LockTransport() const {
-  return std::unique_lock<std::mutex>(transport_mutex_);
-}
-
 Status FlightDataListener::Cancel(Status status) {
-  // Take the state under the lock, then release it before calling out: a
-  // finished RPC has no state left (Clear() ran under this lock), and while the
-  // state is here the transport cannot clear it, so the RPC it points at is
-  // alive until Clear() takes the lock again.
-  internal::FlightDataListenerTransport* transport;
-  {
-    std::lock_guard<std::mutex> lock(transport_mutex_);
-    transport = transport_;
-  }
-  if (transport == nullptr) {
+  // Hold the lock across the call: Clear() takes it as the RPC finishes, so
+  // while it is held the transport state cannot be cleared and the RPC the
+  // pointer names is alive.  CancelUpload must therefore not re-enter this
+  // listener (it only finishes the RPC); that is the contract of the hook.
+  std::lock_guard<std::mutex> lock(transport_mutex_);
+  if (transport_ == nullptr) {
     return Status::Invalid(
         "no upload in flight to cancel: Cancel() must be called while the "
         "upload's RPC is running");
   }
-  transport->CancelUpload(std::move(status));
+  transport_->CancelUpload(std::move(status));
   return Status::OK();
 }
 

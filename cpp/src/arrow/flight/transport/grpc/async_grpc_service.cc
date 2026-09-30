@@ -181,7 +181,8 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
     // future, which can be after OnDone (gRPC has no server-side holds, so
     // the refcount below is ours).
     Hold();
-    arrow::Future<std::shared_ptr<AsyncFlightDataStream>> future = base_->DoGetAsync(flight_context_, *ticket);
+    arrow::Future<std::shared_ptr<AsyncFlightDataStream>> future =
+        base_->DoGetAsync(flight_context_, *ticket);
     future.AddCallback(
         [this, future](
             const arrow::Result<std::shared_ptr<AsyncFlightDataStream>>& result) mutable {
@@ -375,11 +376,21 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   /// `status` without waiting for the client to end it.
   ///
   /// Callable from any thread (that is the point).  Idempotent: `finished_`
-  /// makes only the first ending take effect.
+  /// makes only the first ending take effect.  A Cancel() with an OK status is
+  /// meaningless (there is nothing to cancel successfully), so it is refused.
+  ///
+  /// The reactor refcounts itself here as DoGet's does: gRPC's callback API has
+  /// no holds, and OnDone delete this, so a cancel arriving from another
+  /// thread must keep the reactor alive across the call.
   void CancelUpload(Status status) override {
-    FinishOnce(flight_context_.FinishRequest(
-        status.ok() ? Status::Cancelled("the server cancelled the upload")
-                    : std::move(status)));
+    if (status.ok()) {
+      status = Status::Invalid("Cancel() needs a non-OK status");
+    }
+    // FinishUpload reports the ending and claims it atomically, so the read
+    // that gRPC completes during teardown cannot report a clean end on top.
+    Hold();
+    FinishUpload(std::move(status));
+    ReleaseHold();
   }
 
   /// \brief Called when a new message is available from the client.
@@ -387,6 +398,13 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   /// closed its half of the stream.
   void OnReadDone(bool ok) override {
     if (!ok) {
+      // The read ended.  That is the client's clean half-close only when the
+      // RPC is still running with no ending claimed yet: on a server-side
+      // Cancel() (or a decode rejection) the teardown makes the pending read
+      // complete too, and that ending must keep its own status.
+      if (finished_.load()) {
+        return;
+      }
       // The client closed its half of the stream: the upload ended normally.
       // Report that to the listener, then acknowledge the upload, which is
       // what makes the client's DoPut return.
@@ -400,15 +418,14 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
       StartWrite(&write_buf_);
       return;
     }
-
     // Extract an Arrow buffer from the gRPC ByteBuffer, then feed it to the
     // FlightMessageDecoder which fires the listener callbacks (OnSchemaDecoded / OnNext).
     std::shared_ptr<arrow::Buffer> arrow_buf;
     const Status wrap_status = WrapGrpcBuffer(&request_buf_, &arrow_buf);
     if (!wrap_status.ok()) {
-      FinishOnce(flight_context_.FinishRequest(
+      FinishUpload(
           MakeFlightError(FlightStatusCode::Internal,
-                          "Failed to wrap gRPC buffer: " + wrap_status.message())));
+                          "Failed to wrap gRPC buffer: " + wrap_status.message()));
       return;
     }
 
@@ -417,7 +434,7 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
     const Status decode_status = decoder_.Consume(std::move(arrow_buf));
     if (!decode_status.ok()) {
       // The listener's status is the transport error rejecting the upload.
-      FinishOnce(flight_context_.FinishRequest(decode_status));
+      FinishUpload(decode_status);
       return;
     }
 
@@ -431,12 +448,11 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   void OnWriteDone(bool ok) override {
     if (!ok) {
       // The client closed its half of the stream before the write could complete.
-      FinishOnce(flight_context_.FinishRequest(
-          MakeFlightError(FlightStatusCode::Internal, "Write failed")));
+      FinishUpload(MakeFlightError(FlightStatusCode::Internal, "Write failed"));
       return;
     }
     // The acknowledgement of the upload reached the client: the upload is done.
-    FinishOnce(flight_context_.FinishRequest(arrow::Status::OK()));
+    FinishUpload(arrow::Status::OK());
   }
 
   /// \brief Called when the client cancels the RPC.
@@ -453,10 +469,34 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   void OnDone() override {
     // The RPC is over: the listener must not reach this reactor any more.
     internal::FlightDataListenerTransport::Clear(listener_);
-    delete this;
+    ReleaseHold();
   }
 
  private:
+  // gRPC's server callback API has no holds, so the reactor refcounts itself:
+  // one reference for the RPC (released here) plus one per call in flight on
+  // another thread (CancelUpload).  Whichever thread releases the last
+  // reference deletes the reactor.  This is the DoGet reactor's idiom.
+  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
+  void ReleaseHold() {
+    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete this;
+    }
+  }
+
+  /// \brief Report the upload's ending to the listener, then finish the RPC.
+  ///
+  /// The single place both happen, so no ending can finish the RPC without
+  /// telling the listener (the listener's OnFinish fires at most once, so the
+  /// endings that race each other still report only one).
+  /// \param[in] status the upload's terminal status.
+  void FinishUpload(Status status) {
+    ARROW_WARN_NOT_OK(
+        internal::FlightDataListenerTransport::ReportFinish(listener_, status),
+        "Reporting the end of an upload to the listener failed");
+    FinishOnce(flight_context_.FinishRequest(std::move(status)));
+  }
+
   /// \brief Ensures that gRPC's Finish is called at most once, and never after OnDone.
   /// \param[in] status The gRPC status to finish the call with.
   void FinishOnce(::grpc::Status status) {
@@ -474,6 +514,9 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   /// Set by the first ending: gRPC's Finish runs once, and so does each
   /// terminal report to the listener.
   std::atomic<bool> finished_{false};
+  /// One reference for the RPC (released in OnDone) plus one per call in
+  /// flight on another thread (CancelUpload).
+  std::atomic<int> refs_{1};
 };
 
 /// \brief Serve the Handshake RPC over the generic callback API.
@@ -1223,9 +1266,18 @@ AsyncGenericFlightService::AsyncGenericFlightService(
   if (method == kDoGetMethod) {
     return new DoGetReactor(std::move(flight_context), base_);
   }
-  
+
   if (method == kDoPutMethod) {
-    return new DoPutReactor(std::move(flight_context), base_->CreateDoPutListener(flight_context));
+    // DoPut needs a listener to hand the incoming batches to; a server class
+    // that returns none (the default) refuses uploads.
+    std::shared_ptr<FlightDataListener> listener =
+        base_->CreateDoPutListener(flight_context);
+    if (!listener) {
+      return new Unimplemented(
+          ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
+                         "DoPut is not implemented: no listener available"));
+    }
+    return new DoPutReactor(std::move(flight_context), std::move(listener));
   }
   return new Unimplemented(
       ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "Unknown method"));

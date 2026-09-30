@@ -137,7 +137,16 @@ class ResolvedStream : public AsyncFlightDataStream {
 // to do it.  The inner server must outlive the adapter (it holds a raw pointer).
 class TestServerAsyncAdapter : public AsyncGenericFlightServerBase {
  public:
-  explicit TestServerAsyncAdapter(FlightServerBase* inner) : inner_(inner) {}
+  explicit TestServerAsyncAdapter(FlightServerBase* inner,
+                                  std::shared_ptr<FlightDataListener> listener = nullptr)
+      : inner_(inner), listener_(std::move(listener)) {}
+
+  /// \brief Hands out the listener the test installed, if any; nullptr (the
+  /// default) refuses uploads, which is the base class behavior.
+  std::shared_ptr<FlightDataListener> CreateDoPutListener(
+      const ServerCallContext& context) override {
+    return listener_;
+  }
 
   Status ListFlights(const ServerCallContext& context, const Criteria* criteria,
                      std::unique_ptr<FlightListing>* listings) override {
@@ -169,19 +178,20 @@ class TestServerAsyncAdapter : public AsyncGenericFlightServerBase {
     return inner_->DoExchange(context, std::move(reader), std::move(writer));
   }
 
-  arrow::Future<std::unique_ptr<AsyncFlightDataStream>> DoGetAsync(
+  arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
       const ServerCallContext& context, const Ticket& request) override {
     std::unique_ptr<FlightDataStream> stream;
     const auto status = inner_->DoGet(context, request, &stream);
     if (!status.ok()) {
-      return arrow::Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(status);
+      return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(status);
     }
-    return arrow::Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
-        std::make_unique<ResolvedStream>(std::move(stream)));
+    return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+        std::make_shared<ResolvedStream>(std::move(stream)));
   }
 
  private:
   FlightServerBase* inner_;
+  std::shared_ptr<FlightDataListener> listener_;
 };
 
 // Serves 3 batches of 5 rows for any ticket, and records the ticket it was
@@ -477,10 +487,10 @@ class FinishRecordingListener : public RecordingListener {
 
 // The upload half of TestServerAsyncAdapter as a server class method: the
 // transport asks the server for the per-RPC listener through the
-// CreateDoPutListener() virtual, with no FlightServerOptions::listener_factory
-// involved.  One fresh listener per RPC, as overlapping uploads require; the
-// test reads them only after the server has stopped, or through WaitForListener
-// (which is what a cancel test needs: it acts while the upload is in flight).
+// CreateDoPutListener() virtual.  One fresh listener per RPC, as overlapping uploads
+// require; the test reads them only after the server has stopped, or through
+// WaitForListener (which is what a cancel test needs: it acts while the upload is in
+// flight).
 class TestUploadServerAsyncAdapter : public AsyncGenericFlightServerBase {
  public:
   std::shared_ptr<FlightDataListener> CreateDoPutListener(
@@ -656,7 +666,7 @@ std::pair<std::string, arrow::Status> UploadOneBatch(
 TEST(AsyncGrpcTest, BasicDoGet) {
   TestFlightServer inner_server;
   TestServerAsyncAdapter flight_server(&inner_server);
-  AsyncGenericFlightService service(&flight_server, {}, MakeAsyncMemoryManager(),
+  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
                                     MakeAsyncHelper());
 
   int port = 0;
@@ -708,10 +718,9 @@ TEST(AsyncGrpcTest, BasicDoPut) {
   // One listener for the whole test: shared with the service's factory and
   // kept here so it can be asserted on after the RPC.
   auto listener = std::make_shared<RecordingListener>();
-  TestServerAsyncAdapter flight_server(&inner_server);
-  AsyncGenericFlightService service(
-      &flight_server, [listener]() { return listener; }, MakeAsyncMemoryManager(),
-      MakeAsyncHelper());
+  TestServerAsyncAdapter flight_server(&inner_server, listener);
+  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
+                                    MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;
@@ -769,7 +778,7 @@ TEST(AsyncGrpcTest, BasicDoPut) {
 TEST(AsyncGrpcTest, SchemaOnlyDoGet) {
   TestFlightServer inner_server;
   TestServerAsyncAdapter flight_server(&inner_server);
-  AsyncGenericFlightService service(&flight_server, {}, MakeAsyncMemoryManager(),
+  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
                                     MakeAsyncHelper());
 
   int port = 0;
@@ -810,10 +819,9 @@ TEST(AsyncGrpcTest, SchemaOnlyDoGet) {
 TEST(AsyncGrpcTest, EmptyDoPut) {
   TestFlightServer inner_server;
   auto listener = std::make_shared<RecordingListener>();
-  TestServerAsyncAdapter flight_server(&inner_server);
-  AsyncGenericFlightService service(
-      &flight_server, [listener]() { return listener; }, MakeAsyncMemoryManager(),
-      MakeAsyncHelper());
+  TestServerAsyncAdapter flight_server(&inner_server, listener);
+  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
+                                    MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;
@@ -854,10 +862,9 @@ TEST(AsyncGrpcTest, EmptyDoPut) {
 TEST(AsyncGrpcTest, MetadataOnlyPutChunk) {
   TestFlightServer inner_server;
   auto listener = std::make_shared<RecordingListener>();
-  TestServerAsyncAdapter flight_server(&inner_server);
-  AsyncGenericFlightService service(
-      &flight_server, [listener]() { return listener; }, MakeAsyncMemoryManager(),
-      MakeAsyncHelper());
+  TestServerAsyncAdapter flight_server(&inner_server, listener);
+  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
+                                    MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;
@@ -896,13 +903,12 @@ TEST(AsyncGrpcTest, MetadataOnlyPutChunk) {
 
 TEST(AsyncGrpcTest, DoPutRejectedByListener) {
   TestFlightServer inner_server;
-  auto listener = std::make_shared<RecordingListener>();
+  auto listener = std::make_shared<FinishRecordingListener>();
   // The consumer rejects the upload.
   listener->set_next_status(arrow::Status::Invalid("listener rejected this upload"));
-  TestServerAsyncAdapter flight_server(&inner_server);
-  AsyncGenericFlightService service(
-      &flight_server, [listener]() { return listener; }, MakeAsyncMemoryManager(),
-      MakeAsyncHelper());
+  TestServerAsyncAdapter flight_server(&inner_server, listener);
+  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
+                                    MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;
@@ -932,6 +938,9 @@ TEST(AsyncGrpcTest, DoPutRejectedByListener) {
   ASSERT_EQ(status.code(), arrow::StatusCode::Invalid);
   ASSERT_NE(status.message().find("listener rejected this upload"), std::string::npos)
       << "unexpected status: " << status;
+  // The rejection must also be what OnFinish reports.
+  ASSERT_EQ(listener->finish_status().code(), arrow::StatusCode::Invalid)
+      << "OnFinish got: " << listener->finish_status();
 
   ASSERT_OK(client->Close());
   server->Shutdown();
@@ -943,7 +952,7 @@ TEST(AsyncGrpcTest, DoPutWithoutFactoryIsUnimplemented) {
   TestServerAsyncAdapter flight_server(&inner_server);
   // No listener factory: there is nothing to hand an upload to, so DoPut is
   // answered like any other method the service does not serve.
-  AsyncGenericFlightService service(&flight_server, {}, MakeAsyncMemoryManager(),
+  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
                                     MakeAsyncHelper());
 
   int port = 0;
@@ -981,10 +990,9 @@ TEST(AsyncGrpcTest, DoPutWithoutFactoryIsUnimplemented) {
 TEST(AsyncGrpcTest, OtherMethodsAreUnimplemented) {
   TestFlightServer inner_server;
   auto listener = std::make_shared<RecordingListener>();
-  TestServerAsyncAdapter flight_server(&inner_server);
-  AsyncGenericFlightService service(
-      &flight_server, [listener]() { return listener; }, MakeAsyncMemoryManager(),
-      MakeAsyncHelper());
+  TestServerAsyncAdapter flight_server(&inner_server, listener);
+  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
+                                    MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;
@@ -1596,15 +1604,14 @@ TEST(AsyncGrpcTest, UseAsyncGrpcFlag) {
 }
 
 TEST(AsyncGrpcTest, UseAsyncGrpcFlagServesDoPut) {
-  // The async server serves uploads once it is configured with a listener
-  // factory: FlightServerOptions::listener_factory hands out one listener per
-  // DoPut RPC instead of the RPC falling through to UNIMPLEMENTED.
+  // The async server serves uploads because the server class hands out the
+  // per-RPC listener through CreateDoPutListener(), instead of the RPC falling
+  // through to UNIMPLEMENTED.
   TestFlightServer inner_server;
   auto listener = std::make_shared<RecordingListener>();
   ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
   FlightServerOptions options(location);
-  TestServerAsyncAdapter flight_server(&inner_server);
-  options.listener_factory = [listener]() { return listener; };
+  TestServerAsyncAdapter flight_server(&inner_server, listener);
   ASSERT_OK(flight_server.Init(options));
   ASSERT_GT(flight_server.port(), 0);
 
@@ -1646,7 +1653,7 @@ TEST(AsyncGrpcTest, UseAsyncGrpcFlagServesDoPut) {
 
 TEST(AsyncGrpcTest, CreateDoPutListenerServesUpload) {
   // The upload half of the server class API: CreateDoPutListener() hands out
-  // the per-RPC listener, with no FlightServerOptions::listener_factory at all.
+  // the per-RPC listener, with no options-level factory.
   TestUploadServerAsyncAdapter flight_server;
   ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
   FlightServerOptions options(location);
@@ -1684,13 +1691,14 @@ TEST(AsyncGrpcTest, CreateDoPutListenerServesUpload) {
   ASSERT_EQ(listener->batches()[0]->num_rows(), 3);
 }
 
-TEST(AsyncGrpcTest, CreateDoPutListenerFallsBackToOptionsFactory) {
-  // A server class that does not override the virtual (nullptr) keeps working
-  // through FlightServerOptions::listener_factory, as before its introduction.
-  TestServerAsyncAdapter flight_server(nullptr);
-  auto listener = std::make_shared<RecordingListener>();
+TEST(AsyncGrpcTest, DoPutWithoutListenerIsUnimplemented) {
+  // A server class that does not hand out a listener (CreateDoPutListener()
+  // returns nullptr, the base default) does not accept uploads: the RPC is
+  // answered UNIMPLEMENTED.  There is no options-level fallback.
+  TestFlightServer inner_server;
   ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
   FlightServerOptions options(location);
+  TestServerAsyncAdapter flight_server(&inner_server);
   ASSERT_OK(flight_server.Init(options));
 
   std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
@@ -1700,16 +1708,15 @@ TEST(AsyncGrpcTest, CreateDoPutListenerFallsBackToOptionsFactory) {
   auto schema = arrow::schema({arrow::field("a", arrow::int64())});
   auto batch = arrow::RecordBatch::Make(schema, 2,
                                         {arrow::ArrayFromJSON(arrow::int64(), "[7, 8]")});
-  auto [surface, status] =
-      UploadOneBatch(client.get(), FlightDescriptor::Path({"fallback"}), schema, batch);
-  ASSERT_TRUE(status.ok()) << "upload failed on " << surface << ": " << status;
+  auto [surface, status] = UploadOneBatch(
+      client.get(), FlightDescriptor::Path({"no-listener"}), schema, batch);
+  ASSERT_FALSE(status.ok()) << "the upload succeeded on " << surface
+                            << " with no listener to serve it";
+  ASSERT_EQ(status.code(), arrow::StatusCode::NotImplemented) << status;
 
   ASSERT_OK(client->Close());
   ASSERT_OK(flight_server.Shutdown());
   ASSERT_OK(flight_server.Wait());
-
-  ASSERT_EQ(listener->descriptor_count(), 1);
-  ASSERT_EQ(listener->batches().size(), 1);
 }
 
 TEST(AsyncGrpcTest, DoPutListenerSeesCleanFinish) {
@@ -1787,6 +1794,9 @@ TEST(AsyncGrpcTest, DoPutCancelFromServerSideFinishesTheUpload) {
   ASSERT_EQ(listener->cancel_count(), 1);
   ASSERT_OK(listener->cancel_status()) << listener->cancel_status();
   ASSERT_EQ(listener->finish_count(), 1);
+  // OnFinish must carry the ending that caused it, not a generic status.
+  ASSERT_EQ(listener->finish_status().code(), arrow::StatusCode::Cancelled)
+      << "OnFinish got: " << listener->finish_status();
 
   // After the upload, Cancel() has nothing to cancel.
   listener->CancelWith(arrow::Status::Cancelled("too late"));
@@ -1810,8 +1820,7 @@ TEST(AsyncGrpcTest, UseAsyncGrpcFlagUploadRejectedOnDescriptor) {
       arrow::Status::Invalid("listener rejected this descriptor"));
   ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
   FlightServerOptions options(location);
-  TestServerAsyncAdapter flight_server(&inner_server);
-  options.listener_factory = [listener]() { return listener; };
+  TestServerAsyncAdapter flight_server(&inner_server, listener);
   ASSERT_OK(flight_server.Init(options));
   ASSERT_GT(flight_server.port(), 0);
 
@@ -1947,21 +1956,21 @@ class AsyncAuthTestServer : public AsyncGenericFlightServerBase {
 
   const std::shared_ptr<AsyncAuthState>& state() const { return state_; }
 
-  arrow::Future<std::unique_ptr<AsyncFlightDataStream>> DoGetAsync(
+  arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
       const ServerCallContext& context, const Ticket& request) override {
     {
       std::lock_guard<std::mutex> guard(state_->mutex);
       state_->peer_identity = context.peer_identity();
     }
     if (request.ticket != ticket_) {
-      return arrow::Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
+      return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
           Status::KeyError("No such ticket: ", request.ticket));
     }
     auto schema = arrow::schema({arrow::field("a", arrow::int64())});
     auto batch = arrow::RecordBatch::Make(
         schema, 2, {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
     ARROW_ASSIGN_OR_RAISE(auto reader, arrow::RecordBatchReader::Make({batch}));
-    return arrow::Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
+    return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
         std::make_unique<ResolvedStream>(
             std::make_unique<arrow::flight::RecordBatchStream>(std::move(reader))));
   }
