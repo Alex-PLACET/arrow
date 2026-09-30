@@ -91,26 +91,6 @@ class MidStreamErrorFlightListing : public FlightListing {
   bool served_ = false;
 };
 
-// Counts the exchanges that are inside the handler: incremented on entry and
-// decremented when the handler returns, whichever way it returns.  The
-// DoExchange tests use it to prove that an abandoned exchange still leaves the
-// handler (a leak or a hang leaves it above zero).
-class ExchangeCounter {
- public:
-  explicit ExchangeCounter(std::atomic<int>* in_flight, std::atomic<int>* total)
-      : in_flight_(in_flight) {
-    in_flight_->fetch_add(1, std::memory_order_relaxed);
-    total->fetch_add(1, std::memory_order_relaxed);
-  }
-  ~ExchangeCounter() { in_flight_->fetch_sub(1, std::memory_order_relaxed); }
-
-  ExchangeCounter(const ExchangeCounter&) = delete;
-  ExchangeCounter& operator=(const ExchangeCounter&) = delete;
-
- private:
-  std::atomic<int>* in_flight_;
-};
-
 // Wraps a synchronous stream for the async interface: the payloads are already
 // available, so each future is finished when it is created.  Test-local stand-in
 // for the deleted library bridge, for tests that want an already-resolved stream.
@@ -131,6 +111,73 @@ class ResolvedStream : public AsyncFlightDataStream {
   std::unique_ptr<FlightDataStream> stream_;
 };
 
+// A vector-backed AsyncFlightListing: every NextAsync() resolves immediately.
+class SimpleListingAdapter final : public AsyncFlightListing {
+ public:
+  explicit SimpleListingAdapter(std::vector<FlightInfo> flights)
+      : flights_(std::move(flights)) {}
+
+  arrow::Future<std::shared_ptr<FlightInfo>> NextAsync() override {
+    if (next_ >= flights_.size()) {
+      return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+          std::shared_ptr<FlightInfo>{});
+    }
+    return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+        std::make_shared<FlightInfo>(std::move(flights_[next_++])));
+  }
+
+ private:
+  std::vector<FlightInfo> flights_;
+  size_t next_ = 0;
+};
+
+// Bridges the sync inner server's FlightListing to the async interface: each
+// NextAsync() pulls one FlightInfo on the calling thread.
+class SyncListingAdapter final : public AsyncFlightListing {
+ public:
+  explicit SyncListingAdapter(std::unique_ptr<FlightListing> listing)
+      : listing_(std::move(listing)) {}
+
+  arrow::Future<std::shared_ptr<FlightInfo>> NextAsync() override {
+    auto next = listing_->Next();
+    if (!next.ok()) {
+      return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(next.status());
+    }
+    if (*next == nullptr) {
+      return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+          std::shared_ptr<FlightInfo>{});
+    }
+    return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+        std::shared_ptr<FlightInfo>(std::move(*next)));
+  }
+
+ private:
+  std::unique_ptr<FlightListing> listing_;
+};
+
+// The same bridge for DoAction's ResultStream.
+class SyncResultStreamAdapter final : public AsyncResultStream {
+ public:
+  explicit SyncResultStreamAdapter(std::unique_ptr<ResultStream> results)
+      : results_(std::move(results)) {}
+
+  arrow::Future<std::shared_ptr<Result>> NextAsync() override {
+    auto next = results_->Next();
+    if (!next.ok()) {
+      return arrow::Future<std::shared_ptr<Result>>::MakeFinished(next.status());
+    }
+    if (*next == nullptr) {
+      return arrow::Future<std::shared_ptr<Result>>::MakeFinished(
+          std::shared_ptr<Result>{});
+    }
+    return arrow::Future<std::shared_ptr<Result>>::MakeFinished(
+        std::shared_ptr<Result>(std::move(*next)));
+  }
+
+ private:
+  std::unique_ptr<ResultStream> results_;
+};
+
 // Serves an existing FlightServerBase-derived test server on the async
 // transport.  Deriving from the async class is what selects the async generic
 // transport now, so wrapping is the test-side equivalent of the flag that used
@@ -149,34 +196,79 @@ class TestServerAsyncAdapter : public AsyncGenericFlightServerBase {
     return listener_;
   }
 
-  Status ListFlights(const ServerCallContext& context, const Criteria* criteria,
-                     std::unique_ptr<FlightListing>* listings) override {
-    return inner_->ListFlights(context, criteria, listings);
+  arrow::Future<std::shared_ptr<FlightInfo>> GetFlightInfoAsync(
+      const ServerCallContext& context, const FlightDescriptor& request) override {
+    std::unique_ptr<FlightInfo> info;
+    const auto status = inner_->GetFlightInfo(context, request, &info);
+    if (!status.ok()) {
+      return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(status);
+    }
+    return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+        std::shared_ptr<FlightInfo>(std::move(info)));
   }
-  Status GetFlightInfo(const ServerCallContext& context, const FlightDescriptor& request,
-                       std::unique_ptr<FlightInfo>* info) override {
-    return inner_->GetFlightInfo(context, request, info);
+
+  arrow::Future<std::shared_ptr<SchemaResult>> GetSchemaAsync(
+      const ServerCallContext& context, const FlightDescriptor& request) override {
+    std::unique_ptr<SchemaResult> schema;
+    const auto status = inner_->GetSchema(context, request, &schema);
+    if (!status.ok()) {
+      return arrow::Future<std::shared_ptr<SchemaResult>>::MakeFinished(status);
+    }
+    return arrow::Future<std::shared_ptr<SchemaResult>>::MakeFinished(
+        std::shared_ptr<SchemaResult>(std::move(schema)));
   }
-  Status PollFlightInfo(const ServerCallContext& context, const FlightDescriptor& request,
-                        std::unique_ptr<PollInfo>* info) override {
-    return inner_->PollFlightInfo(context, request, info);
+
+  arrow::Future<std::shared_ptr<PollInfo>> PollFlightInfoAsync(
+      const ServerCallContext& context, const FlightDescriptor& request) override {
+    std::unique_ptr<PollInfo> info;
+    const auto status = inner_->PollFlightInfo(context, request, &info);
+    if (!status.ok()) {
+      return arrow::Future<std::shared_ptr<PollInfo>>::MakeFinished(status);
+    }
+    return arrow::Future<std::shared_ptr<PollInfo>>::MakeFinished(
+        std::shared_ptr<PollInfo>(std::move(info)));
   }
-  Status GetSchema(const ServerCallContext& context, const FlightDescriptor& request,
-                   std::unique_ptr<SchemaResult>* schema) override {
-    return inner_->GetSchema(context, request, schema);
+
+  arrow::Future<std::shared_ptr<AsyncFlightListing>> ListFlightsAsync(
+      const ServerCallContext& context, const Criteria* criteria) override {
+    std::unique_ptr<FlightListing> listing;
+    const auto status = inner_->ListFlights(context, criteria, &listing);
+    if (!status.ok()) {
+      return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(status);
+    }
+    if (listing == nullptr) {
+      return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(
+          std::shared_ptr<AsyncFlightListing>{});
+    }
+    return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(
+        std::make_shared<SyncListingAdapter>(std::move(listing)));
   }
-  Status DoAction(const ServerCallContext& context, const Action& action,
-                  std::unique_ptr<ResultStream>* result) override {
-    return inner_->DoAction(context, action, result);
+
+  arrow::Future<std::vector<ActionType>> ListActionsAsync(
+      const ServerCallContext& context) override {
+    std::vector<ActionType> actions;
+    const auto status = inner_->ListActions(context, &actions);
+    if (!status.ok()) {
+      return arrow::Future<std::vector<ActionType>>::MakeFinished(status);
+    }
+    return arrow::Future<std::vector<ActionType>>::MakeFinished(std::move(actions));
   }
-  Status ListActions(const ServerCallContext& context,
-                     std::vector<ActionType>* actions) override {
-    return inner_->ListActions(context, actions);
-  }
-  Status DoExchange(const ServerCallContext& context,
-                    std::unique_ptr<FlightMessageReader> reader,
-                    std::unique_ptr<FlightMessageWriter> writer) override {
-    return inner_->DoExchange(context, std::move(reader), std::move(writer));
+
+  arrow::Future<std::shared_ptr<AsyncResultStream>> DoActionAsync(
+      const ServerCallContext& context, const Action& action) override {
+    std::unique_ptr<ResultStream> results;
+    const auto status = inner_->DoAction(context, action, &results);
+    if (!status.ok()) {
+      return arrow::Future<std::shared_ptr<AsyncResultStream>>::MakeFinished(status);
+    }
+    if (results == nullptr) {
+      // OK with no stream: the transport answers CANCELLED for this, so the
+      // null must travel.
+      return arrow::Future<std::shared_ptr<AsyncResultStream>>::MakeFinished(
+          std::shared_ptr<AsyncResultStream>{});
+    }
+    return arrow::Future<std::shared_ptr<AsyncResultStream>>::MakeFinished(
+        std::make_shared<SyncResultStreamAdapter>(std::move(results)));
   }
 
   arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
@@ -332,39 +424,6 @@ class TestFlightServer : public FlightServerBase {
 
   void set_empty_actions() { empty_actions_ = true; }
 
-  // Echoes every chunk back, in order: the exchange reader and writer must be
-  // live simultaneously, which is the whole point of the DoExchange bridge.
-  // `exchanges_in_flight_` is decremented by the counter's destructor, so the
-  // disconnect test can prove the handler left even when it returns early on a
-  // client-side error.
-  arrow::Status DoExchange(const ServerCallContext&,
-                           std::unique_ptr<FlightMessageReader> reader,
-                           std::unique_ptr<FlightMessageWriter> writer) override {
-    ExchangeCounter in_flight(&exchanges_in_flight_, &exchange_count_);
-    bool begun = false;
-    while (true) {
-      ARROW_ASSIGN_OR_RAISE(FlightStreamChunk chunk, reader->Next());
-      if (!chunk.data && !chunk.app_metadata) {
-        break;
-      }
-      if (!begun && chunk.data) {
-        begun = true;
-        ARROW_RETURN_NOT_OK(writer->Begin(chunk.data->schema()));
-      }
-      if (chunk.data && chunk.app_metadata) {
-        ARROW_RETURN_NOT_OK(writer->WriteWithMetadata(*chunk.data, chunk.app_metadata));
-      } else if (chunk.data) {
-        ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*chunk.data));
-      } else if (chunk.app_metadata) {
-        ARROW_RETURN_NOT_OK(writer->WriteMetadata(chunk.app_metadata));
-      }
-    }
-    return arrow::Status::OK();
-  }
-
-  int exchanges_in_flight() const { return exchanges_in_flight_.load(); }
-  int exchange_count() const { return exchange_count_.load(); }
-
   const std::string& ticket() const { return ticket_; }
   const FlightDescriptor& last_descriptor() const { return last_descriptor_; }
   const std::string& last_action_type() const { return last_action_type_; }
@@ -376,6 +435,71 @@ class TestFlightServer : public FlightServerBase {
   std::string last_action_type_;
   Criteria last_criteria_;
   bool empty_actions_ = false;
+};
+
+// Echoes every chunk of a DoExchange back, in order, on the async API: the
+// reader's demand drives the loop, each write is awaited, and the all-null
+// chunk ends the exchange.  `exchanges_in_flight` proves an abandoned
+// exchange still leaves the handler: the state object is freed when the last
+// continuation dies and decrements the counter on destruction.
+class EchoExchangeTestServer : public AsyncGenericFlightServerBase {
+ public:
+  arrow::Future<> DoExchangeAsync(
+      const ServerCallContext&, std::shared_ptr<AsyncFlightMessageReader> reader,
+      std::shared_ptr<AsyncFlightMessageWriter> writer) override {
+    exchange_count_.fetch_add(1);
+    exchanges_in_flight_.fetch_add(1);
+    auto state = std::make_shared<EchoState>();
+    state->reader = std::move(reader);
+    state->writer = std::move(writer);
+    state->in_flight = &exchanges_in_flight_;
+    return EchoNext(state);
+  }
+
+  int exchanges_in_flight() const { return exchanges_in_flight_.load(); }
+  int exchange_count() const { return exchange_count_.load(); }
+
+ private:
+  struct EchoState {
+    std::shared_ptr<AsyncFlightMessageReader> reader;
+    std::shared_ptr<AsyncFlightMessageWriter> writer;
+    std::atomic<int>* in_flight = nullptr;
+    bool begun = false;
+    ~EchoState() { in_flight->fetch_sub(1); }
+  };
+
+  arrow::Future<> EchoNext(const std::shared_ptr<EchoState>& state) {
+    // ponytail: the recursion depth follows the batch count of one exchange.
+    // Flatten into a loop if a single exchange ever carries thousands.
+    return state->reader->NextAsync().Then(
+        [this, state](const FlightStreamChunk& chunk) -> arrow::Future<> {
+          if (chunk.data == nullptr && chunk.app_metadata == nullptr) {
+            // End of the exchange.
+            return arrow::Future<>::MakeFinished();
+          }
+          arrow::Future<> written = arrow::Future<>::MakeFinished();
+          if (chunk.data != nullptr && !state->begun) {
+            state->begun = true;
+            written = state->writer->BeginAsync(chunk.data->schema());
+          }
+          if (chunk.data != nullptr && chunk.app_metadata != nullptr) {
+            written = written.Then([state, chunk]() {
+              return state->writer->WriteWithMetadataAsync(*chunk.data,
+                                                           chunk.app_metadata);
+            });
+          } else if (chunk.data != nullptr) {
+            written = written.Then([state, chunk]() {
+              return state->writer->WriteRecordBatchAsync(*chunk.data);
+            });
+          } else {
+            written = written.Then([state, chunk]() {
+              return state->writer->WriteMetadataAsync(chunk.app_metadata);
+            });
+          }
+          return written.Then([this, state]() { return EchoNext(state); });
+        });
+  }
+
   std::atomic<int> exchanges_in_flight_{0};
   std::atomic<int> exchange_count_{0};
 };
@@ -1154,6 +1278,51 @@ TEST(AsyncGrpcTest, UnaryReactorPropagatesServerError) {
   ASSERT_OK(flight_server.Wait());
 }
 
+TEST(AsyncGrpcTest, GetFlightInfoAsyncCompletesOnAnotherThread) {
+  // The handler completes its future from a helper thread after the dispatch
+  // has returned: the answer must arrive on the client anyway, which is the
+  // whole point of the async handler.
+  class DeferredInfoServer : public AsyncGenericFlightServerBase {
+   public:
+    arrow::Future<std::shared_ptr<FlightInfo>> GetFlightInfoAsync(
+        const ServerCallContext&, const FlightDescriptor& request) override {
+      auto out = arrow::Future<std::shared_ptr<FlightInfo>>::Make();
+      std::thread([out, request]() mutable {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        auto info =
+            FlightInfo::Make(*arrow::schema({arrow::field("value", arrow::int64())}),
+                             request, std::vector<FlightEndpoint>{}, -1, -1);
+        if (!info.ok()) {
+          out.MarkFinished(info.status());
+          return;
+        }
+        out.MarkFinished(std::make_shared<FlightInfo>(std::move(*info)));
+      }).detach();
+      return out;
+    }
+  };
+
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  DeferredInfoServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto info,
+                       client->GetFlightInfo(FlightDescriptor::Command("deferred")));
+  ipc::DictionaryMemo dict_memo;
+  ASSERT_OK_AND_ASSIGN(auto schema, info->GetSchema(&dict_memo));
+  ASSERT_EQ(1, schema->num_fields());
+  ASSERT_EQ("value", schema->field(0)->name());
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
 // ---------------------------------------------------------------------------
 // The streaming trio: ListActions (a vector), DoAction (a ResultStream) and
 // ListFlights (a FlightListing) share StreamingReactor (one request in, N
@@ -1404,6 +1573,52 @@ TEST(AsyncGrpcTest, ListFlightsMidStreamErrorFinishesTheRpc) {
   ASSERT_OK(flight_server.Wait());
 }
 
+TEST(AsyncGrpcTest, ListFlightsAsyncCompletesOnAnotherThread) {
+  // The listing object itself arrives on a helper thread: the transport must
+  // serve the response from wherever the future resolves.
+  class DeferredListingServer : public AsyncGenericFlightServerBase {
+   public:
+    arrow::Future<std::shared_ptr<AsyncFlightListing>> ListFlightsAsync(
+        const ServerCallContext&, const Criteria*) override {
+      auto out = arrow::Future<std::shared_ptr<AsyncFlightListing>>::Make();
+      std::thread([out]() mutable {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::vector<FlightInfo> flights;
+        auto info = MakeTestFlightInfo(FlightDescriptor::Path({"deferred"}));
+        if (!info.ok()) {
+          out.MarkFinished(info.status());
+          return;
+        }
+        flights.push_back(std::move(**info));
+        out.MarkFinished(std::make_shared<SimpleListingAdapter>(std::move(flights)));
+      }).detach();
+      return out;
+    }
+  };
+
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  DeferredListingServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto listing, client->ListFlights());
+  int seen = 0;
+  while (true) {
+    ASSERT_OK_AND_ASSIGN(auto info, listing->Next());
+    if (info == nullptr) break;
+    ++seen;
+  }
+  ASSERT_EQ(1, seen);
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
 // ---------------------------------------------------------------------------
 // DoExchange: the bidirectional RPC.  Its handler is synchronous user code
 // running on the callback thread, with the sync reader/writer stack over the
@@ -1414,10 +1629,9 @@ TEST(AsyncGrpcTest, DoExchangeEchoesBatches) {
   // Two batches up, two batches back, in order: this is the case that needs a
   // read and a write outstanding at the same time, which is what the bridge
   // exists for.
-  TestFlightServer inner_server;
   ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
   FlightServerOptions options(location);
-  TestServerAsyncAdapter flight_server(&inner_server);
+  EchoExchangeTestServer flight_server;
   ASSERT_OK(flight_server.Init(options));
   ASSERT_OK_AND_ASSIGN(
       auto client_location,
@@ -1455,8 +1669,8 @@ TEST(AsyncGrpcTest, DoExchangeEchoesBatches) {
   ASSERT_OK(flight_server.Shutdown());
   ASSERT_OK(flight_server.Wait());
 
-  ASSERT_EQ(1, inner_server.exchange_count());
-  ASSERT_EQ(0, inner_server.exchanges_in_flight());
+  ASSERT_EQ(1, flight_server.exchange_count());
+  ASSERT_EQ(0, flight_server.exchanges_in_flight());
 }
 
 TEST(AsyncGrpcTest, DoExchangeMetadataOnlyDoesNotHang) {
@@ -1465,10 +1679,9 @@ TEST(AsyncGrpcTest, DoExchangeMetadataOnlyDoesNotHang) {
   // message that will never come (the case DataTest::TestDoExchangeNoData
   // exists for).  A hang here is the failure mode this test exists for, which
   // is why it runs under a shell timeout.
-  TestFlightServer inner_server;
   ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
   FlightServerOptions options(location);
-  TestServerAsyncAdapter flight_server(&inner_server);
+  EchoExchangeTestServer flight_server;
   ASSERT_OK(flight_server.Init(options));
   ASSERT_OK_AND_ASSIGN(
       auto client_location,
@@ -1494,8 +1707,8 @@ TEST(AsyncGrpcTest, DoExchangeMetadataOnlyDoesNotHang) {
   ASSERT_OK(flight_server.Shutdown());
   ASSERT_OK(flight_server.Wait());
 
-  ASSERT_EQ(1, inner_server.exchange_count());
-  ASSERT_EQ(0, inner_server.exchanges_in_flight());
+  ASSERT_EQ(1, flight_server.exchange_count());
+  ASSERT_EQ(0, flight_server.exchanges_in_flight());
 }
 
 TEST(AsyncGrpcTest, DoExchangeClientDisconnectFinishes) {
@@ -1503,10 +1716,9 @@ TEST(AsyncGrpcTest, DoExchangeClientDisconnectFinishes) {
   // must let the handler unwind and finish the RPC, and the exchange counter
   // added to the test server must come back to zero -- a hang or a leaked
   // handler leaves it above zero.
-  TestFlightServer inner_server;
   ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
   FlightServerOptions options(location);
-  TestServerAsyncAdapter flight_server(&inner_server);
+  EchoExchangeTestServer flight_server;
   ASSERT_OK(flight_server.Init(options));
   ASSERT_OK_AND_ASSIGN(
       auto client_location,
@@ -1522,7 +1734,7 @@ TEST(AsyncGrpcTest, DoExchangeClientDisconnectFinishes) {
       schema, 2, {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")})));
   // The server has entered its handler by now (it answered the schema); the
   // exchange is live.
-  ASSERT_TRUE(WaitFor([&inner_server] { return inner_server.exchange_count() == 1; }));
+  ASSERT_TRUE(WaitFor([&flight_server] { return flight_server.exchange_count() == 1; }));
 
   // Walk away without finishing: no DoneWriting, no Close, no reader drain.
   // The client's destructor closes the channel, which cancels the RPC.
@@ -1533,9 +1745,9 @@ TEST(AsyncGrpcTest, DoExchangeClientDisconnectFinishes) {
 
   // The handler must leave, whichever status path it takes.
   const bool drained =
-      WaitFor([&inner_server] { return inner_server.exchanges_in_flight() == 0; });
+      WaitFor([&flight_server] { return flight_server.exchanges_in_flight() == 0; });
   ASSERT_TRUE(drained) << "the exchange handler never left (in flight: "
-                       << inner_server.exchanges_in_flight() << ")";
+                       << flight_server.exchanges_in_flight() << ")";
 
   ASSERT_OK(flight_server.Shutdown());
   ASSERT_OK(flight_server.Wait());

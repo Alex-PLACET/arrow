@@ -35,6 +35,10 @@
 namespace arrow::flight {
 
 AsyncFlightDataStream::~AsyncFlightDataStream() = default;
+AsyncFlightListing::~AsyncFlightListing() = default;
+AsyncResultStream::~AsyncResultStream() = default;
+AsyncFlightMessageReader::~AsyncFlightMessageReader() = default;
+AsyncFlightMessageWriter::~AsyncFlightMessageWriter() = default;
 
 struct AsyncGenericFlightServerBase::Impl {
   internal::ServerLifecycle lifecycle{"AsyncGenericFlightServerBase"};
@@ -80,44 +84,49 @@ Status AsyncGenericFlightServerBase::Wait() { return impl_->lifecycle.Wait(); }
 
 // --- handler defaults: the same answers FlightServerBase's defaults give ---
 
-Status AsyncGenericFlightServerBase::ListFlights(const ServerCallContext&,
-                                                 const Criteria*,
-                                                 std::unique_ptr<FlightListing>*) {
-  return Status::NotImplemented("NYI");
+arrow::Future<std::shared_ptr<AsyncFlightListing>>
+AsyncGenericFlightServerBase::ListFlightsAsync(const ServerCallContext&,
+                                               const Criteria*) {
+  return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(
+      Status::NotImplemented("NYI"));
 }
 
-Status AsyncGenericFlightServerBase::GetFlightInfo(const ServerCallContext&,
-                                                   const FlightDescriptor&,
-                                                   std::unique_ptr<FlightInfo>*) {
-  return Status::NotImplemented("NYI");
+arrow::Future<std::shared_ptr<FlightInfo>>
+AsyncGenericFlightServerBase::GetFlightInfoAsync(const ServerCallContext&,
+                                                 const FlightDescriptor&) {
+  return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+      Status::NotImplemented("NYI"));
 }
 
-Status AsyncGenericFlightServerBase::PollFlightInfo(const ServerCallContext&,
-                                                    const FlightDescriptor&,
-                                                    std::unique_ptr<PollInfo>*) {
-  return Status::NotImplemented("NYI");
+arrow::Future<std::shared_ptr<PollInfo>>
+AsyncGenericFlightServerBase::PollFlightInfoAsync(const ServerCallContext&,
+                                                  const FlightDescriptor&) {
+  return arrow::Future<std::shared_ptr<PollInfo>>::MakeFinished(
+      Status::NotImplemented("NYI"));
 }
 
-Status AsyncGenericFlightServerBase::GetSchema(const ServerCallContext&,
-                                               const FlightDescriptor&,
-                                               std::unique_ptr<SchemaResult>*) {
-  return Status::NotImplemented("NYI");
+arrow::Future<std::shared_ptr<SchemaResult>> AsyncGenericFlightServerBase::GetSchemaAsync(
+    const ServerCallContext&, const FlightDescriptor&) {
+  return arrow::Future<std::shared_ptr<SchemaResult>>::MakeFinished(
+      Status::NotImplemented("NYI"));
 }
 
-Status AsyncGenericFlightServerBase::DoAction(const ServerCallContext&, const Action&,
-                                              std::unique_ptr<ResultStream>*) {
-  return Status::NotImplemented("NYI");
+arrow::Future<std::shared_ptr<AsyncResultStream>>
+AsyncGenericFlightServerBase::DoActionAsync(const ServerCallContext&, const Action&) {
+  return arrow::Future<std::shared_ptr<AsyncResultStream>>::MakeFinished(
+      Status::NotImplemented("NYI"));
 }
 
-Status AsyncGenericFlightServerBase::ListActions(const ServerCallContext&,
-                                                 std::vector<ActionType>*) {
-  return Status::NotImplemented("NYI");
+arrow::Future<std::vector<ActionType>> AsyncGenericFlightServerBase::ListActionsAsync(
+    const ServerCallContext&) {
+  return arrow::Future<std::vector<ActionType>>::MakeFinished(
+      Status::NotImplemented("NYI"));
 }
 
-Status AsyncGenericFlightServerBase::DoExchange(const ServerCallContext&,
-                                                std::unique_ptr<FlightMessageReader>,
-                                                std::unique_ptr<FlightMessageWriter>) {
-  return Status::NotImplemented("NYI");
+arrow::Future<> AsyncGenericFlightServerBase::DoExchangeAsync(
+    const ServerCallContext&, std::shared_ptr<AsyncFlightMessageReader>,
+    std::shared_ptr<AsyncFlightMessageWriter>) {
+  return arrow::Future<>::MakeFinished(Status::NotImplemented("NYI"));
 }
 
 arrow::Future<std::shared_ptr<AsyncFlightDataStream>>
@@ -126,8 +135,8 @@ AsyncGenericFlightServerBase::DoGetAsync(const ServerCallContext&, const Ticket&
       Status::NotImplemented("DoGetAsync is not implemented"));
 }
 
-std::shared_ptr<AsyncFlightDataListener> AsyncGenericFlightServerBase::CreateDoPutListener(
-    const ServerCallContext&) {
+std::shared_ptr<AsyncFlightDataListener>
+AsyncGenericFlightServerBase::CreateDoPutListener(const ServerCallContext&) {
   // The default refuses uploads; a server that accepts them overrides this.
   return nullptr;
 }

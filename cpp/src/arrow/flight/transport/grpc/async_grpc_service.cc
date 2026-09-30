@@ -28,9 +28,10 @@
 
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <utility>
 
@@ -44,6 +45,7 @@
 #include "arrow/flight/transport_server.h"
 #include "arrow/flight/transport_server_internal.h"
 #include "arrow/flight/types.h"
+#include "arrow/ipc/writer.h"
 #include "arrow/util/logging.h"
 
 namespace arrow::flight::transport::grpc {
@@ -134,7 +136,7 @@ arrow::Result<T> ParseProtoRequest(const ::grpc::ByteBuffer& buf, std::string_vi
 /// answers for a handler that returned OK without setting its result
 /// (grpc_server.cc: "Flight not found").
 template <typename T, typename PbT>
-arrow::Status SerializeOrNotFound(const std::unique_ptr<T>& value, PbT* out) {
+arrow::Status SerializeOrNotFound(const std::shared_ptr<T>& value, PbT* out) {
   if (value == nullptr) {
     return arrow::Status::KeyError("Flight not found");
   }
@@ -594,17 +596,18 @@ class HandshakeReactor : public ::grpc::ServerGenericBidiReactor {
 
 /// One request message in, one response message out, then finish.
 ///
-/// The RPCs served here (the three whose request is a FlightDescriptor:
-/// GetFlightInfo, GetSchema, PollFlightInfo) differ only in the server class
-/// method that runs and the response type, so the handler supplied by the
-/// service does both while the reactor does the request parsing, the
-/// "handler returned nothing" answer and the serialization.
-template <typename PbResponseT>
+/// The handler returns a future; the response is serialized and written when
+/// the future resolves, on whatever thread resolved it, so the gRPC callback
+/// thread serving the request is never held by the handler.  The RPCs served
+/// here (the three whose request is a FlightDescriptor: GetFlightInfo,
+/// GetSchema, PollFlightInfo) differ only in the handler and the response
+/// type, so `HandlerFn` does the handler while the reactor does the request
+/// parsing, the "handler answered nothing" answer and the serialization.
+template <typename T, typename PbT>
 class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
  public:
-  /// Convert the request, call the server class, serialize the response.
-  using HandlerFn = std::function<arrow::Status(const ServerCallContext&,
-                                                const FlightDescriptor&, PbResponseT*)>;
+  using HandlerFn = std::function<arrow::Future<std::shared_ptr<T>>(
+      const ServerCallContext&, const FlightDescriptor&)>;
 
   UnaryReactor(AsyncCallContext flight_context, HandlerFn handler)
       : flight_context_(std::move(flight_context)), handler_(std::move(handler)) {
@@ -613,47 +616,92 @@ class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
 
   void OnReadDone(bool ok) override {
     if (!ok) {
-      Finish(flight_context_.FinishRequest(
+      FinishOnce(flight_context_.FinishRequest(
           MakeFlightError(FlightStatusCode::Internal, "Failed to read request")));
       return;
     }
     const auto descriptor = ParseProtoRequest<pb::FlightDescriptor, FlightDescriptor>(
         request_buf_, "FlightDescriptor");
     if (!descriptor.ok()) {
-      Finish(flight_context_.FinishRequest(descriptor.status()));
+      FinishOnce(flight_context_.FinishRequest(descriptor.status()));
       return;
     }
-    PbResponseT response;
-    const auto status = handler_(flight_context_, *descriptor, &response);
-    if (!status.ok()) {
-      Finish(flight_context_.FinishRequest(status));
-      return;
-    }
-    response_buf_ = MakeWriteBuffer(response);
-    StartWrite(&response_buf_);
+    // The handler may complete its future on any thread: hold the reactor
+    // across the continuation (gRPC has no server-side holds).
+    Hold();
+    arrow::Future<std::shared_ptr<T>> future = handler_(flight_context_, *descriptor);
+    future.AddCallback(
+        [this, future](const arrow::Result<std::shared_ptr<T>>& result) mutable {
+          if (cancelled_) {
+            // The RPC died while the future was pending.
+            FinishOnce(flight_context_.FinishRequest(arrow::Status::Cancelled()));
+            ReleaseHold();
+            return;
+          }
+          if (!result.ok()) {
+            FinishOnce(flight_context_.FinishRequest(result.status()));
+            ReleaseHold();
+            return;
+          }
+          PbT response;
+          const auto status = SerializeOrNotFound(*future.MoveResult(), &response);
+          if (!status.ok()) {
+            FinishOnce(flight_context_.FinishRequest(status));
+            ReleaseHold();
+            return;
+          }
+          response_buf_ = MakeWriteBuffer(response);
+          StartWrite(&response_buf_);
+          ReleaseHold();  // the next hop is a gRPC callback (OnWriteDone)
+        });
   }
 
   void OnWriteDone(bool ok) override {
-    // The failed-read path above never reaches the write, so exactly one of
-    // the two calls Finish().
-    Finish(flight_context_.FinishRequest(
+    // The failed-read and cancel paths never reach the write, so exactly one
+    // path calls FinishOnce.
+    FinishOnce(flight_context_.FinishRequest(
         ok ? arrow::Status::OK()
            : MakeFlightError(FlightStatusCode::Internal, "Failed to write response")));
   }
 
-  void OnDone() override { delete this; }
+  void OnCancel() override { cancelled_ = true; }
+
+  void OnDone() override { ReleaseHold(); }
 
  private:
+  /// \brief Ensures that gRPC's Finish is called at most once, and never after OnDone.
+  void FinishOnce(::grpc::Status status) {
+    bool expected = false;
+    if (finished_.compare_exchange_strong(expected, true)) {
+      Finish(std::move(status));
+    }
+  }
+
+  // gRPC's server callback API has no holds, so the reactor refcounts itself:
+  // one reference for the RPC (released in OnDone) plus one per pending
+  // continuation.  Whichever thread releases the last reference deletes it.
+  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
+  void ReleaseHold() {
+    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete this;
+    }
+  }
+
   AsyncCallContext flight_context_;
   HandlerFn handler_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer response_buf_;
+  std::atomic<bool> cancelled_{false};
+  std::atomic<bool> finished_{false};
+  std::atomic<int> refs_{1};
 };
 
 /// One request message in, N response messages out, then finish.
 ///
-/// One message is in flight at a time: OnWriteDone asks for the next, so the
-/// loop costs one callback per message and no extra state.
+/// The handler's answer arrives as a future (the listing, the result stream,
+/// the action vector); the reactor then pulls one message at a time through
+/// NextMessage(), each pull possibly completing later, and writes each
+/// message on its own OnWriteDone turn.
 class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
  public:
   StreamingReactor(AsyncCallContext flight_context, AsyncGenericFlightServerBase* base)
@@ -663,81 +711,139 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
 
   void OnReadDone(bool ok) override {
     if (!ok) {
-      Finish(flight_context_.FinishRequest(
+      FinishOnce(flight_context_.FinishRequest(
           MakeFlightError(FlightStatusCode::Internal, "Failed to read request")));
       return;
     }
-    const auto status = HandleRequest();
-    if (!status.ok()) {
-      Finish(flight_context_.FinishRequest(status));
-      return;
-    }
-    WriteNext();
+    // The handler may complete its future on any thread: hold the reactor
+    // across the continuation (gRPC has no server-side holds).
+    Hold();
+    Start().AddCallback([this](const arrow::Status& status) {
+      if (cancelled_) {
+        FinishOnce(flight_context_.FinishRequest(arrow::Status::Cancelled()));
+        ReleaseHold();
+        return;
+      }
+      if (!status.ok()) {
+        // The handler's status is the RPC's status (a handler that completed
+        // OK with no stream arrives here too: the concrete reactor mapped
+        // that to CANCELLED, as the sync transport does).
+        FinishOnce(flight_context_.FinishRequest(status));
+        ReleaseHold();
+        return;
+      }
+      WriteNextMessage();
+      ReleaseHold();
+    });
   }
 
   void OnWriteDone(bool ok) override {
     if (!ok) {
-      Finish(flight_context_.FinishRequest(
+      FinishOnce(flight_context_.FinishRequest(
           MakeFlightError(FlightStatusCode::Internal, "Failed to write response")));
       return;
     }
-    WriteNext();
+    WriteNextMessage();
   }
 
-  void OnDone() override { delete this; }
+  void OnCancel() override { cancelled_ = true; }
+
+  void OnDone() override { ReleaseHold(); }
 
  protected:
-  /// Consume the request. Called once, before the first WriteNext().
-  virtual arrow::Status HandleRequest() = 0;
-  /// Serialize the next message into `write_buf_` and return true, or return
-  /// false when the response stream is exhausted.
-  virtual arrow::Result<bool> NextMessage() = 0;
+  /// Consume the request; the returned future resolves when the handler's
+  /// answer is available, with a non-OK status to fail the RPC.
+  virtual arrow::Future<> Start() = 0;
+  /// Serialize the next message of the response into `write_buf_`.  A future
+  /// completed with true writes it; false ends the response with OK; a
+  /// non-OK status fails the RPC.
+  virtual arrow::Future<bool> NextMessage() = 0;
 
-  void WriteNext() {
-    auto has_next = NextMessage();
-    if (!has_next.ok()) {
-      Finish(flight_context_.FinishRequest(std::move(has_next).status()));
+  void WriteNextMessage() {
+    if (cancelled_) {
+      FinishOnce(flight_context_.FinishRequest(arrow::Status::Cancelled()));
       return;
     }
-    if (!*has_next) {
-      // Nothing left to send: finish without ever arming a write, so the RPC
-      // does not wait for an OnWriteDone that will not come.
-      Finish(flight_context_.FinishRequest(arrow::Status::OK()));
-      return;
+    Hold();  // the message may be produced on any thread
+    NextMessage().AddCallback([this](const arrow::Result<bool>& has_next) {
+      if (cancelled_) {
+        FinishOnce(flight_context_.FinishRequest(arrow::Status::Cancelled()));
+        ReleaseHold();
+        return;
+      }
+      if (!has_next.ok()) {
+        FinishOnce(flight_context_.FinishRequest(has_next.status()));
+        ReleaseHold();
+        return;
+      }
+      if (!*has_next) {
+        // Nothing left to send: finish without ever arming a write, so the
+        // RPC does not wait for an OnWriteDone that will not come.
+        FinishOnce(flight_context_.FinishRequest(arrow::Status::OK()));
+        ReleaseHold();
+        return;
+      }
+      StartWrite(&write_buf_);
+      ReleaseHold();  // the next hop is a gRPC callback (OnWriteDone)
+    });
+  }
+
+ protected:
+  /// \brief Ensures that gRPC's Finish is called at most once, and never after OnDone.
+  void FinishOnce(::grpc::Status status) {
+    bool expected = false;
+    if (finished_.compare_exchange_strong(expected, true)) {
+      Finish(std::move(status));
     }
-    StartWrite(&write_buf_);
+  }
+
+  // gRPC's server callback API has no holds, so the reactor refcounts itself:
+  // one reference for the RPC (released in OnDone) plus one per pending
+  // continuation.  Whichever thread releases the last reference deletes it.
+  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
+  void ReleaseHold() {
+    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete this;
+    }
   }
 
   AsyncCallContext flight_context_;
   AsyncGenericFlightServerBase* base_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer write_buf_;
+  std::atomic<bool> cancelled_{false};
+  std::atomic<bool> finished_{false};
+  std::atomic<int> refs_{1};
 };
 
-/// \brief Serve one ListActions RPC: the server's action types are collected
-/// up front (a plain vector, no iterator) and written one per OnWriteDone.
+/// \brief Serve one ListActions RPC: the handler's action types are written
+/// one per OnWriteDone.
 class ListActionsReactor final : public StreamingReactor {
  public:
   using StreamingReactor::StreamingReactor;
 
  protected:
-  arrow::Status HandleRequest() override {
+  arrow::Future<> Start() override {
     // The request is pb::Empty; nothing to parse.
-    std::vector<ActionType> actions;
-    ARROW_RETURN_NOT_OK(base_->ListActions(flight_context_, &actions));
-    actions_ = std::move(actions);
-    next_ = 0;
-    return arrow::Status::OK();
+    return base_->ListActionsAsync(flight_context_)
+        .Then([this](const std::vector<ActionType>& actions) -> arrow::Status {
+          actions_ = actions;
+          next_ = 0;
+          return arrow::Status::OK();
+        });
   }
 
-  arrow::Result<bool> NextMessage() override {
+  arrow::Future<bool> NextMessage() override {
     if (next_ >= actions_.size()) {
-      return false;
+      return arrow::Future<bool>::MakeFinished(false);
     }
     pb::ActionType pb_type;
-    ARROW_RETURN_NOT_OK(internal::ToProto(actions_[next_++], &pb_type));
+    const auto status = internal::ToProto(actions_[next_++], &pb_type);
+    if (!status.ok()) {
+      return arrow::Future<bool>::MakeFinished(status);
+    }
     write_buf_ = MakeWriteBuffer(pb_type);
-    return true;
+    return arrow::Future<bool>::MakeFinished(true);
   }
 
  private:
@@ -745,413 +851,576 @@ class ListActionsReactor final : public StreamingReactor {
   size_t next_ = 0;
 };
 
-/// \brief Serve one DoAction RPC: the server's ResultStream is pulled one
-/// Result per OnWriteDone until it reports the end of stream.
+/// \brief Serve one DoAction RPC: the handler's AsyncResultStream is pulled
+/// one Result per OnWriteDone until it reports the end of stream.
 class DoActionReactor final : public StreamingReactor {
  public:
   using StreamingReactor::StreamingReactor;
 
  protected:
-  arrow::Status HandleRequest() override {
-    ARROW_ASSIGN_OR_RAISE(
-        auto action, (ParseProtoRequest<pb::Action, Action>(request_buf_, "Action")));
-    return base_->DoAction(flight_context_, action, &results_);
+  arrow::Future<> Start() override {
+    auto action = ParseProtoRequest<pb::Action, Action>(request_buf_, "Action");
+    if (!action.ok()) {
+      return arrow::Future<>::MakeFinished(action.status());
+    }
+    return base_->DoActionAsync(flight_context_, *action)
+        .Then([this](const std::shared_ptr<AsyncResultStream>& stream) -> arrow::Status {
+          if (stream == nullptr) {
+            // A handler that completed OK with no stream answers CANCELLED on
+            // the sync transport (grpc_server.cc:404-406), before any message
+            // is written: the same answer, in the same place.
+            return arrow::Status::Cancelled();
+          }
+          stream_ = stream;
+          return arrow::Status::OK();
+        });
   }
 
-  arrow::Result<bool> NextMessage() override {
-    if (results_ == nullptr) {
-      // A handler that returned OK without a stream answers CANCELLED on the
-      // sync transport (grpc_server.cc:404-406), before any message is
-      // written: same answer, same place.
-      return arrow::Status::Cancelled();
-    }
-    ARROW_ASSIGN_OR_RAISE(auto result, results_->Next());
-    // A null Result is the end-of-stream sentinel, as in the sync
-    // WriteStream/DoAction loops (grpc_server.cc:408-421).
-    if (result == nullptr) {
-      return false;
-    }
-    pb::Result pb_result;
-    ARROW_RETURN_NOT_OK(internal::ToProto(*result, &pb_result));
-    write_buf_ = MakeWriteBuffer(pb_result);
-    return true;
+  arrow::Future<bool> NextMessage() override {
+    return stream_->NextAsync().Then(
+        [this](const std::shared_ptr<Result>& result) -> arrow::Result<bool> {
+          // A null Result is the end-of-stream sentinel, as in the sync
+          // WriteStream/DoAction loops (grpc_server.cc:408-421).
+          if (result == nullptr) {
+            return false;
+          }
+          pb::Result pb_result;
+          ARROW_RETURN_NOT_OK(internal::ToProto(*result, &pb_result));
+          write_buf_ = MakeWriteBuffer(pb_result);
+          return true;
+        });
   }
 
  private:
-  std::unique_ptr<ResultStream> results_;
+  std::shared_ptr<AsyncResultStream> stream_;
 };
 
-/// \brief Serve one ListFlights RPC: the server's FlightListing is pulled one
-/// FlightInfo per OnWriteDone until it is exhausted.
+/// \brief Serve one ListFlights RPC: the handler's AsyncFlightListing is
+/// pulled one FlightInfo per OnWriteDone until it is exhausted.
 class ListFlightsReactor final : public StreamingReactor {
  public:
   using StreamingReactor::StreamingReactor;
 
  protected:
-  arrow::Status HandleRequest() override {
-    ARROW_ASSIGN_OR_RAISE(auto criteria, (ParseProtoRequest<pb::Criteria, Criteria>(
-                                             request_buf_, "Criteria")));
-    return base_->ListFlights(flight_context_, &criteria, &listing_);
+  arrow::Future<> Start() override {
+    auto criteria = ParseProtoRequest<pb::Criteria, Criteria>(request_buf_, "Criteria");
+    if (!criteria.ok()) {
+      return arrow::Future<>::MakeFinished(criteria.status());
+    }
+    criteria_ = *criteria;
+    return base_->ListFlightsAsync(flight_context_, &criteria_)
+        .Then(
+            [this](const std::shared_ptr<AsyncFlightListing>& listing) -> arrow::Status {
+              listing_ = listing;
+              return arrow::Status::OK();
+            });
   }
 
-  arrow::Result<bool> NextMessage() override {
+  arrow::Future<bool> NextMessage() override {
     // A null listing is "no flights available", as in the sync transport
     // (grpc_server.cc:258-261) -- zero messages, then OK.
     if (listing_ == nullptr) {
-      return false;
+      return arrow::Future<bool>::MakeFinished(false);
     }
-    ARROW_ASSIGN_OR_RAISE(auto info, listing_->Next());
-    // Exhaustion is the listing returning null (grpc_server.cc:186-206).
-    if (info == nullptr) {
-      return false;
-    }
-    pb::FlightInfo pb_info;
-    ARROW_RETURN_NOT_OK(internal::ToProto(*info, &pb_info));
-    write_buf_ = MakeWriteBuffer(pb_info);
-    return true;
+    return listing_->NextAsync().Then(
+        [this](const std::shared_ptr<FlightInfo>& info) -> arrow::Result<bool> {
+          // Exhaustion is the listing returning null (grpc_server.cc:186-206).
+          if (info == nullptr) {
+            return false;
+          }
+          pb::FlightInfo pb_info;
+          ARROW_RETURN_NOT_OK(internal::ToProto(*info, &pb_info));
+          write_buf_ = MakeWriteBuffer(pb_info);
+          return true;
+        });
   }
 
  private:
-  std::unique_ptr<FlightListing> listing_;
+  Criteria criteria_;
+  std::shared_ptr<AsyncFlightListing> listing_;
 };
 
 // ---------------------------------------------------------------------------
 // DoExchange: the bidirectional RPC.
 //
-// Its handler is synchronous user code (a FlightMessageReader + a
-// FlightMessageWriter), so unlike every other reactor here it cannot run on a
-// callback thread: the handler blocks while the reactor's callbacks complete
-// the operation on another gRPC thread.  `ExchangeDataStream` is the
-// internal::ServerDataStream that bridges the two, and the reader/writer
-// classes the Arrow sync path already has (TransportMessageReader /
-// TransportMessageWriter) run on top of it untouched.
-//
-// Invariants (the class below is the only enforcement):
-//   1. At most one read outstanding at a time: `ReadData()` is the only place
-//      that calls StartRead, and it does not return until the read it posted
-//      has completed (that is the condvar predicate it waits on) -- so a second
-//      StartRead can never be posted while the first is in flight.
-//   2. At most one write outstanding at a time: `WriteData()` waits out any
-//      previous write before arming the next one, and does not return until the
-//      write it armed has completed; only `OnWriteDone` clears the flag that
-//      wait tests.
-//   3. Finish() is called exactly once, from whichever terminal path fires
-//      first (the handler returned, or the request could not be read at all);
-//      the CAS in FinishOnce() is what makes that true.  On a cancelled call
-//      the unblocked handler still returns and still reaches that one Finish.
-//   4. OnDone() deletes the reactor, and the handler runs on the same thread
-//      that entered OnReadDone (RunHandler() is called inline from it), so it
-//      cannot outlive the reactor: gRPC delivers OnDone only after that
-//      callback returns (grpcpp/impl/server_callback_handlers.h: it calls
-//      reactor->OnReadDone(ok) and only then MaybeDone()).
-//
-// ponytail: holding the callback thread for the whole exchange is the accepted
-// tradeoff (matches the sync transport's thread-per-exchange behaviour). The
-// cost is real -- a long exchange occupies one thread from the pool, and the
-// pool grows ~1 thread/s while it is held -- but it buys a synchronous handler
-// with no extra thread per exchange and no new public API.  Upgrade path: run
-// the handler on a Flight thread pool and keep a Hold() on the reactor, if
-// DoExchange throughput ever matters.
+// Its handler is asynchronous user code: it receives an
+// AsyncFlightMessageReader/AsyncFlightMessageWriter pair and returns a future
+// the reactor finishes the RPC with.  The reader pulls one client message per
+// NextAsync() demand (the reactor arms exactly one read at a time), and the
+// writer serializes through the same IPC writer stack the synchronous
+// transport uses, the reactor writing one message per StartWrite.  No gRPC
+// callback thread is ever held by the handler.
+
 class ExchangeReactor;
 
-/// The internal::ServerDataStream the sync reader/writer classes see; it
-/// forwards each call to the reactor, which blocks until the corresponding
-/// gRPC callback completes.  (Defined out-of-line, after ExchangeReactor.)
-class ExchangeDataStream final : public internal::ServerDataStream {
+/// \brief The AsyncFlightMessageReader of one DoExchange RPC.
+///
+/// Decoding reuses the push decoder DoPut uses, so the wire shapes behave
+/// identically: the schema and dictionary messages are read through (they are
+/// not chunks), a metadata-only message is a chunk with a null data member,
+/// and the end of the exchange is the chunk whose members are both null.
+/// Messages are pulled one demand at a time: NextAsync() arms the next read,
+/// and the chunk (or the end, or the failure) resolves the demand.
+///
+/// The reactor drives the I/O (it owns the read buffer and calls OnMessage /
+/// OnReadClosed / OnReadFailed); this class owns the decode state machine.
+class ExchangeReader final : public AsyncFlightMessageReader {
  public:
-  explicit ExchangeDataStream(ExchangeReactor* reactor);
+  ExchangeReader()
+      : listener_(std::make_shared<ChunkListener>(this)), decoder_(listener_) {}
 
-  bool ReadData(internal::FlightData* data) override;
+  const FlightDescriptor& descriptor() const override { return descriptor_; }
 
-  arrow::Result<bool> WriteData(const FlightPayload& payload) override;
+  arrow::Future<FlightStreamChunk> NextAsync() override {
+    if (pending_.is_valid() && !pending_.is_finished()) {
+      return arrow::Future<FlightStreamChunk>::MakeFinished(
+          arrow::Status::Invalid("one NextAsync at a time"));
+    }
+    if (buffered_.has_value()) {
+      arrow::Future<FlightStreamChunk> out =
+          arrow::Future<FlightStreamChunk>::MakeFinished(std::move(*buffered_));
+      buffered_.reset();
+      return out;
+    }
+    if (!read_error_.ok()) {
+      return arrow::Future<FlightStreamChunk>::MakeFinished(read_error_);
+    }
+    if (read_closed_) {
+      // The read side is over and nothing is buffered: the end of the
+      // exchange is the all-null chunk.
+      return arrow::Future<FlightStreamChunk>::MakeFinished(FlightStreamChunk{});
+    }
+    pending_ = arrow::Future<FlightStreamChunk>::Make();
+    if (first_read_.has_value()) {
+      // The first message was read before the handler started; consume it now.
+      internal::FlightData data = std::move(*first_read_);
+      first_read_.reset();
+      Consume(std::move(data));
+    } else {
+      RequestRead();
+    }
+    return pending_;
+  }
 
-  // Not offered by the exchange: DoExchange's writer has no PutResult channel,
-  // so the default (NotImplemented) is the honest answer and WriteMetadata()
-  // goes through the data path instead (payload.app_metadata).
-  Status WritePutMetadata(const Buffer& payload) override;
+  /// \brief The reactor wires itself and the descriptor before the handler
+  /// starts, and hands over the already-read first message.
+  void SetReactor(ExchangeReactor* reactor) { reactor_ = reactor; }
+  void SetDescriptor(const FlightDescriptor& descriptor) { descriptor_ = descriptor; }
+  void OfferFirstRead(internal::FlightData data) { first_read_ = std::move(data); }
 
-  Status WritesDone() override;
+  /// \brief The reactor's OnReadDone: a message was read.
+  void OnMessage(internal::FlightData data) {
+    read_in_flight_ = false;
+    Consume(std::move(data));
+  }
+
+  /// \brief The reactor's OnReadDone with ok == false: the read side is over.
+  void OnReadClosed() {
+    read_in_flight_ = false;
+    read_closed_ = true;
+    ResolvePending(FlightStreamChunk{});
+  }
+
+  /// \brief The reactor read a message that could not be deserialized.
+  void OnReadFailed(Status status) {
+    read_in_flight_ = false;
+    read_error_ = std::move(status);
+    ResolvePending(read_error_);
+  }
+
+  /// \brief The RPC was cancelled: fail the demand so the handler unwinds.
+  void OnCancelled() {
+    read_closed_ = true;
+    ResolvePending(arrow::Status::Cancelled("the client cancelled the exchange"));
+  }
 
  private:
+  void ResolvePending(FlightStreamChunk chunk) {
+    if (pending_.is_valid() && !pending_.is_finished()) {
+      pending_.MarkFinished(std::move(chunk));
+    }
+  }
+
+  void ResolvePending(const Status& status) {
+    if (pending_.is_valid() && !pending_.is_finished()) {
+      pending_.MarkFinished(status);
+    }
+  }
+
+  /// \brief Decode one message and resolve the demand it satisfies, or keep
+  /// reading when the message was read through (a schema or dictionary
+  /// message).
+  void Consume(internal::FlightData data) {
+    if (read_closed_) {
+      return;  // the demand was already resolved
+    }
+    decoder_.Consume(std::move(data)).AddCallback([this](const arrow::Status& status) {
+      if (!status.ok()) {
+        // A message that cannot be decoded breaks the exchange.
+        read_error_ = status;
+        ResolvePending(status);
+      } else if (pending_.is_valid() && !pending_.is_finished()) {
+        // Read through: the demand is still open, keep reading until a chunk
+        // or the end arrives.
+        RequestRead();
+      }
+    });
+  }
+
+  /// \brief Arm the next read through the reactor (defined after
+  /// ExchangeReactor, whose full definition it needs).
+  void RequestRead();
+
+  /// The decoder's listener: chunks are handed to the reader; the descriptor
+  /// and the schema are consumed (the reactor sets the descriptor before the
+  /// handler starts).
+  class ChunkListener final : public AsyncFlightDataListener {
+   public:
+    explicit ChunkListener(ExchangeReader* reader) : reader_(reader) {}
+
+    arrow::Future<> OnNext(FlightStreamChunk chunk) override {
+      if (reader_->pending_.is_valid() && !reader_->pending_.is_finished()) {
+        reader_->ResolvePending(std::move(chunk));
+      } else {
+        // A chunk that arrived with no demand outstanding: buffered (a
+        // one-chunk window), returned by the next NextAsync().  In practice
+        // a demand is always open when a read is armed.
+        reader_->buffered_ = std::move(chunk);
+      }
+      return arrow::Future<>::MakeFinished();
+    }
+
+    arrow::Future<> OnDescriptor(const FlightDescriptor&) override {
+      return arrow::Future<>::MakeFinished();
+    }
+
+    arrow::Status OnSchemaDecoded(std::shared_ptr<Schema>) override {
+      return arrow::Status::OK();
+    }
+
+   private:
+    ExchangeReader* reader_;
+  };
+
+  ExchangeReactor* reactor_ = nullptr;  // owned by gRPC; alive for the RPC
+  std::shared_ptr<ChunkListener> listener_;
+  AsyncFlightMessageDecoder decoder_;
+  FlightDescriptor descriptor_;
+  std::optional<internal::FlightData> first_read_;
+  std::optional<FlightStreamChunk> buffered_;
+  arrow::Future<FlightStreamChunk> pending_;
+  Status read_error_;
+  bool read_in_flight_ = false;
+  bool read_closed_ = false;
+};
+
+/// \brief The AsyncFlightMessageWriter of one DoExchange RPC.
+///
+/// Record batches are serialized through the same IPC writer stack the
+/// synchronous transport uses (dictionary messages included) into an
+/// IpcPayloadWriter sink that queues FlightPayloads; the reactor then writes
+/// them one at a time.  Each method's future resolves when its messages have
+/// been handed to the reactor, or with the first failure.
+class ExchangeWriter final : public AsyncFlightMessageWriter {
+ public:
+  explicit ExchangeWriter(ExchangeReactor* reactor) : reactor_(reactor) {}
+
+  arrow::Future<> BeginAsync(std::shared_ptr<Schema> schema) override {
+    if (batch_writer_ != nullptr) {
+      return arrow::Future<>::MakeFinished(
+          arrow::Status::Invalid("This writer has already been started."));
+    }
+    auto sink = std::make_unique<PayloadSink>(this);
+    ARROW_ASSIGN_OR_RAISE(batch_writer_, ipc::internal::OpenRecordBatchWriter(
+                                             std::move(sink), schema, options_));
+    return Flush();
+  }
+
+  arrow::Future<> WriteRecordBatchAsync(const RecordBatch& batch) override {
+    pending_app_metadata_ = nullptr;
+    return WriteBatch(batch);
+  }
+
+  arrow::Future<> WriteWithMetadataAsync(const RecordBatch& batch,
+                                         std::shared_ptr<Buffer> app_metadata) override {
+    pending_app_metadata_ = std::move(app_metadata);
+    return WriteBatch(batch);
+  }
+
+  arrow::Future<> WriteMetadataAsync(std::shared_ptr<Buffer> app_metadata) override {
+    FlightPayload payload;
+    payload.app_metadata = std::move(app_metadata);
+    queue_.push_back(std::move(payload));
+    return Flush();
+  }
+
+  arrow::Future<> CloseAsync() override {
+    if (batch_writer_ != nullptr) {
+      auto status = batch_writer_->Close();
+      batch_writer_ = nullptr;
+      if (!status.ok()) {
+        return arrow::Future<>::MakeFinished(std::move(status));
+      }
+    }
+    return arrow::Future<>::MakeFinished();
+  }
+
+  /// \brief The reactor's OnWriteDone: continue flushing the queue.
+  void OnWriteDone(bool ok) {
+    write_in_flight_ = false;
+    if (!ok) {
+      FailFlush(MakeFlightError(FlightStatusCode::Internal, "Failed to write response"));
+      return;
+    }
+    Pump();
+  }
+
+  /// \brief The RPC was cancelled: fail the pending write so the handler
+  /// unwinds.
+  void OnCancelled() {
+    if (write_in_flight_) {
+      write_in_flight_ = false;
+      FailFlush(arrow::Status::Cancelled("the client cancelled the exchange"));
+    }
+  }
+
+ private:
+  /// \brief The IpcPayloadWriter that queues the IPC payloads the writer
+  /// stack produces; the schema, dictionary and record-batch messages all
+  /// travel this way, as on the synchronous path.
+  class PayloadSink final : public ipc::internal::IpcPayloadWriter {
+   public:
+    explicit PayloadSink(ExchangeWriter* writer) : writer_(writer) {}
+
+    arrow::Status Start() override { return arrow::Status::OK(); }
+
+    arrow::Status WritePayload(const ipc::IpcPayload& ipc_payload) override {
+      FlightPayload payload;
+      payload.ipc_message = ipc_payload;
+      if (ipc_payload.type == ipc::MessageType::RECORD_BATCH &&
+          writer_->pending_app_metadata_ != nullptr) {
+        payload.app_metadata = std::move(writer_->pending_app_metadata_);
+      }
+      writer_->queue_.push_back(std::move(payload));
+      return arrow::Status::OK();
+    }
+
+    arrow::Status Close() override { return arrow::Status::OK(); }
+
+   private:
+    ExchangeWriter* writer_;
+  };
+
+  arrow::Future<> WriteBatch(const RecordBatch& batch) {
+    if (batch_writer_ == nullptr) {
+      return arrow::Future<>::MakeFinished(arrow::Status::Invalid(
+          "This writer is not started. Call BeginAsync() with a schema"));
+    }
+    auto status = batch_writer_->WriteRecordBatch(batch);
+    if (!status.ok()) {
+      return arrow::Future<>::MakeFinished(std::move(status));
+    }
+    return Flush();
+  }
+
+  /// \brief Write the queued payloads one at a time; the returned future
+  /// resolves when the queue is empty, or with the first failure.
+  arrow::Future<> Flush() {
+    if (!flush_.is_valid() || flush_.is_finished()) {
+      flush_ = arrow::Future<>::Make();
+    }
+    Pump();
+    return flush_;
+  }
+
+  /// \brief Write queued payloads through the reactor (defined after
+  /// ExchangeReactor, whose full definition it needs).
+  void Pump();
+
+  void FailFlush(Status status) {
+    if (flush_.is_valid() && !flush_.is_finished()) {
+      flush_.MarkFinished(std::move(status));
+    }
+  }
+
   ExchangeReactor* reactor_;
+  std::unique_ptr<ipc::RecordBatchWriter> batch_writer_;
+  ipc::IpcWriteOptions options_ = ipc::IpcWriteOptions::Defaults();
+  std::shared_ptr<Buffer> pending_app_metadata_;
+  std::deque<FlightPayload> queue_;
+  arrow::Future<> flush_;
+  bool write_in_flight_ = false;
 };
 
 /// Serve one DoExchange RPC.
 ///
-/// The handler runs inline in `RunHandler()`, which this reactor calls from the
-/// first OnReadDone (i.e. on a gRPC callback thread): the server class's
-/// synchronous DoExchange gets the sync TransportMessageReader/Writer over the
-/// ExchangeDataStream.  While the handler runs, its blocking
-/// ReadData()/WriteData() wait on a mutex + condvar for the OnReadDone /
-/// OnWriteDone that gRPC delivers on its own threads.
+/// The handler receives an AsyncFlightMessageReader/Writer pair and returns a
+/// future; the RPC then runs entirely on continuations.  The reader pulls one
+/// message per NextAsync() demand (the reactor arms the read), the writer
+/// serializes through the IPC writer stack and the reactor writes one message
+/// per StartWrite, and the handler's future completing finishes the RPC with
+/// its status.  No callback thread is ever held by the handler.
 class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
  public:
-  ExchangeReactor(AsyncCallContext flight_context, AsyncGenericFlightServerBase* base,
-                  std::shared_ptr<MemoryManager> memory_manager)
+  ExchangeReactor(AsyncCallContext flight_context, AsyncGenericFlightServerBase* base)
       : flight_context_(std::move(flight_context)),
         base_(base),
-        memory_manager_(std::move(memory_manager)) {
-    // The first message carries the request descriptor; the reader's Init()
-    // consumes it (see ReadData below).
+        reader_(std::make_shared<ExchangeReader>()),
+        writer_(std::make_shared<ExchangeWriter>(this)) {
+    reader_->SetReactor(this);
+    // The first message carries the request descriptor.
     StartRead(&read_buf_);
   }
 
-  // --- gRPC callbacks; every one of these runs on a gRPC thread -----------
-
-  /// One message arrived (or the read side ended).  The first message starts
-  /// the handler; every later one is buffered for it.
   void OnReadDone(bool ok) override {
-    std::unique_lock<std::mutex> lock(mutex_);
-    read_pending_ = false;
+    if (finished_) {
+      return;  // the RPC is over; gRPC may still deliver this
+    }
     if (!ok) {
-      // The client half-closed (or the stream broke): the read side is done,
-      // but the exchange is not -- the handler may still be writing, which is
-      // the read-all-then-write-all shape.
-      read_finished_ = true;
-      if (!handler_started_) {
-        // The client never sent the descriptor: there is no exchange to run.
-        lock.unlock();
+      if (!started_) {
+        // The client never sent the descriptor message.
         FinishOnce(flight_context_.FinishRequest(
             MakeFlightError(FlightStatusCode::Internal, "Failed to read request")));
         return;
       }
-      condvar_.notify_all();
+      // The client half-closed (or the stream broke): the read side is over.
+      reader_->OnReadClosed();
       return;
     }
     const ::grpc::Status deserialized = FlightDataDeserialize(&read_buf_, &read_data_);
     if (!deserialized.ok()) {
-      // A message that cannot be deserialized breaks the whole stream: nothing
-      // written afterwards would make sense, so this is terminal.
-      deserialize_error_ =
-          MakeFlightError(FlightStatusCode::Internal, deserialized.error_message());
-      read_finished_ = true;
-      cancelled_ = true;
-      condvar_.notify_all();
+      if (!started_) {
+        FinishOnce(flight_context_.FinishRequest(
+            MakeFlightError(FlightStatusCode::Internal, deserialized.error_message())));
+        return;
+      }
+      // A message that cannot be deserialized breaks the whole exchange.
+      reader_->OnReadFailed(
+          MakeFlightError(FlightStatusCode::Internal, deserialized.error_message()));
       return;
     }
-    pending_read_ = std::move(read_data_);
-    has_pending_read_ = true;
-    const bool is_first = !handler_started_;
-    if (is_first) {
-      handler_started_ = true;
+    if (!started_) {
+      started_ = true;
+      if (read_data_.descriptor == nullptr) {
+        FinishOnce(flight_context_.FinishRequest(MakeFlightError(
+            FlightStatusCode::Internal, "Descriptor missing on first message")));
+        return;
+      }
+      reader_->SetDescriptor(*read_data_.descriptor);
+      // The first message may carry data; the reader consumes it on its first
+      // NextAsync, so hand it over before the handler can ask.
+      reader_->OfferFirstRead(std::move(read_data_));
+      // The handler may complete its future on any thread: hold the reactor
+      // across it (gRPC has no server-side holds).
+      Hold();
+      arrow::Future<> exchange =
+          base_->DoExchangeAsync(flight_context_, reader_, writer_);
+      exchange.AddCallback([this](const arrow::Status& status) {
+        FinishOnce(flight_context_.FinishRequest(status));
+        ReleaseHold();
+      });
+      return;
     }
-    condvar_.notify_all();
-    if (is_first) {
-      // Invariant 4: this is the thread the handler runs on, so the handler
-      // cannot outlive the reactor (OnDone is delivered only after this
-      // callback returns -- see the class comment).
-      lock.unlock();
-      RunHandler();
-    }
+    // A message read because the reader asked for one.
+    reader_->OnMessage(std::move(read_data_));
   }
 
-  void OnWriteDone(bool ok) override {
-    std::unique_lock<std::mutex> lock(mutex_);
-    // Invariant 2: the write that just completed is the only one outstanding.
-    write_pending_ = false;
-    write_ok_ = ok;
-    if (!ok) {
-      // No further write-side operation will succeed (grpcpp/support/
-      // server_callback.h): stop the handler's writer from trying again.
-      write_failed_ = true;
-    }
-    condvar_.notify_all();
-  }
+  void OnWriteDone(bool ok) override { writer_->OnWriteDone(ok); }
 
   void OnCancel() override {
-    std::unique_lock<std::mutex> lock(mutex_);
-    // A cancelled call's outstanding read/write never complete: unblock the
-    // handler so it can unwind.  The call is already being torn down, so there
-    // is no status left to report (gRPC drops it).
     cancelled_ = true;
-    read_finished_ = true;
-    write_failed_ = true;
-    condvar_.notify_all();
+    reader_->OnCancelled();
+    writer_->OnCancelled();
   }
 
-  /// Invariant 4: this is the last callback for the RPC, and the handler ran to
-  /// completion inside OnReadDone before it, so nothing can touch the reactor
-  /// after this delete.
-  void OnDone() override { delete this; }
+  void OnDone() override { ReleaseHold(); }
 
-  // --- called by the handler (through ExchangeDataStream) -----------------
-
-  /// Block until a message is available, or report the end of the read side.
-  bool ReadData(internal::FlightData* data) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (read_finished_ || cancelled_) {
-      return false;
+  /// \brief The reader's demand: arm the next read.  The demand guarantees at
+  /// most one read is outstanding (ExchangeReader::RequestRead is the only
+  /// caller).
+  void StartReadNext() {
+    if (finished_) {
+      return;
     }
-    if (has_pending_read_) {
-      *data = std::move(pending_read_);
-      has_pending_read_ = false;
-      return true;
-    }
-    // Invariant 1: exactly one read outstanding -- the one whose OnReadDone
-    // this call now waits for.  There can be no other, because this method
-    // blocks until that read completes.
-    read_pending_ = true;
     StartRead(&read_buf_);
-    condvar_.wait(lock, [this] {
-      return !read_pending_ || has_pending_read_ || read_finished_ || cancelled_;
-    });
-    read_pending_ = false;
-    if (has_pending_read_) {
-      *data = std::move(pending_read_);
-      has_pending_read_ = false;
-      return true;
-    }
-    return false;
   }
 
-  /// Serialize and post one payload, then wait for its write to complete.
-  arrow::Result<bool> WriteData(const FlightPayload& payload) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (write_failed_ || cancelled_) {
-      return false;
-    }
-    // Invariant 2: wait out any previous write before arming this one, so at
-    // most one write is ever outstanding.  (Only this thread writes, so the
-    // wait is a no-op in practice -- it is here so the invariant holds even if
-    // that ever changes.)
-    condvar_.wait(lock, [this] { return !write_pending_ || cancelled_; });
-    if (cancelled_) {
-      return false;
-    }
+  /// \brief Serialize one payload into the write buffer and start the write.
+  /// Called by ExchangeWriter; OnWriteDone() resumes it.
+  arrow::Status WritePayload(FlightPayload payload) {
     bool own_buffer = false;
-    // Mirror the sync path's WritePayload(), which validates before writing:
-    // the DoGet reactor's inline serialize does not, but the exchange reuses
-    // the sync reader/writer stack, and a payload that cannot be written must
-    // be a status here and not gRPC's own assertion ("returning error here
-    // causes gRPC to fail an assertion" -- serialization_internal.cc).
-    ARROW_RETURN_NOT_OK(payload.Validate());
     const ::grpc::Status serialize =
         FlightDataSerialize(payload, &write_buf_, &own_buffer);
-    // own_buffer is true whenever SerializeAsString-style buffers were built
-    // (serialization_internal.cc:201); the reactor owns write_buf_ either way,
-    // so there is nothing to free here -- kept to mirror the sync call shape.
     (void)own_buffer;
     if (!serialize.ok()) {
       return MakeFlightError(FlightStatusCode::Internal, serialize.error_message());
     }
-    write_pending_ = true;
-    write_ok_ = false;
     StartWrite(&write_buf_);
-    condvar_.wait(lock, [this] { return !write_pending_ || cancelled_; });
-    if (!write_ok_) {
-      // The client went away (or the write failed): report "not accepted", the
-      // transport-level disconnect signal the writer stack turns into an
-      // error.
-      return false;
-    }
-    return true;
+    return arrow::Status::OK();
   }
-
-  /// The client's writes are done: nothing is outstanding, so there is nothing
-  /// to flush.  gRPC's generic callback API has no server-side WritesDone
-  /// (StartWritesDone exists only on the client, grpcpp/support/
-  /// client_callback.h), and DoExchange does not need one: unlike DoPut, whose
-  /// client waits for a PutResult, the exchange's client sees the RPC status
-  /// from Finish().
-  Status WritesDone() { return Status::OK(); }
 
  private:
-  /// The handler body, mirroring internal::ServerTransport::DoExchange
-  /// (transport_server.cc:49-58): the sync reader/writer stack over this
-  /// reactor's stream.  `reader->Init()` reads the descriptor (the message the
-  /// first OnReadDone buffered), so a client that never sends one makes Init()
-  /// report it.
-  void RunHandler() {
-    auto stream = std::make_unique<ExchangeDataStream>(this);
-    std::unique_ptr<internal::TransportMessageReader> reader(
-        new internal::TransportMessageReader(stream.get(), memory_manager_));
-    std::unique_ptr<FlightMessageWriter> writer(
-        new internal::TransportMessageWriter(stream.get()));
-
-    Status status = reader->Init();
-    if (status.ok()) {
-      status = base_->DoExchange(flight_context_, std::move(reader), std::move(writer));
-    }
-    if (status.ok()) {
-      // The last line of the sync ServerTransport::DoExchange; WritesDone() is
-      // OK by construction here (see its comment).
-      status = stream->WritesDone();
-    }
-    // A broken stream must not look like a clean finish.  Taken under the lock:
-    // the callback that recorded it ran on another thread.
-    if (status.ok() || cancelled_) {
-      status = TakeDeserializeError();
-    }
-    FinishOnce(flight_context_.FinishRequest(std::move(status)));
-  }
-
-  /// Move out the status of a message that could not be deserialized (empty
-  /// when every message was fine).  Locked: OnReadDone writes it.
-  Status TakeDeserializeError() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return std::move(deserialize_error_);
-  }
-
-  /// Invariant 3, the only Finish(): the CAS is the guard, and every
-  /// background callback releases its reference only after it returns
-  /// (grpcpp/support/server_callback.h), so OnDone follows the last of them.
+  /// \brief Ensures that gRPC's Finish is called at most once, and never after
+  /// OnDone.
   void FinishOnce(::grpc::Status status) {
     bool expected = false;
-    if (finished_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    if (finished_.compare_exchange_strong(expected, true)) {
       Finish(std::move(status));
+    }
+  }
+
+  // gRPC's server callback API has no holds, so the reactor refcounts itself:
+  // one reference for the RPC (released in OnDone) plus one per pending
+  // continuation.  Whichever thread releases the last reference deletes it.
+  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
+  void ReleaseHold() {
+    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete this;
     }
   }
 
   AsyncCallContext flight_context_;
   AsyncGenericFlightServerBase* base_;
-  std::shared_ptr<MemoryManager> memory_manager_;
-
-  std::mutex mutex_;
-  std::condition_variable condvar_;
-  // At most one buffered message, owned here while the handler consumes it.
-  internal::FlightData pending_read_;
-  bool has_pending_read_ = false;
-  bool handler_started_ = false;
-  // Invariant 1 / 2 flags: at most one outstanding operation per direction.
-  bool read_pending_ = false;
-  bool write_pending_ = false;
-  bool write_ok_ = false;
-  // The read side ended (the client half-closed or the stream broke); writes
-  // may still be outstanding and are still allowed.
-  bool read_finished_ = false;
-  // No further write-side operation can succeed.
-  bool write_failed_ = false;
-  // The client went away: every wait returns immediately so the handler can
-  // unwind, and the status it returns is dropped by the cancelled call.
-  bool cancelled_ = false;
-  // Set when a message could not be deserialized; reported in RunHandler.
-  Status deserialize_error_;
-  std::atomic<bool> finished_{false};
-  // gRPC reads into `read_buf_` and serializes `write_buf_`; both must stay
-  // valid (and unmodified) until their callback arrives.
+  std::shared_ptr<ExchangeReader> reader_;
+  std::shared_ptr<ExchangeWriter> writer_;
   ::grpc::ByteBuffer read_buf_;
   ::grpc::ByteBuffer write_buf_;
   internal::FlightData read_data_;
+  bool started_ = false;
+  std::atomic<bool> cancelled_{false};
+  std::atomic<bool> finished_{false};
+  std::atomic<int> refs_{1};
 };
 
-// ExchangeDataStream, now that ExchangeReactor is complete.
-ExchangeDataStream::ExchangeDataStream(ExchangeReactor* reactor) : reactor_(reactor) {}
-
-bool ExchangeDataStream::ReadData(internal::FlightData* data) {
-  return reactor_->ReadData(data);
+// ExchangeReader and ExchangeWriter members that call into ExchangeReactor,
+// now that its definition above is complete.
+void ExchangeReader::RequestRead() {
+  if (read_in_flight_ || read_closed_ || reactor_ == nullptr) {
+    return;
+  }
+  read_in_flight_ = true;
+  reactor_->StartReadNext();
 }
 
-arrow::Result<bool> ExchangeDataStream::WriteData(const FlightPayload& payload) {
-  return reactor_->WriteData(payload);
+void ExchangeWriter::Pump() {
+  if (write_in_flight_) {
+    return;  // OnWriteDone resumes it
+  }
+  if (queue_.empty()) {
+    if (flush_.is_valid() && !flush_.is_finished()) {
+      flush_.MarkFinished();
+    }
+    return;
+  }
+  FlightPayload payload = std::move(queue_.front());
+  queue_.pop_front();
+  write_in_flight_ = true;
+  const auto status = reactor_->WritePayload(std::move(payload));
+  if (!status.ok()) {
+    write_in_flight_ = false;
+    FailFlush(std::move(status));
+  }
 }
-
-Status ExchangeDataStream::WritePutMetadata(const Buffer& payload) {
-  (void)payload;
-  return Status::NotImplemented(
-      "DoExchange writes application metadata through its data stream");
-}
-
-Status ExchangeDataStream::WritesDone() { return reactor_->WritesDone(); }
 
 // Reject unknown methods.  Finish() in the constructor is fine: gRPC backlogs
 // operations issued before the reactor is returned to it.
@@ -1174,9 +1443,12 @@ AsyncGenericFlightService::AsyncGenericFlightService(
     std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>> helper,
     HandshakeFn handshake_handler)
     : base_(async_base),
-      memory_manager_(std::move(memory_manager)),
       helper_(std::move(helper)),
-      handshake_handler_(std::move(handshake_handler)) {}
+      handshake_handler_(std::move(handshake_handler)) {
+  // The memory manager was only needed by the synchronous DoExchange bridge;
+  // the async exchange does not read bodies into Arrow buffers itself.
+  (void)memory_manager;
+}
 
 ::grpc::ServerGenericBidiReactor* AsyncGenericFlightService::CreateReactor(
     ::grpc::GenericCallbackServerContext* context) {
@@ -1213,38 +1485,26 @@ AsyncGenericFlightService::AsyncGenericFlightService(
   }
 
   if (method == kGetFlightInfoMethod) {
-    return new UnaryReactor<pb::FlightInfo>(
-        std::move(flight_context),
-        [base = base_](const ServerCallContext& context,
-                       const FlightDescriptor& descriptor,
-                       pb::FlightInfo* out) -> arrow::Status {
-          std::unique_ptr<FlightInfo> info;
-          ARROW_RETURN_NOT_OK(base->GetFlightInfo(context, descriptor, &info));
-          return SerializeOrNotFound(info, out);
+    return new UnaryReactor<FlightInfo, pb::FlightInfo>(
+        std::move(flight_context), [base = base_](const ServerCallContext& context,
+                                                  const FlightDescriptor& descriptor) {
+          return base->GetFlightInfoAsync(context, descriptor);
         });
   }
 
   if (method == kGetSchemaMethod) {
-    return new UnaryReactor<pb::SchemaResult>(
-        std::move(flight_context),
-        [base = base_](const ServerCallContext& context,
-                       const FlightDescriptor& descriptor,
-                       pb::SchemaResult* out) -> arrow::Status {
-          std::unique_ptr<SchemaResult> schema;
-          ARROW_RETURN_NOT_OK(base->GetSchema(context, descriptor, &schema));
-          return SerializeOrNotFound(schema, out);
+    return new UnaryReactor<SchemaResult, pb::SchemaResult>(
+        std::move(flight_context), [base = base_](const ServerCallContext& context,
+                                                  const FlightDescriptor& descriptor) {
+          return base->GetSchemaAsync(context, descriptor);
         });
   }
 
   if (method == kPollFlightInfoMethod) {
-    return new UnaryReactor<pb::PollInfo>(
-        std::move(flight_context),
-        [base = base_](const ServerCallContext& context,
-                       const FlightDescriptor& descriptor,
-                       pb::PollInfo* out) -> arrow::Status {
-          std::unique_ptr<PollInfo> info;
-          ARROW_RETURN_NOT_OK(base->PollFlightInfo(context, descriptor, &info));
-          return SerializeOrNotFound(info, out);
+    return new UnaryReactor<PollInfo, pb::PollInfo>(
+        std::move(flight_context), [base = base_](const ServerCallContext& context,
+                                                  const FlightDescriptor& descriptor) {
+          return base->PollFlightInfoAsync(context, descriptor);
         });
   }
 
@@ -1261,7 +1521,7 @@ AsyncGenericFlightService::AsyncGenericFlightService(
   }
 
   if (method == kDoExchangeMethod) {
-    return new ExchangeReactor(std::move(flight_context), base_, memory_manager_);
+    return new ExchangeReactor(std::move(flight_context), base_);
   }
 
   if (method == kDoGetMethod) {

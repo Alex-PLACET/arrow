@@ -43,8 +43,9 @@ class AsyncGenericFlightService : public ::grpc::CallbackGenericService {
  public:
   /// \param async_base is the async server whose handlers are served; it must
   /// outlive the service.
-  /// \param memory_manager is the server transport's memory manager; the
-  /// DoExchange reader uses it to view the bodies it reads.
+  /// \param memory_manager is the server transport's memory manager; kept for
+  /// the transport's construction contract (the async exchange does not need
+  /// it).
   /// \param helper runs middleware and auth and builds the call context.
   /// \param handshake_handler is the server's Handshake hook; an empty hook
   /// means the server has no authentication mechanism.
@@ -64,7 +65,6 @@ class AsyncGenericFlightService : public ::grpc::CallbackGenericService {
  private:
   AsyncGenericFlightServerBase* base_;
   /// The server transport's memory manager; only DoExchange's reader uses it.
-  std::shared_ptr<MemoryManager> memory_manager_;
   std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>> helper_;
   /// The server class's Handshake hook; empty when the server has none.
   HandshakeFn handshake_handler_;
