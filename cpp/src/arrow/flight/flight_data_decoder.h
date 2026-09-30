@@ -19,6 +19,7 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 
 #include "arrow/flight/types.h"
 #include "arrow/flight/visibility.h"
@@ -32,11 +33,56 @@ namespace internal {
 struct FlightData;
 }  // namespace internal
 
+class FlightDataListener;
+
+namespace internal {
+
+/// \brief The per-RPC handle a transport gives a FlightDataListener so the
+/// application can act on the RPC while it is in flight.
+///
+/// The transport owns this; the listener only holds a reference for as long as
+/// the RPC is live, and asks for it under a lock the transport takes to clear
+/// it (see FlightDataListener::LockTransport).  That is the same lifetime rule
+/// the client-side AsyncListenerBase uses for its AsyncRpc state.
+class ARROW_FLIGHT_EXPORT FlightDataListenerTransport {
+ public:
+  virtual ~FlightDataListenerTransport();
+
+  /// \brief Finish the upload's RPC with `status`, from any thread.
+  ///
+  /// The transport must make this idempotent and safe to call after the RPC
+  /// finished (as a no-op), so a racing Cancel() cannot use-after-free.
+  virtual void CancelUpload(Status status) = 0;
+
+  /// \brief Install `transport` on `listener` for the life of the RPC.
+  /// Transport-only.  `transport` is the transport's own RPC state (for gRPC's
+  /// callback API, the reactor itself); it stays valid until Clear(), and the
+  /// listener only reaches it under the lock Clear() takes.
+  static void Install(const std::shared_ptr<FlightDataListener>& listener,
+                      FlightDataListenerTransport* transport);
+
+  /// \brief Clear the installed transport.  Transport-only; called as the RPC
+  /// finishes, before the transport object dies, so a concurrent Cancel() can
+  /// never reach a dead RPC.
+  static void Clear(const std::shared_ptr<FlightDataListener>& listener);
+
+  /// \brief Report the upload's terminal status to the listener, once.
+  /// Transport-only.  Later calls are dropped, so every ending can report
+  /// without coordinating with the others.
+  static Status ReportFinish(const std::shared_ptr<FlightDataListener>& listener,
+                             Status status);
+};
+
+}  // namespace internal
+
 /// \brief A general listener class to receive events from FlightMessageDecoder
 ///
 /// User must implement callback methods for interested events.
 class ARROW_FLIGHT_EXPORT FlightDataListener : public ipc::Listener {
  public:
+  FlightDataListener();
+  ~FlightDataListener() override;
+
   /// \brief Called for each decoded FlightStreamChunk.
   ///
   /// chunk.data is the decoded RecordBatch, or nullptr for metadata-only
@@ -48,6 +94,52 @@ class ARROW_FLIGHT_EXPORT FlightDataListener : public ipc::Listener {
   /// Fired before any schema or data of that upload, so the listener knows
   /// which upload it is being handed. A non-OK status rejects the upload.
   virtual Status OnDescriptor(const FlightDescriptor& descriptor) { return Status::OK(); }
+
+  /// \brief Called once, when the upload ends, whichever way it ends.
+  ///
+  /// The counterpart of OnNext: after this, no other callback arrives.  Runs
+  /// on a transport thread, so it must not block.  `status` is OK for an upload
+  /// the client ended normally, and the failure otherwise (the client went
+  /// away, the transport failed, or the upload was rejected).  This is where a
+  /// consumer commits or discards what it accumulated; the default does
+  /// nothing, since a stream that only counts chunks needs no completion.
+  virtual Status OnFinish(Status status) { return Status::OK(); }
+
+  /// \brief Cancel the upload with `status`, from any thread.
+  ///
+  /// Finishes the RPC with that status without waiting for the client to end
+  /// the upload: the client's pending write or Close() reports it.  Use for a
+  /// server-side rejection discovered mid-upload (quota, bad batch, upstream
+  /// error).  Idempotent and safe to call from any thread at any time: after
+  /// the upload finished it is a no-op, and only the first call takes effect.
+  /// \return OK when the cancel was handed to the transport, or Invalid when
+  /// the upload is not in flight (before it started or after it finished).
+  Status Cancel(Status status);
+
+ protected:
+  /// \brief Lock the transport state of this RPC for the duration of a control
+  /// call (Cancel()).
+  ///
+  /// As in the client-side AsyncListenerBase::LockRpcState: the transport takes
+  /// this lock to install and to clear the state, so the state cannot be
+  /// destroyed under a control call.
+  std::unique_lock<std::mutex> LockTransport() const;
+
+  /// \brief The transport state of this RPC, or null if none is installed.
+  /// Only valid while holding the LockTransport() lock.
+  internal::FlightDataListenerTransport* transport() const { return transport_; }
+
+ private:
+  /// The transport installs and clears the state through
+  /// FlightDataListenerTransport::Install/Clear, both under this lock.
+  friend class internal::FlightDataListenerTransport;
+
+  /// Whether OnFinish was already reported; guarded by transport_mutex_.
+  bool finished_ = false;
+
+  mutable std::mutex transport_mutex_;
+  /// Not owned: the transport's own RPC state, valid until Clear().
+  internal::FlightDataListenerTransport* transport_ = nullptr;
 };
 
 /// \brief Creates the FlightDataListener that serves one upload.
