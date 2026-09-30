@@ -1978,7 +1978,8 @@ class RecordDoGetListener : public AsyncDoGetListener {
   }
 
   /// Wait until chunk `index` arrived.
-  /// Unlike WaitForChunks(), a terminal status first is a failure, not a pass: chunk(index) would be out of range.
+  /// Unlike WaitForChunks(), a terminal status first is a failure, not a pass:
+  /// chunk(index) would be out of range.
   bool WaitForChunk(size_t index) {
     std::unique_lock<std::mutex> guard(mutex_);
     cv_.wait_for(guard, std::chrono::seconds(10),
@@ -2368,7 +2369,7 @@ TEST_F(GrpcAsyncDoGet, MetadataOnlyChunkIsAValue) {
   // with app_metadata and no IPC metadata on the wire, and a server-side payload
   // with no IPC metadata ends the stream instead.  The clause is covered at the
   // level where that shape can be produced: the decoder, see
-  // TEST(FlightMessageDecoder, MetadataOnlyChunkIsAValue) in
+  // TEST(AsyncFlightMessageDecoder, MetadataOnlyChunkIsAValue) in
   // flight_internals_test.cc.
   GTEST_SKIP() << "the shared test server cannot produce this stream shape";
 }
@@ -2382,7 +2383,7 @@ TEST_F(GrpcAsyncDoGet, SchemaOnlyStream) {
   // (test_flight_server.cc, TestFlightServer::DoGet): it has no stream with a
   // schema and no batches (an empty stream is an error: see the ARROW-5095
   // tickets).  The schema-only decode path is covered by
-  // TEST(FlightMessageDecoder, SchemaOnlyStream) in flight_internals_test.cc;
+  // TEST(AsyncFlightMessageDecoder, SchemaOnlyStream) in flight_internals_test.cc;
   // the pending-request-across-OnSchema and terminal-OK halves are not covered
   // at any level.
   GTEST_SKIP() << "the shared test server cannot produce this stream shape";

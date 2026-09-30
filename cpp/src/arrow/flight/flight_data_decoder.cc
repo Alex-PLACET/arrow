@@ -102,19 +102,39 @@ class FlightDataMessageReader : public ipc::MessageReader {
 class AsyncFlightMessageDecoder::AsyncFlightMessageDecoderImpl {
  public:
   AsyncFlightMessageDecoderImpl(std::shared_ptr<AsyncFlightDataListener> listener,
-                           ipc::IpcReadOptions options)
+                                ipc::IpcReadOptions options)
       : listener_(std::move(listener)),
         options_(std::move(options)),
         message_reader_(new FlightDataMessageReader()) {}
 
   /// \brief Consume a chunk of Flight data.
   /// \param data The Flight data to consume.
-  /// \return Status indicating success or failure.
+  /// \return A future carrying the listener's status for this message: a
+  /// non-OK result rejects the upload.  The descriptor of an upload is
+  /// reported before the rest of its first message is decoded.
   Future<> ConsumeData(internal::FlightData data) {
-    if (data.descriptor) {
-      return listener_->OnDescriptor(*data.descriptor);
+    if (!data.descriptor) {
+      return ConsumeDataAfterDescriptor(std::move(data));
     }
+    // The descriptor of an upload arrives with the first message of the
+    // upload, which also carries the schema: report the descriptor first, and
+    // decode the rest of that message once the listener's future resolves.  A
+    // bare return here would drop the schema (the next read would then fail
+    // to decode).
+    return listener_->OnDescriptor(*data.descriptor)
+        .Then([this, data = std::move(data)]() mutable {
+          return ConsumeDataAfterDescriptor(std::move(data));
+        });
+  }
 
+  std::shared_ptr<Schema> schema() const {
+    return batch_reader_ ? batch_reader_->schema() : nullptr;
+  }
+
+ private:
+  /// \brief Decode a FlightData message whose descriptor (if any) was already
+  /// reported to the listener.
+  Future<> ConsumeDataAfterDescriptor(internal::FlightData data) {
     if (!data.metadata) {
       // Metadata-only message: no IPC content, just Flight app_metadata.
       if (data.app_metadata && data.app_metadata->size() > 0) {
@@ -137,7 +157,7 @@ class AsyncFlightMessageDecoder::AsyncFlightMessageDecoderImpl {
           batch_reader_,
           ipc::RecordBatchStreamReader::Open(
               std::unique_ptr<ipc::MessageReader>(message_reader_), options_));
-      return  listener_->OnSchemaDecoded(batch_reader_->schema());
+      return listener_->OnSchemaDecoded(batch_reader_->schema());
     }
 
     message_reader_->Push(std::move(message), std::move(data.app_metadata));
@@ -169,11 +189,6 @@ class AsyncFlightMessageDecoder::AsyncFlightMessageDecoderImpl {
     return arrow::Future<>::MakeFinished(Status::OK());
   }
 
-  std::shared_ptr<Schema> schema() const {
-    return batch_reader_ ? batch_reader_->schema() : nullptr;
-  }
-
- private:
   std::shared_ptr<AsyncFlightDataListener> listener_;
   ipc::IpcReadOptions options_;
   // This is owned by the RecordBatchStreamReader once it's passed to it.
@@ -182,10 +197,10 @@ class AsyncFlightMessageDecoder::AsyncFlightMessageDecoderImpl {
   std::shared_ptr<ipc::RecordBatchStreamReader> batch_reader_;
 };
 
-AsyncFlightMessageDecoder::AsyncFlightMessageDecoder(std::shared_ptr<AsyncFlightDataListener> listener,
-                                           ipc::IpcReadOptions options)
+AsyncFlightMessageDecoder::AsyncFlightMessageDecoder(
+    std::shared_ptr<AsyncFlightDataListener> listener, ipc::IpcReadOptions options)
     : impl_(std::make_unique<AsyncFlightMessageDecoderImpl>(std::move(listener),
-                                                       std::move(options))) {}
+                                                            std::move(options))) {}
 
 AsyncFlightMessageDecoder::~AsyncFlightMessageDecoder() = default;
 
@@ -198,9 +213,11 @@ Future<> AsyncFlightMessageDecoder::Consume(internal::FlightData data) {
   return impl_->ConsumeData(std::move(data));
 }
 
-std::shared_ptr<Schema> AsyncFlightMessageDecoder::schema() const { return impl_->schema(); }
+std::shared_ptr<Schema> AsyncFlightMessageDecoder::schema() const {
+  return impl_->schema();
+}
 
-// --- FlightDataListener: transport state and the terminal callbacks ---
+// --- AsyncFlightDataListener: transport state and the terminal callbacks ---
 
 AsyncFlightDataListener::AsyncFlightDataListener() = default;
 AsyncFlightDataListener::~AsyncFlightDataListener() = default;

@@ -132,12 +132,12 @@ class ARROW_FLIGHT_EXPORT AsyncGenericFlightServerBase {
   virtual arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
       const ServerCallContext& context, const Ticket& request);
 
-  /// \brief Create the FlightDataListener serving one DoPut RPC.
+  /// \brief Create the AsyncFlightDataListener serving one DoPut RPC.
   ///
   /// \param[in] `context` is the server call context.
-  /// \return A shared pointer to the FlightDataListener handling the upload, or
+  /// \return A shared pointer to the AsyncFlightDataListener handling the upload, or
   /// nullptr to refuse the upload.
-  
+
   virtual std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
       const ServerCallContext& context);
 

@@ -137,8 +137,9 @@ class ResolvedStream : public AsyncFlightDataStream {
 // to do it.  The inner server must outlive the adapter (it holds a raw pointer).
 class TestServerAsyncAdapter : public AsyncGenericFlightServerBase {
  public:
-  explicit TestServerAsyncAdapter(FlightServerBase* inner,
-                                  std::shared_ptr<AsyncFlightDataListener> listener = nullptr)
+  explicit TestServerAsyncAdapter(
+      FlightServerBase* inner,
+      std::shared_ptr<AsyncFlightDataListener> listener = nullptr)
       : inner_(inner), listener_(std::move(listener)) {}
 
   /// \brief Hands out the listener the test installed, if any; nullptr (the
@@ -191,7 +192,7 @@ class TestServerAsyncAdapter : public AsyncGenericFlightServerBase {
 
  private:
   FlightServerBase* inner_;
-  std::shared_ptr<FlightDataListener> listener_;
+  std::shared_ptr<AsyncFlightDataListener> listener_;
 };
 
 // Serves 3 batches of 5 rows for any ticket, and records the ticket it was
@@ -390,7 +391,7 @@ class RecordingListener : public AsyncFlightDataListener {
     return arrow::Status::OK();
   }
 
-  arrow::Status OnNext(FlightStreamChunk chunk) override {
+  arrow::Future<> OnNext(FlightStreamChunk chunk) override {
     if (chunk.data) {
       batches_.push_back(std::move(chunk.data));
     } else {
@@ -398,14 +399,14 @@ class RecordingListener : public AsyncFlightDataListener {
       metadata_chunks_.push_back(std::move(chunk.app_metadata));
     }
     last_status_ = next_status_;
-    return next_status_;
+    return arrow::Future<>::MakeFinished(next_status_);
   }
 
   // Records the upload's descriptor and reports whatever status the test
   // configured, so the descriptor rejection path is reachable from here too.
-  arrow::Status OnDescriptor(const FlightDescriptor& descriptor) override {
+  arrow::Future<> OnDescriptor(const FlightDescriptor& descriptor) override {
     descriptors_.push_back(descriptor);
-    return descriptor_status_;
+    return arrow::Future<>::MakeFinished(descriptor_status_);
   }
 
   // Consumer-side rejection of the upload, as the decoder tests do.
@@ -454,7 +455,7 @@ class FinishRecordingListener : public RecordingListener {
 
   /// Cancel from whatever thread the test drives; records what Cancel() said.
   void CancelWith(Status status) {
-    const Status cancel_status = Cancel(std::move(status));
+    const arrow::Status cancel_status = Cancel(std::move(status)).status();
     std::lock_guard<std::mutex> lock(mutex_);
     cancel_status_ = cancel_status;
     ++cancel_count_;

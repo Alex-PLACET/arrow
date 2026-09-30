@@ -34,7 +34,7 @@
 // Deriving from AsyncGenericFlightServerBase (arrow/flight/server_async.h)
 // selects the async generic gRPC transport.  On this path DoPut is not answered
 // by a handler method: the transport hands every decoded upload to the
-// FlightDataListener the server class hands out (CreateDoPutListener), one
+// AsyncFlightDataListener the server class hands out (CreateDoPutListener), one
 // listener per RPC.  The callbacks are:
 //
 // * OnDescriptor(const FlightDescriptor&) - the descriptor of the upload;
@@ -75,7 +75,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeInt64Batch(
   return arrow::RecordBatch::Make(schema, array->length(), {array});
 }
 
-/// \brief The FlightDataListener serving one DoPut RPC: it records what it is
+/// \brief The AsyncFlightDataListener serving one DoPut RPC: it records what it is
 /// handed as the upload streams in.  The counters are atomics because the
 /// callbacks run on gRPC threads.
 class CountingUploadListener : public flight::AsyncFlightDataListener {

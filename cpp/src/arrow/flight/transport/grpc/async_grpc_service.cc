@@ -349,7 +349,7 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
 /// \brief Serve one DoPut RPC over the generic callback API.
 ///
 /// Reads one message per OnReadDone turn and pushes it into the per-RPC
-/// FlightMessageDecoder, which fires the listener's callbacks
+/// AsyncFlightMessageDecoder, which fires the listener's callbacks
 /// The listener's status is the upload's status: a non-OK one rejects the upload (the
 /// acknowledgement is not written, so the client's DoPut fails with it). On
 /// end of stream the acknowledgement is written back, that is what makes the
@@ -419,7 +419,8 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
       return;
     }
     // Extract an Arrow buffer from the gRPC ByteBuffer, then feed it to the
-    // FlightMessageDecoder which fires the listener callbacks (OnSchemaDecoded / OnNext).
+    // AsyncFlightMessageDecoder which fires the listener callbacks (OnSchemaDecoded /
+    // OnNext).
     std::shared_ptr<arrow::Buffer> arrow_buf;
     const Status wrap_status = WrapGrpcBuffer(&request_buf_, &arrow_buf);
     if (!wrap_status.ok()) {
@@ -429,10 +430,10 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
       return;
     }
 
-    // Feed the Arrow buffer to the FlightMessageDecoder. This will trigger the
+    // Feed the Arrow buffer to the AsyncFlightMessageDecoder. This will trigger the
     // appropriate callbacks on the listener (OnSchemaDecoded / OnNext).
     Future<> decode_status = decoder_.Consume(std::move(arrow_buf));
-    decode_status.AddCallback([this](arrow::Status status){
+    decode_status.AddCallback([this](arrow::Status status) {
       if (!status.ok()) {
         // The listener's status is the transport error rejecting the upload.
         FinishUpload(status);

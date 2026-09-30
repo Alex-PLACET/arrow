@@ -37,12 +37,12 @@ class AsyncFlightDataListener;
 
 namespace internal {
 
-/// \brief The per-RPC handle a transport gives a FlightDataListener so the
+/// \brief The per-RPC handle a transport gives an AsyncFlightDataListener so the
 /// application can act on the RPC while it is in flight.
 ///
 /// The transport owns this; the listener only holds a reference for as long as
 /// the RPC is live, and asks for it under a lock the transport takes to clear
-/// it (see FlightDataListener::LockTransport).  That is the same lifetime rule
+/// it (see FlightDataListenerTransport::Clear).  That is the same lifetime rule
 /// the client-side AsyncListenerBase uses for its AsyncRpc state.
 class ARROW_FLIGHT_EXPORT FlightDataListenerTransport {
  public:
@@ -93,7 +93,9 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
   ///
   /// Fired before any schema or data of that upload, so the listener knows
   /// which upload it is being handed. A non-OK status rejects the upload.
-  virtual Future<> OnDescriptor(const FlightDescriptor& descriptor) { return Future<>::MakeFinished(); }
+  virtual Future<> OnDescriptor(const FlightDescriptor& descriptor) {
+    return Future<>::MakeFinished();
+  }
 
   /// \brief Called once, when the upload ends, whichever way it ends.
   ///
@@ -135,7 +137,7 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
 /// FlightStreamChunks.
 ///
 /// This class decodes Apache Arrow Flight data format from arrow::Buffer
-/// and fires events on the provided FlightDataListener.
+/// and fires events on the provided AsyncFlightDataListener.
 class ARROW_FLIGHT_EXPORT AsyncFlightMessageDecoder {
  public:
   explicit AsyncFlightMessageDecoder(
