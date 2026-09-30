@@ -36,18 +36,18 @@ namespace arrow::flight {
 /// NextAsync()/GetSchemaPayloadAsync() and never blocks a gRPC callback thread.
 class ARROW_FLIGHT_EXPORT AsyncFlightDataStream {
  public:
-  virtual ~AsyncFlightDataStream() ;
+  virtual ~AsyncFlightDataStream();
 
   virtual std::shared_ptr<Schema> schema() = 0;
 
   /// \brief Like GetSchemaPayload(), but the payload arrives later.
   virtual arrow::Future<FlightPayload> GetSchemaPayloadAsync() = 0;
 
-  /// \brief Like Next(), but the payload arrives later. 
+  /// \brief Like Next(), but the payload arrives later.
   /// The last payload has null metadata, as in the synchronous interface.
   virtual arrow::Future<FlightPayload> NextAsync() = 0;
 
-  virtual Status Close() { return Status::OK(); };
+  virtual Status Close() { return Status::OK(); }
 };
 
 /// \brief a Flight server served by the async generic gRPC
@@ -60,7 +60,7 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataStream {
 ///   arrow::Status GetFlightInfo(const arrow::flight::ServerCallContext&,
 ///                               const arrow::flight::FlightDescriptor&,
 ///                               std::unique_ptr<arrow::flight::FlightInfo>*) override;
-///   arrow::Future<std::unique_ptr<arrow::flight::AsyncFlightDataStream>> DoGetAsync(
+///   arrow::Future<std::shared_ptr<arrow::flight::AsyncFlightDataStream>> DoGetAsync(
 ///       const arrow::flight::ServerCallContext&,
 ///       const arrow::flight::Ticket&) override;
 /// };
@@ -129,8 +129,17 @@ class ARROW_FLIGHT_EXPORT AsyncGenericFlightServerBase {
   /// writes whatever stream it resolves to.
   /// \param[in] `context` is the server call context.
   /// \param[in] `request` is an opaque ticket The default answers UNIMPLEMENTED.
-  virtual arrow::Future<std::unique_ptr<AsyncFlightDataStream>> DoGetAsync(
+  virtual arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
       const ServerCallContext& context, const Ticket& request);
+
+  /// \brief Create the FlightDataListener serving one DoPut RPC.
+  ///
+  /// \param[in] `context` is the server call context.
+  /// \return A shared pointer to the FlightDataListener handling the upload, or
+  /// nullptr to refuse the upload.
+  
+  virtual std::shared_ptr<FlightDataListener> CreateDoPutListener(
+      const ServerCallContext& context);
 
   /// \brief Handle the handshake protocol with the client.
   ///

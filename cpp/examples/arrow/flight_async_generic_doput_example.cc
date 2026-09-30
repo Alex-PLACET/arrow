@@ -1,17 +1,17 @@
 // Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements. See the NOTICE file
+// or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
-// regarding copyright ownership. The ASF licenses this file
+// regarding copyright ownership.  The ASF licenses this file
 // to you under the Apache License, Version 2.0 (the
 // "License"); you may not use this file except in compliance
-// with the License. You may obtain a copy of the License at
+// with the License.  You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//   http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
 // software distributed under the License is distributed on an
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied. See the License for the
+// KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
 
@@ -19,28 +19,23 @@
 #include <unistd.h>
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <deque>
 #include <iostream>
 #include <memory>
-#include <mutex>
-#include <thread>
 #include <utility>
 
 #include <arrow/api.h>
 #include <arrow/flight/api.h>
 #include <gflags/gflags.h>
-#include <condition_variable>
 
-// Async DoPut on the async generic Flight server.
+// Serve DoPut over the async generic Flight transport.
 //
-// Deriving from AsyncGenericFlightServerBase selects the async generic
-// transport.  On this path DoPut is not answered by FlightServerBase::DoPut:
-// the transport hands each decoded upload to the FlightDataListener returned by
-// FlightServerOptions::listener_factory, one listener per RPC.  The callbacks
-// are:
+// Deriving from AsyncGenericFlightServerBase (arrow/flight/server_async.h)
+// selects the async generic gRPC transport.  On this path DoPut is not answered
+// by a handler method: the transport hands every decoded upload to the
+// FlightDataListener returned by FlightServerOptions::listener_factory, one
+// listener per RPC.  The callbacks are:
 //
 // * OnDescriptor(const FlightDescriptor&) - the descriptor of the upload;
 //   returning non-OK rejects the upload (the client sees that status when it
@@ -50,36 +45,24 @@
 // * OnNext(FlightStreamChunk) - once per decoded message; chunk.data is the
 //   RecordBatch, or nullptr for metadata-only messages.
 //
-// All of them run on a gRPC callback thread, so none of them may block: a slow
-// callback stalls the RPC and every other call that thread would serve.  The
-// listener interface has no completion callback (no OnFinish/OnError) - the
-// RPC's completion is the transport's business - so this example drains its own
-// queue instead of waiting for a notification.
-//
-// AsyncUploadHandler::OnNext therefore only pushes the chunk onto an
-// UploadQueue and returns OK at once.  A worker thread pops the chunks and
-// processes them one at a time, sleeping --slow_processing_ms per batch to
-// stand in for real work.
-//
-// --demo proves the callbacks never block: the client writes 3 batches and the
-// whole DoPut (DoPut() through Close()) must complete in well under the
-// worker's total processing time (3 x --slow_processing_ms).  If a callback
-// thread were blocked by the processing, the client-visible DoPut would take at
-// least that long.
+// All of them run on gRPC callback threads, so they must return promptly: a
+// slow callback stalls the RPC and every other call that thread would serve.
+// This listener only counts and prints; a server with real work would hand the
+// chunk to its own queue or thread pool and return at once.
 //
 // Usage:
 //   flight-async-generic-doput-example --port=31337
-//   flight-async-generic-doput-example --demo --slow_processing_ms=100
+//   flight-async-generic-doput-example --port=0 --demo
 //
 // Run with no arguments to print this message and exit.
 
 DEFINE_int32(port, 0, "Port to listen on (0 picks a free port)");
-DEFINE_int32(slow_processing_ms, 100,
-             "Time the worker thread spends on each uploaded batch, standing in for "
-             "real work");
-DEFINE_bool(demo, false, "Run the async DoPut self-check against the server, then exit");
+DEFINE_bool(demo, false, "Run the DoPut self-check against the server, then exit");
 
 namespace flight = arrow::flight;
+
+constexpr int kNumBatches = 3;
+constexpr int64_t kRowsPerBatch = 4;
 
 /// \brief Make a one-column batch of `num_rows` int64 values starting at `value`.
 arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeInt64Batch(
@@ -92,102 +75,11 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeInt64Batch(
   return arrow::RecordBatch::Make(schema, array->length(), {array});
 }
 
-/// \brief The hand-off between the gRPC callback threads and one worker thread.
-///
-/// Push() is called from a callback thread and only appends to a deque under a
-/// mutex: it never waits for processing.  The worker pops one chunk at a time
-/// and sleeps --slow_processing_ms per batch to stand in for real work.
-class UploadQueue {
+/// \brief The FlightDataListener serving one DoPut RPC: it records what it is
+/// handed as the upload streams in.  The counters are atomics because the
+/// callbacks run on gRPC threads.
+class CountingUploadListener : public flight::FlightDataListener {
  public:
-  explicit UploadQueue(int32_t slow_processing_ms)
-      : slow_processing_ms_(slow_processing_ms), worker_([this] { Run(); }) {}
-
-  ~UploadQueue() { Stop(); }
-
-  /// \brief Hand a decoded chunk to the worker; returns immediately.
-  void Push(flight::FlightStreamChunk chunk) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      chunks_.push_back(std::move(chunk));
-    }
-    ready_.notify_one();
-  }
-
-  /// \brief Block until every queued chunk has been processed.
-  void Drain() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    idle_.wait(lock, [this] { return chunks_.empty() && !processing_; });
-  }
-
-  /// \brief Stop and join the worker.  Idempotent; call after the last Push().
-  void Stop() {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      stopped_ = true;
-    }
-    ready_.notify_all();
-    if (worker_.joinable()) {
-      worker_.join();
-    }
-  }
-
-  /// Counters, readable once Drain() has returned.
-  int64_t num_batches() const { return num_batches_.load(); }
-  int64_t num_rows() const { return num_rows_.load(); }
-
- private:
-  void Run() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    while (true) {
-      if (chunks_.empty()) {
-        if (stopped_) {
-          return;
-        }
-        ready_.wait(lock);
-        continue;
-      }
-      auto chunk = std::move(chunks_.front());
-      chunks_.pop_front();
-      processing_ = true;
-      lock.unlock();
-
-      // The deliberately slow part, off the callback thread.
-      std::this_thread::sleep_for(std::chrono::milliseconds(slow_processing_ms_));
-      if (chunk.data != nullptr) {  // null for metadata-only messages
-        num_batches_.fetch_add(1);
-        num_rows_.fetch_add(chunk.data->num_rows());
-      }
-
-      lock.lock();
-      processing_ = false;
-      if (chunks_.empty()) {
-        idle_.notify_all();
-      }
-    }
-  }
-
-  const int32_t slow_processing_ms_;
-  std::mutex mutex_;
-  std::condition_variable ready_;
-  std::condition_variable idle_;
-  std::deque<flight::FlightStreamChunk> chunks_;
-  bool processing_ = false;
-  bool stopped_ = false;
-  std::atomic<int64_t> num_batches_{0};
-  std::atomic<int64_t> num_rows_{0};
-  std::thread worker_;
-};
-
-/// \brief The FlightDataListener serving one DoPut RPC.
-///
-/// Every method runs on a gRPC callback thread and returns promptly: the
-/// descriptor and the schema are printed as they arrive, and each chunk is
-/// handed to the queue.  The processing happens on the queue's worker thread.
-class AsyncUploadHandler : public flight::FlightDataListener {
- public:
-  explicit AsyncUploadHandler(std::shared_ptr<UploadQueue> queue)
-      : queue_(std::move(queue)) {}
-
   arrow::Status OnDescriptor(const flight::FlightDescriptor& descriptor) override {
     std::cout << "DoPut descriptor: " << descriptor.ToString() << std::endl;
     // Returning non-OK here would reject the upload; the client sees that
@@ -205,27 +97,66 @@ class AsyncUploadHandler : public flight::FlightDataListener {
   }
 
   arrow::Status OnNext(flight::FlightStreamChunk chunk) override {
-    // Hand the chunk over and return at once: the worker thread does the slow
-    // processing, this callback thread stays free for the transport.
-    queue_->Push(std::move(chunk));
+    if (chunk.data != nullptr) {  // null for metadata-only messages
+      num_batches_.fetch_add(1);
+      num_rows_.fetch_add(chunk.data->num_rows());
+    }
     return arrow::Status::OK();
   }
 
+  /// \brief The upload ended, whichever way: here is where a consumer commits.
+  /// status == OK means the client ended it normally; anything else is why it
+  /// did not complete.
+  arrow::Status OnFinish(arrow::Status status) override {
+    finished_ = true;
+    if (status.ok()) {
+      std::cout << "DoPut finished: the client ended the upload" << std::endl;
+    } else {
+      std::cout << "DoPut finished: " << status.ToString() << std::endl;
+    }
+    return arrow::Status::OK();
+  }
+
+  int64_t num_batches() const { return num_batches_.load(); }
+  int64_t num_rows() const { return num_rows_.load(); }
+  bool finished() const { return finished_; }
+
  private:
-  std::shared_ptr<UploadQueue> queue_;
+  std::atomic<int64_t> num_batches_{0};
+  std::atomic<int64_t> num_rows_{0};
+  std::atomic<bool> finished_{false};
 };
 
 /// \brief The server.  Deriving from AsyncGenericFlightServerBase selects the
-/// async generic transport; uploads are served by the listener from
-/// options.listener_factory set in main(), never by a DoPut handler method.
-class UploadServer : public flight::AsyncGenericFlightServerBase {};
+/// async generic transport.  Uploads are served by the listener the server
+/// class itself hands out: the transport calls CreateDoPutListener() once per
+/// DoPut RPC, the server-class counterpart of DoGetAsync.  (The older
+/// FlightServerOptions::listener_factory still works as a fallback when this
+/// returns nullptr.)
+///
+/// One listener per RPC, as overlapping uploads require.  This demo has a
+/// single --demo client, so it keeps the listener it handed out in order to
+/// check it in main(), once the server has stopped.
+class UploadServer : public flight::AsyncGenericFlightServerBase {
+ public:
+  std::shared_ptr<flight::FlightDataListener> CreateDoPutListener(
+      const flight::ServerCallContext& context) override {
+    auto listener = std::make_shared<CountingUploadListener>();
+    last_listener_ = listener;
+    return listener;
+  }
 
-/// \brief The --demo self-check.  The assertion that matters: the client-visible
-/// DoPut finishes long before the worker thread has processed the batches, so
-/// no callback thread was blocked.
-bool RunDemo(int port, const std::shared_ptr<UploadQueue>& queue) {
-  bool ok = true;
+  /// The listener the last DoPut RPC got; for the demo's assertions.
+  std::shared_ptr<CountingUploadListener> last_listener() const { return last_listener_; }
 
+ private:
+  std::shared_ptr<CountingUploadListener> last_listener_;
+};
+
+/// \brief The --demo client half: upload kNumBatches batches and close the
+/// writer.  What the listener saw is read back in main(), once the server has
+/// stopped.
+bool RunDemo(int port) {
   auto location = flight::Location::ForGrpcTcp("127.0.0.1", port);
   if (!location.ok()) {
     std::cerr << "Failed to build client location: " << location.status() << std::endl;
@@ -237,13 +168,7 @@ bool RunDemo(int port, const std::shared_ptr<UploadQueue>& queue) {
     return false;
   }
 
-  constexpr int kNumBatches = 3;
-  constexpr int64_t kRowsPerBatch = 4;
   auto schema = arrow::schema({arrow::field("value", arrow::int64())});
-
-  // Time the whole client-visible DoPut: the initial call through the final
-  // Close().  The worker's processing happens after this window.
-  const auto start = std::chrono::steady_clock::now();
   auto put = (*client)->DoPut(flight::FlightDescriptor::Command("upload"), schema);
   if (!put.ok()) {
     std::cerr << "DoPut failed: " << put.status() << std::endl;
@@ -264,62 +189,22 @@ bool RunDemo(int port, const std::shared_ptr<UploadQueue>& queue) {
   if (status.ok()) {
     status = put->writer->Close();
   }
-  const double put_ms =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
-          .count();
   if (!status.ok()) {
     std::cerr << "DoPut upload failed: " << status << std::endl;
     return false;
   }
-
-  const double worker_ms = kNumBatches * FLAGS_slow_processing_ms;
-  std::cout << "Client-visible DoPut (DoPut() to Close()) took " << put_ms
-            << " ms; the worker still has " << worker_ms << " ms of processing queued"
-            << std::endl;
-  if (put_ms < 150.0) {
-    std::cout << "PASS: client-visible DoPut finished in " << put_ms
-              << " ms, well under the 150 ms budget" << std::endl;
-  } else {
-    std::cout << "FAIL: client-visible DoPut took " << put_ms << " ms, expected < 150 ms"
-              << std::endl;
-    ok = false;
-  }
-  if (put_ms < worker_ms) {
-    std::cout << "PASS: DoPut returned " << put_ms << " ms in, before the worker's "
-              << worker_ms << " ms of processing could have finished" << std::endl;
-  } else {
-    std::cout << "FAIL: DoPut took " << put_ms << " ms, no faster than the worker's "
-              << worker_ms << " ms of processing: a callback thread was blocked"
-              << std::endl;
-    ok = false;
-  }
-
-  // Now let the worker finish and check what it saw.
-  queue->Drain();
-  if (queue->num_batches() == kNumBatches &&
-      queue->num_rows() == kNumBatches * kRowsPerBatch) {
-    std::cout << "PASS: worker processed " << queue->num_batches() << " batches, "
-              << queue->num_rows() << " rows" << std::endl;
-  } else {
-    std::cout << "FAIL: worker processed " << queue->num_batches() << " batches, "
-              << queue->num_rows() << " rows, expected " << kNumBatches << " batches, "
-              << kNumBatches * kRowsPerBatch << " rows" << std::endl;
-    ok = false;
-  }
-  return ok;
+  return true;
 }
 
 int main(int argc, char** argv) {
   if (argc == 1) {
     // As in the other examples: a bare run (e.g. from ctest) does not start a
     // server, it just prints the usage.
-    std::cout << "Usage: " << argv[0]
-              << " [--port=PORT] [--slow_processing_ms=MS] [--demo]" << std::endl;
+    std::cout << "Usage: " << argv[0] << " [--port=PORT] [--demo]" << std::endl;
     return EXIT_SUCCESS;
   }
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-  auto queue = std::make_shared<UploadQueue>(FLAGS_slow_processing_ms);
   UploadServer server;
 
   auto location = flight::Location::ForGrpcTcp("0.0.0.0", FLAGS_port);
@@ -330,12 +215,8 @@ int main(int argc, char** argv) {
   flight::FlightServerOptions options(*location);
   // UploadServer derives from AsyncGenericFlightServerBase: the server class
   // alone selects the async generic transport, so there is no option to set.
-  // The factory is called once per DoPut RPC and returns a fresh listener,
-  // since uploads may overlap; returning nullptr would refuse the upload.
-  options.listener_factory = [queue]() -> std::shared_ptr<flight::FlightDataListener> {
-    return std::make_shared<AsyncUploadHandler>(queue);
-  };
-
+  // Uploads come from the server's CreateDoPutListener() override; no
+  // options.listener_factory is set (that is the fallback path).
   auto status = server.Init(options);
   if (!status.ok()) {
     std::cerr << status.ToString() << std::endl;
@@ -346,10 +227,28 @@ int main(int argc, char** argv) {
   std::cout << "Server pid " << getpid() << ", port " << port << std::endl;
 
   if (FLAGS_demo) {
-    bool ok = RunDemo(port, queue);
+    bool ok = RunDemo(port);
     ARROW_WARN_NOT_OK(server.Shutdown(), "Error shutting down server");
     ARROW_WARN_NOT_OK(server.Wait(), "Error waiting for server shutdown");
-    queue->Stop();  // join the worker now that no more uploads can arrive
+    // The listener callbacks run on gRPC threads: read its counters only once
+    // the server has stopped (the same pattern the flight tests use).
+    const auto listener = server.last_listener();
+    if (listener == nullptr) {
+      std::cout << "FAIL: the server handed out no DoPut listener" << std::endl;
+      ok = false;
+    } else if (listener->num_batches() == kNumBatches &&
+               listener->num_rows() == kNumBatches * kRowsPerBatch &&
+               listener->finished()) {
+      std::cout << "PASS: listener saw " << listener->num_batches() << " batches, "
+                << listener->num_rows() << " rows, and its OnFinish said the client "
+                << "ended the upload" << std::endl;
+    } else {
+      std::cout << "FAIL: listener saw " << listener->num_batches() << " batches, "
+                << listener->num_rows() << " rows, finished=" << listener->finished()
+                << ", expected " << kNumBatches << " batches, "
+                << kNumBatches * kRowsPerBatch << " rows, finished" << std::endl;
+      ok = false;
+    }
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 

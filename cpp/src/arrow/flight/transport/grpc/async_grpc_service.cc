@@ -123,8 +123,7 @@ arrow::Result<PbT> ParseProtoRequest(const ::grpc::ByteBuffer& buf,
 
 /// \brief Read `buf` as the proto message `PbT` and convert it to `T`.
 template <typename PbT, typename T>
-arrow::Result<T> ParseProtoRequest(const ::grpc::ByteBuffer& buf,
-                                   std::string_view what) {
+arrow::Result<T> ParseProtoRequest(const ::grpc::ByteBuffer& buf, std::string_view what) {
   ARROW_ASSIGN_OR_RAISE(auto pb, ParseProtoRequest<PbT>(buf, what));
   T out;
   ARROW_RETURN_NOT_OK(internal::FromProto(pb, &out));
@@ -182,10 +181,10 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
     // future, which can be after OnDone (gRPC has no server-side holds, so
     // the refcount below is ours).
     Hold();
-    auto future = base_->DoGetAsync(flight_context_, *ticket);
+    arrow::Future<std::shared_ptr<AsyncFlightDataStream>> future = base_->DoGetAsync(flight_context_, *ticket);
     future.AddCallback(
         [this, future](
-            const arrow::Result<std::unique_ptr<AsyncFlightDataStream>>& result) mutable {
+            const arrow::Result<std::shared_ptr<AsyncFlightDataStream>>& result) mutable {
           if (!result.ok()) {
             FinishOnce(flight_context_.FinishRequest(result.status()));
             ReleaseHold();
@@ -238,16 +237,13 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   /// \brief Called when the client cancels the request.
   /// This allows the server to stop producing data for a request that will no longer be
   /// consumed.
-  void OnCancel() override {
-    cancelled_ = true;
-  }
+  void OnCancel() override { cancelled_ = true; }
 
   /// \brief Called when the RPC is fully done, regardless of success or cancellation.
   /// This is the last callback that will be invoked for this RPC.
   void OnDone() override { ReleaseHold(); }
 
  private:
-
   /// Parse the request ByteBuffer as the pb::Ticket of the DoGet request.
   /// \return A Result containing the parsed Ticket, or an error if parsing failed.
   arrow::Result<Ticket> ParseTicket() {
@@ -273,7 +269,7 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
     }
   }
 
-  /// Serialize the next payload of the data stream and start writing it. 
+  /// Serialize the next payload of the data stream and start writing it.
   /// Called once from OnReadDone (schema payload) and then once per OnWriteDone.
   /// NextAsync() is the server's code: the payload can complete on any thread,
   /// so the reactor holds itself across that callback and never touches the call
@@ -330,7 +326,7 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
 
       // StartWrite requires the buffer to remain valid until OnWriteDone.
       StartWrite(&write_buf_);
-      ReleaseHold(); // the next hop is a gRPC callback (OnWriteDone)
+      ReleaseHold();  // the next hop is a gRPC callback (OnWriteDone)
     });
   }
 
@@ -338,7 +334,7 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   AsyncGenericFlightServerBase* base_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer write_buf_;
-  std::unique_ptr<AsyncFlightDataStream> async_data_stream_;
+  std::shared_ptr<AsyncFlightDataStream> async_data_stream_;
   bool wrote_schema_ = false;
   /// Set by OnCancel: a pending DoGetAsync continuation must not write or touch
   /// the call context afterwards.
@@ -357,7 +353,8 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
 /// acknowledgement is not written, so the client's DoPut fails with it). On
 /// end of stream the acknowledgement is written back, that is what makes the
 /// client's DoPut return.
-class DoPutReactor : public ::grpc::ServerGenericBidiReactor {
+class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
+                     public internal::FlightDataListenerTransport {
  public:
   /// \param `flight_context` is prepared by the service (middleware/auth ran); the raw
   /// context is owned by gRPC and outlives the reactor (the reactor is
@@ -365,8 +362,24 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor {
   /// \param `listener` is the per-RPC listener that will receive the uploaded data.
   DoPutReactor(AsyncCallContext flight_context,
                std::shared_ptr<FlightDataListener> listener)
-      : flight_context_(std::move(flight_context)), decoder_(std::move(listener)) {
+      : flight_context_(std::move(flight_context)),
+        listener_(std::move(listener)),
+        decoder_(listener_) {
+    // The listener can now Cancel() this RPC; cleared in OnDone, before the
+    // reactor dies.
+    internal::FlightDataListenerTransport::Install(listener_, this);
     StartRead(&request_buf_);
+  }
+
+  /// \brief Cancel the upload from the application side: finish the RPC with
+  /// `status` without waiting for the client to end it.
+  ///
+  /// Callable from any thread (that is the point).  Idempotent: `finished_`
+  /// makes only the first ending take effect.
+  void CancelUpload(Status status) override {
+    FinishOnce(flight_context_.FinishRequest(
+        status.ok() ? Status::Cancelled("the server cancelled the upload")
+                    : std::move(status)));
   }
 
   /// \brief Called when a new message is available from the client.
@@ -374,8 +387,12 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor {
   /// closed its half of the stream.
   void OnReadDone(bool ok) override {
     if (!ok) {
-      // The client closed its half of the stream: acknowledge the upload.
-      // The client's DoPut does not return until it has read this message.
+      // The client closed its half of the stream: the upload ended normally.
+      // Report that to the listener, then acknowledge the upload, which is
+      // what makes the client's DoPut return.
+      ARROW_WARN_NOT_OK(
+          internal::FlightDataListenerTransport::ReportFinish(listener_, Status::OK()),
+          "Reporting the end of an upload to the listener failed");
       pb::PutResult pb_result;
       // Not a local variable: StartWrite requires the ByteBuffer to remain
       // valid until OnWriteDone.
@@ -389,7 +406,7 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor {
     std::shared_ptr<arrow::Buffer> arrow_buf;
     const Status wrap_status = WrapGrpcBuffer(&request_buf_, &arrow_buf);
     if (!wrap_status.ok()) {
-      Finish(flight_context_.FinishRequest(
+      FinishOnce(flight_context_.FinishRequest(
           MakeFlightError(FlightStatusCode::Internal,
                           "Failed to wrap gRPC buffer: " + wrap_status.message())));
       return;
@@ -400,7 +417,7 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor {
     const Status decode_status = decoder_.Consume(std::move(arrow_buf));
     if (!decode_status.ok()) {
       // The listener's status is the transport error rejecting the upload.
-      Finish(flight_context_.FinishRequest(decode_status));
+      FinishOnce(flight_context_.FinishRequest(decode_status));
       return;
     }
 
@@ -414,28 +431,49 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor {
   void OnWriteDone(bool ok) override {
     if (!ok) {
       // The client closed its half of the stream before the write could complete.
-      Finish(flight_context_.FinishRequest(
+      FinishOnce(flight_context_.FinishRequest(
           MakeFlightError(FlightStatusCode::Internal, "Write failed")));
       return;
     }
-    Finish(flight_context_.FinishRequest(arrow::Status::OK()));
+    // The acknowledgement of the upload reached the client: the upload is done.
+    FinishOnce(flight_context_.FinishRequest(arrow::Status::OK()));
   }
 
   /// \brief Called when the client cancels the RPC.
   void OnCancel() override {
-    // The client went away: there is no data stream to close here (the
-    // listener is not owned by the call), and the call is already being torn
-    // down, so there is no status to report.
+    // The client went away before ending the upload: the application must hear
+    // that the upload will not complete.
+    ARROW_WARN_NOT_OK(
+        internal::FlightDataListenerTransport::ReportFinish(
+            listener_, Status::Cancelled("the client cancelled the upload")),
+        "Reporting the cancellation of an upload to the listener failed");
   }
 
   /// \brief Called when the RPC is done, regardless of success, failure, or cancellation.
-  void OnDone() override { delete this; }
+  void OnDone() override {
+    // The RPC is over: the listener must not reach this reactor any more.
+    internal::FlightDataListenerTransport::Clear(listener_);
+    delete this;
+  }
 
  private:
+  /// \brief Ensures that gRPC's Finish is called at most once, and never after OnDone.
+  /// \param[in] status The gRPC status to finish the call with.
+  void FinishOnce(::grpc::Status status) {
+    bool expected = false;
+    if (finished_.compare_exchange_strong(expected, true)) {
+      Finish(std::move(status));
+    }
+  }
+
   GrpcServerCallContext<::grpc::CallbackServerContext> flight_context_;
+  std::shared_ptr<FlightDataListener> listener_;
   FlightMessageDecoder decoder_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer write_buf_;
+  /// Set by the first ending: gRPC's Finish runs once, and so does each
+  /// terminal report to the listener.
+  std::atomic<bool> finished_{false};
 };
 
 /// \brief Serve the Handshake RPC over the generic callback API.
@@ -499,9 +537,8 @@ class HandshakeReactor : public ::grpc::ServerGenericBidiReactor {
   /// Parse the request ByteBuffer as the pb::HandshakeRequest of the handshake
   /// and return its payload (the client's password).
   arrow::Result<std::string> ParseRequest() {
-    ARROW_ASSIGN_OR_RAISE(
-        auto request,
-        ParseProtoRequest<pb::HandshakeRequest>(request_buf_, "HandshakeRequest"));
+    ARROW_ASSIGN_OR_RAISE(auto request, ParseProtoRequest<pb::HandshakeRequest>(
+                                            request_buf_, "HandshakeRequest"));
     return request.payload();
   }
 
@@ -522,8 +559,8 @@ template <typename PbResponseT>
 class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
  public:
   /// Convert the request, call the server class, serialize the response.
-  using HandlerFn = std::function<arrow::Status(
-      const ServerCallContext&, const FlightDescriptor&, PbResponseT*)>;
+  using HandlerFn = std::function<arrow::Status(const ServerCallContext&,
+                                                const FlightDescriptor&, PbResponseT*)>;
 
   UnaryReactor(AsyncCallContext flight_context, HandlerFn handler)
       : flight_context_(std::move(flight_context)), handler_(std::move(handler)) {
@@ -672,8 +709,8 @@ class DoActionReactor final : public StreamingReactor {
 
  protected:
   arrow::Status HandleRequest() override {
-    ARROW_ASSIGN_OR_RAISE(auto action, (ParseProtoRequest<pb::Action, Action>(
-                                           request_buf_, "Action")));
+    ARROW_ASSIGN_OR_RAISE(
+        auto action, (ParseProtoRequest<pb::Action, Action>(request_buf_, "Action")));
     return base_->DoAction(flight_context_, action, &results_);
   }
 
@@ -1187,13 +1224,18 @@ AsyncGenericFlightService::AsyncGenericFlightService(
   if (method == kDoGetMethod) {
     return new DoGetReactor(std::move(flight_context), base_);
   }
-  // DoPut needs a listener to hand the incoming batches to, so a server
-  // built without a factory does not accept uploads.
+  // DoPut needs a listener to hand the incoming batches to.  The server class
+  // is asked first; a server that only sets options.listener_factory keeps
+  // working through the fallback, and a server with neither (or whose
+  // listener is refused) does not accept uploads.
   if (method == kDoPutMethod) {
-    // A server built without a factory, or whose factory declined this RPC,
-    // does not accept uploads.
-    if (auto listener = listener_factory_ ? listener_factory_() : nullptr) {
-      return new DoPutReactor(std::move(flight_context), std::move(listener));
+    std::shared_ptr<FlightDataListener> listener =
+        base_->CreateDoPutListener(flight_context);
+    if (!listener && listener_factory_) {
+      listener = listener_factory_();
+    }
+    if (listener) {
+      return new DoPutReactor(std::move(flight_context), base_->CreateDoPutListener(flight_context));
     }
     return new Unimplemented(
         ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,

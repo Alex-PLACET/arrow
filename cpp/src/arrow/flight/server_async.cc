@@ -36,7 +36,6 @@ namespace arrow::flight {
 
 AsyncFlightDataStream::~AsyncFlightDataStream() = default;
 
-
 struct AsyncGenericFlightServerBase::Impl {
   internal::ServerLifecycle lifecycle{"AsyncGenericFlightServerBase"};
 };
@@ -121,10 +120,18 @@ Status AsyncGenericFlightServerBase::DoExchange(const ServerCallContext&,
   return Status::NotImplemented("NYI");
 }
 
-arrow::Future<std::unique_ptr<AsyncFlightDataStream>>
+arrow::Future<std::shared_ptr<AsyncFlightDataStream>>
 AsyncGenericFlightServerBase::DoGetAsync(const ServerCallContext&, const Ticket&) {
-  return arrow::Future<std::unique_ptr<AsyncFlightDataStream>>::MakeFinished(
+  return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
       Status::NotImplemented("DoGetAsync is not implemented"));
+}
+
+std::shared_ptr<FlightDataListener> AsyncGenericFlightServerBase::CreateDoPutListener(
+    const ServerCallContext&) {
+  // The default refuses uploads; a server that accepts them overrides this, or
+  // sets FlightServerOptions::listener_factory (see the service's DoPut
+  // dispatch, which consults the factory when this returns nullptr).
+  return nullptr;
 }
 
 Status AsyncGenericFlightServerBase::Handshake(const ServerCallContext&,

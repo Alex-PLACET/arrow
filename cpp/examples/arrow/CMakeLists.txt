@@ -128,7 +128,7 @@ if(ARROW_FLIGHT)
                     "${CMAKE_CURRENT_BINARY_DIR}/helloworld.grpc.pb.cc")
 
   # Does not use the helloworld proto, so no proto generation is needed.
-  add_arrow_example(flight_async_generic_server_example
+  add_arrow_example(flight_async_generic_doget_example
                     EXTRA_LINK_LIBS
                     ${FLIGHT_EXAMPLES_LINK_LIBS}
                     gRPC::grpc++

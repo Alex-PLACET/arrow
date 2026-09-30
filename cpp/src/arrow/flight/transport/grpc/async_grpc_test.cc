@@ -430,6 +430,96 @@ class RecordingListener : public FlightDataListener {
   arrow::Status last_status_;
 };
 
+// A listener that records the terminal events on top of RecordingListener:
+// OnFinish (the upload ended, whichever way) and what Cancel() reported, so
+// the tests can assert on an upload cancelled from the server side.
+class FinishRecordingListener : public RecordingListener {
+ public:
+  arrow::Status OnFinish(Status status) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    finish_count_++;
+    finish_status_ = std::move(status);
+    return arrow::Status::OK();
+  }
+
+  /// Cancel from whatever thread the test drives; records what Cancel() said.
+  void CancelWith(Status status) {
+    const Status cancel_status = Cancel(std::move(status));
+    std::lock_guard<std::mutex> lock(mutex_);
+    cancel_status_ = cancel_status;
+    ++cancel_count_;
+  }
+
+  int finish_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return finish_count_;
+  }
+  int cancel_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cancel_count_;
+  }
+  Status finish_status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return finish_status_;
+  }
+  Status cancel_status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cancel_status_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  int finish_count_ = 0;
+  int cancel_count_ = 0;
+  Status finish_status_;
+  Status cancel_status_;
+};
+
+// The upload half of TestServerAsyncAdapter as a server class method: the
+// transport asks the server for the per-RPC listener through the
+// CreateDoPutListener() virtual, with no FlightServerOptions::listener_factory
+// involved.  One fresh listener per RPC, as overlapping uploads require; the
+// test reads them only after the server has stopped, or through WaitForListener
+// (which is what a cancel test needs: it acts while the upload is in flight).
+class TestUploadServerAsyncAdapter : public AsyncGenericFlightServerBase {
+ public:
+  std::shared_ptr<FlightDataListener> CreateDoPutListener(
+      const ServerCallContext& context) override {
+    auto listener = std::make_shared<FinishRecordingListener>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    listeners_.push_back(listener);
+    return listener;
+  }
+
+  int calls() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<int>(listeners_.size());
+  }
+
+  std::shared_ptr<FinishRecordingListener> listener(int i) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return listeners_[i];
+  }
+
+  /// \brief Wait (bounded) for the listener of the i-th upload to exist.
+  /// The factory runs on a gRPC thread; a test that must act mid-upload waits
+  /// for it here instead of racing the read.
+  std::shared_ptr<FinishRecordingListener> WaitForListener(int i) const {
+    for (int attempt = 0; attempt < 500; attempt++) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (static_cast<int>(listeners_.size()) > i) return listeners_[i];
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return nullptr;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::shared_ptr<FinishRecordingListener>> listeners_;
+};
+
 // Middleware execution counts, shared between the factory, the middleware and
 // the test thread (all three touch it).
 struct MiddlewareTrace {
@@ -1552,6 +1642,164 @@ TEST(AsyncGrpcTest, UseAsyncGrpcFlagServesDoPut) {
   ASSERT_EQ(chunk->num_columns(), 2);
   ASSERT_OK_AND_ASSIGN(auto value, chunk->column(0)->GetScalar(0));
   ASSERT_TRUE(value->Equals(*arrow::MakeScalar(int64_t(1))));
+}
+
+TEST(AsyncGrpcTest, CreateDoPutListenerServesUpload) {
+  // The upload half of the server class API: CreateDoPutListener() hands out
+  // the per-RPC listener, with no FlightServerOptions::listener_factory at all.
+  TestUploadServerAsyncAdapter flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_GT(flight_server.port(), 0);
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema(
+      {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+  auto batch =
+      arrow::RecordBatch::Make(schema, 3,
+                               {arrow::ArrayFromJSON(arrow::int64(), "[1, 2, 3]"),
+                                arrow::ArrayFromJSON(arrow::int64(), "[10, 20, 30]")});
+
+  const FlightDescriptor descriptor = FlightDescriptor::Path({"virtual", "h2"});
+  auto [surface, status] = UploadOneBatch(client.get(), descriptor, schema, batch);
+  ASSERT_TRUE(status.ok()) << "upload failed on " << surface << ": " << status;
+
+  // Cleanup before reading the recordings: the listener's callbacks run on a
+  // gRPC thread.
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // The virtual was consulted exactly once, and its listener saw the upload.
+  ASSERT_EQ(flight_server.calls(), 1);
+  const auto& listener = flight_server.listener(0);
+  ASSERT_EQ(listener->descriptor_count(), 1);
+  ASSERT_EQ(listener->descriptors()[0], descriptor);
+  ASSERT_EQ(listener->schema_count(), 1);
+  ASSERT_EQ(listener->batches().size(), 1);
+  ASSERT_EQ(listener->batches()[0]->num_rows(), 3);
+}
+
+TEST(AsyncGrpcTest, CreateDoPutListenerFallsBackToOptionsFactory) {
+  // A server class that does not override the virtual (nullptr) keeps working
+  // through FlightServerOptions::listener_factory, as before its introduction.
+  TestServerAsyncAdapter flight_server(nullptr);
+  auto listener = std::make_shared<RecordingListener>();
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  options.listener_factory = [listener]() { return listener; };
+  ASSERT_OK(flight_server.Init(options));
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[7, 8]")});
+  auto [surface, status] =
+      UploadOneBatch(client.get(), FlightDescriptor::Path({"fallback"}), schema, batch);
+  ASSERT_TRUE(status.ok()) << "upload failed on " << surface << ": " << status;
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  ASSERT_EQ(listener->descriptor_count(), 1);
+  ASSERT_EQ(listener->batches().size(), 1);
+}
+
+TEST(AsyncGrpcTest, DoPutListenerSeesCleanFinish) {
+  // A client that ends the upload normally (DoneWriting + Close) makes the
+  // listener's OnFinish fire once, with OK: that is how a consumer knows the
+  // upload ended and it can commit what it accumulated.
+  TestUploadServerAsyncAdapter flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+  auto [surface, status] =
+      UploadOneBatch(client.get(), FlightDescriptor::Path({"finish"}), schema, batch);
+  ASSERT_TRUE(status.ok()) << "upload failed on " << surface << ": " << status;
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // OnFinish ran exactly once, and said the upload ended cleanly.
+  ASSERT_EQ(flight_server.listener(0)->finish_count(), 1);
+  ASSERT_TRUE(flight_server.listener(0)->finish_status().ok())
+      << "unexpected finish status: " << flight_server.listener(0)->finish_status();
+}
+
+TEST(AsyncGrpcTest, DoPutCancelFromServerSideFinishesTheUpload) {
+  // The server aborts the upload without waiting for the client: Cancel()
+  // finishes the RPC with the given status, the client's write or Close
+  // reports it, and the listener hears it as its OnFinish status.
+  TestUploadServerAsyncAdapter flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[3, 4]")});
+
+  // Open the upload and write one batch, but do not end it.
+  auto put = client->DoPut(FlightDescriptor::Path({"cancel"}), schema);
+  ASSERT_TRUE(put.ok()) << put.status();
+  auto& writer = *put->writer;
+  ASSERT_OK(writer.WriteRecordBatch(*batch));
+
+  // Wait for the listener the virtual handed out, then cancel it from this
+  // (non-gRPC) thread: that is the mid-upload server-side abort.
+  auto listener = flight_server.WaitForListener(0);
+  ASSERT_NE(listener, nullptr) << "the server never handed out a DoPut listener";
+  listener->CancelWith(arrow::Status::Cancelled("server said stop"));
+
+  // The client sees the cancellation on the surface that observes the RPC.
+  const Status close_status = writer.Close();
+  ASSERT_FALSE(close_status.ok()) << "the server-side cancel never reached the client";
+  ASSERT_EQ(close_status.code(), arrow::StatusCode::Cancelled);
+  ASSERT_NE(close_status.message().find("server said stop"), std::string::npos)
+      << "unexpected status: " << close_status;
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // Cancel() reached the transport, and the listener was told the upload ended
+  // with that status exactly once.
+  ASSERT_EQ(listener->cancel_count(), 1);
+  ASSERT_OK(listener->cancel_status()) << listener->cancel_status();
+  ASSERT_EQ(listener->finish_count(), 1);
+
+  // After the upload, Cancel() has nothing to cancel.
+  listener->CancelWith(arrow::Status::Cancelled("too late"));
+  ASSERT_EQ(listener->cancel_status().code(), arrow::StatusCode::Invalid);
+}
+
+TEST(AsyncGrpcTest, DoPutCancelAfterUploadIsInvalid) {
+  // Cancel() is only meaningful while the upload's RPC is running: once it
+  // finished, the listener says so instead of reaching a dead RPC.
+  auto listener = std::make_shared<FinishRecordingListener>();
+  listener->CancelWith(arrow::Status::Cancelled("nothing in flight"));
+  ASSERT_EQ(listener->cancel_status().code(), arrow::StatusCode::Invalid);
 }
 
 TEST(AsyncGrpcTest, UseAsyncGrpcFlagUploadRejectedOnDescriptor) {

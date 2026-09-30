@@ -78,7 +78,8 @@ class FlightDataMessageReader : public ipc::MessageReader {
   }
 
   /// \brief Read the application metadata of the last message taken by ReadNextMessage().
-  /// \return The application metadata of the last message taken, or nullptr if no messages have been taken.
+  /// \return The application metadata of the last message taken, or nullptr if no
+  /// messages have been taken.
   std::shared_ptr<Buffer> ReadAppMetadata() { return app_metadata_; }
 
  private:
@@ -198,5 +199,71 @@ Status FlightMessageDecoder::Consume(internal::FlightData data) {
 }
 
 std::shared_ptr<Schema> FlightMessageDecoder::schema() const { return impl_->schema(); }
+
+// --- FlightDataListener: transport state and the terminal callbacks ---
+
+FlightDataListener::FlightDataListener() = default;
+FlightDataListener::~FlightDataListener() = default;
+
+namespace internal {
+
+FlightDataListenerTransport::~FlightDataListenerTransport() = default;
+
+void FlightDataListenerTransport::Install(
+    const std::shared_ptr<FlightDataListener>& listener,
+    FlightDataListenerTransport* transport) {
+  if (listener == nullptr) return;
+  std::lock_guard<std::mutex> lock(listener->transport_mutex_);
+  listener->transport_ = transport;
+}
+
+void FlightDataListenerTransport::Clear(
+    const std::shared_ptr<FlightDataListener>& listener) {
+  if (listener == nullptr) return;
+  std::lock_guard<std::mutex> lock(listener->transport_mutex_);
+  listener->transport_ = nullptr;
+}
+
+Status FlightDataListenerTransport::ReportFinish(
+    const std::shared_ptr<FlightDataListener>& listener, Status status) {
+  if (listener == nullptr) return Status::OK();
+  {
+    std::lock_guard<std::mutex> lock(listener->transport_mutex_);
+    if (listener->finished_) {
+      // The first ending wins: a cancel racing the client's own end (or the
+      // transport cleaning up) must notify once.
+      return Status::OK();
+    }
+    listener->finished_ = true;
+  }
+  // Outside the lock: the listener's OnFinish is application code, and it may
+  // call back into the listener (as Cancel() does).
+  return listener->OnFinish(std::move(status));
+}
+
+}  // namespace internal
+
+std::unique_lock<std::mutex> FlightDataListener::LockTransport() const {
+  return std::unique_lock<std::mutex>(transport_mutex_);
+}
+
+Status FlightDataListener::Cancel(Status status) {
+  // Take the state under the lock, then release it before calling out: a
+  // finished RPC has no state left (Clear() ran under this lock), and while the
+  // state is here the transport cannot clear it, so the RPC it points at is
+  // alive until Clear() takes the lock again.
+  internal::FlightDataListenerTransport* transport;
+  {
+    std::lock_guard<std::mutex> lock(transport_mutex_);
+    transport = transport_;
+  }
+  if (transport == nullptr) {
+    return Status::Invalid(
+        "no upload in flight to cancel: Cancel() must be called while the "
+        "upload's RPC is running");
+  }
+  transport->CancelUpload(std::move(status));
+  return Status::OK();
+}
 
 }  // namespace arrow::flight
