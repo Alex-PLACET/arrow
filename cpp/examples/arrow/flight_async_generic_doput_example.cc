@@ -34,7 +34,7 @@
 // Deriving from AsyncGenericFlightServerBase (arrow/flight/server_async.h)
 // selects the async generic gRPC transport.  On this path DoPut is not answered
 // by a handler method: the transport hands every decoded upload to the
-// FlightDataListener returned by FlightServerOptions::listener_factory, one
+// FlightDataListener the server class hands out (CreateDoPutListener), one
 // listener per RPC.  The callbacks are:
 //
 // * OnDescriptor(const FlightDescriptor&) - the descriptor of the upload;
@@ -78,13 +78,13 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> MakeInt64Batch(
 /// \brief The FlightDataListener serving one DoPut RPC: it records what it is
 /// handed as the upload streams in.  The counters are atomics because the
 /// callbacks run on gRPC threads.
-class CountingUploadListener : public flight::FlightDataListener {
+class CountingUploadListener : public flight::AsyncFlightDataListener {
  public:
-  arrow::Status OnDescriptor(const flight::FlightDescriptor& descriptor) override {
+  arrow::Future<> OnDescriptor(const flight::FlightDescriptor& descriptor) override {
     std::cout << "DoPut descriptor: " << descriptor.ToString() << std::endl;
     // Returning non-OK here would reject the upload; the client sees that
     // status when it closes the writer.
-    return arrow::Status::OK();
+    return arrow::Future<>::MakeFinished(arrow::Status::OK());
   }
 
   arrow::Status OnSchemaDecoded(std::shared_ptr<arrow::Schema> schema) override {
@@ -96,25 +96,25 @@ class CountingUploadListener : public flight::FlightDataListener {
     return arrow::Status::OK();
   }
 
-  arrow::Status OnNext(flight::FlightStreamChunk chunk) override {
+  arrow::Future<> OnNext(flight::FlightStreamChunk chunk) override {
     if (chunk.data != nullptr) {  // null for metadata-only messages
       num_batches_.fetch_add(1);
       num_rows_.fetch_add(chunk.data->num_rows());
     }
-    return arrow::Status::OK();
+    return arrow::Future<>::MakeFinished(arrow::Status::OK());
   }
 
   /// \brief The upload ended, whichever way: here is where a consumer commits.
   /// status == OK means the client ended it normally; anything else is why it
   /// did not complete.
-  arrow::Status OnFinish(arrow::Status status) override {
+  arrow::Future<> OnFinish(arrow::Status status) override {
     finished_ = true;
     if (status.ok()) {
       std::cout << "DoPut finished: the client ended the upload" << std::endl;
     } else {
       std::cout << "DoPut finished: " << status.ToString() << std::endl;
     }
-    return arrow::Status::OK();
+    return arrow::Future<>::MakeFinished(arrow::Status::OK());
   }
 
   int64_t num_batches() const { return num_batches_.load(); }
@@ -130,16 +130,15 @@ class CountingUploadListener : public flight::FlightDataListener {
 /// \brief The server.  Deriving from AsyncGenericFlightServerBase selects the
 /// async generic transport.  Uploads are served by the listener the server
 /// class itself hands out: the transport calls CreateDoPutListener() once per
-/// DoPut RPC, the server-class counterpart of DoGetAsync.  (The older
-/// FlightServerOptions::listener_factory still works as a fallback when this
-/// returns nullptr.)
+/// DoPut RPC, the server-class counterpart of DoGetAsync.  Returning nullptr
+/// refuses uploads (they answer UNIMPLEMENTED).
 ///
 /// One listener per RPC, as overlapping uploads require.  This demo has a
 /// single --demo client, so it keeps the listener it handed out in order to
 /// check it in main(), once the server has stopped.
 class UploadServer : public flight::AsyncGenericFlightServerBase {
  public:
-  std::shared_ptr<flight::FlightDataListener> CreateDoPutListener(
+  std::shared_ptr<flight::AsyncFlightDataListener> CreateDoPutListener(
       const flight::ServerCallContext& context) override {
     auto listener = std::make_shared<CountingUploadListener>();
     last_listener_ = listener;
@@ -215,8 +214,7 @@ int main(int argc, char** argv) {
   flight::FlightServerOptions options(*location);
   // UploadServer derives from AsyncGenericFlightServerBase: the server class
   // alone selects the async generic transport, so there is no option to set.
-  // Uploads come from the server's CreateDoPutListener() override; no
-  // options.listener_factory is set (that is the fallback path).
+  // Uploads come from the server's CreateDoPutListener() override.
   auto status = server.Init(options);
   if (!status.ok()) {
     std::cerr << status.ToString() << std::endl;

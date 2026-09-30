@@ -21,7 +21,6 @@
 
 #include <grpcpp/generic/callback_generic_service.h>
 
-#include "arrow/flight/flight_data_decoder.h"
 #include "arrow/flight/server_async.h"
 #include "arrow/flight/transport/grpc/grpc_server_internal.h"
 

@@ -99,9 +99,9 @@ class FlightDataMessageReader : public ipc::MessageReader {
 
 }  // namespace
 
-class FlightMessageDecoder::FlightMessageDecoderImpl {
+class AsyncFlightMessageDecoder::AsyncFlightMessageDecoderImpl {
  public:
-  FlightMessageDecoderImpl(std::shared_ptr<FlightDataListener> listener,
+  AsyncFlightMessageDecoderImpl(std::shared_ptr<AsyncFlightDataListener> listener,
                            ipc::IpcReadOptions options)
       : listener_(std::move(listener)),
         options_(std::move(options)),
@@ -110,9 +110,9 @@ class FlightMessageDecoder::FlightMessageDecoderImpl {
   /// \brief Consume a chunk of Flight data.
   /// \param data The Flight data to consume.
   /// \return Status indicating success or failure.
-  Status ConsumeData(internal::FlightData data) {
+  Future<> ConsumeData(internal::FlightData data) {
     if (data.descriptor) {
-      RETURN_NOT_OK(listener_->OnDescriptor(*data.descriptor));
+      return listener_->OnDescriptor(*data.descriptor);
     }
 
     if (!data.metadata) {
@@ -120,7 +120,7 @@ class FlightMessageDecoder::FlightMessageDecoderImpl {
       if (data.app_metadata && data.app_metadata->size() > 0) {
         FlightStreamChunk chunk;
         chunk.app_metadata = std::move(data.app_metadata);
-        RETURN_NOT_OK(listener_->OnNext(std::move(chunk)));
+        return listener_->OnNext(std::move(chunk));
       }
       return Status::OK();
     }
@@ -137,7 +137,7 @@ class FlightMessageDecoder::FlightMessageDecoderImpl {
           batch_reader_,
           ipc::RecordBatchStreamReader::Open(
               std::unique_ptr<ipc::MessageReader>(message_reader_), options_));
-      return listener_->OnSchemaDecoded(batch_reader_->schema());
+      return  listener_->OnSchemaDecoded(batch_reader_->schema());
     }
 
     message_reader_->Push(std::move(message), std::move(data.app_metadata));
@@ -147,9 +147,9 @@ class FlightMessageDecoder::FlightMessageDecoderImpl {
       if (app_metadata && app_metadata->size() > 0) {
         FlightStreamChunk chunk;
         chunk.app_metadata = std::move(app_metadata);
-        RETURN_NOT_OK(listener_->OnNext(std::move(chunk)));
+        return listener_->OnNext(std::move(chunk));
       }
-      return Status::OK();
+      return arrow::Future<>::MakeFinished(Status::OK());
     }
 
     std::shared_ptr<RecordBatch> batch;
@@ -166,7 +166,7 @@ class FlightMessageDecoder::FlightMessageDecoderImpl {
       FlightStreamChunk chunk{nullptr, std::move(app_metadata)};
       return listener_->OnNext(std::move(chunk));
     }
-    return Status::OK();
+    return arrow::Future<>::MakeFinished(Status::OK());
   }
 
   std::shared_ptr<Schema> schema() const {
@@ -174,7 +174,7 @@ class FlightMessageDecoder::FlightMessageDecoderImpl {
   }
 
  private:
-  std::shared_ptr<FlightDataListener> listener_;
+  std::shared_ptr<AsyncFlightDataListener> listener_;
   ipc::IpcReadOptions options_;
   // This is owned by the RecordBatchStreamReader once it's passed to it.
   // We want to keep a reference to it so we can extract the app_metadata.
@@ -182,35 +182,35 @@ class FlightMessageDecoder::FlightMessageDecoderImpl {
   std::shared_ptr<ipc::RecordBatchStreamReader> batch_reader_;
 };
 
-FlightMessageDecoder::FlightMessageDecoder(std::shared_ptr<FlightDataListener> listener,
+AsyncFlightMessageDecoder::AsyncFlightMessageDecoder(std::shared_ptr<AsyncFlightDataListener> listener,
                                            ipc::IpcReadOptions options)
-    : impl_(std::make_unique<FlightMessageDecoderImpl>(std::move(listener),
+    : impl_(std::make_unique<AsyncFlightMessageDecoderImpl>(std::move(listener),
                                                        std::move(options))) {}
 
-FlightMessageDecoder::~FlightMessageDecoder() = default;
+AsyncFlightMessageDecoder::~AsyncFlightMessageDecoder() = default;
 
-Status FlightMessageDecoder::Consume(std::shared_ptr<Buffer> buffer) {
+Future<> AsyncFlightMessageDecoder::Consume(std::shared_ptr<Buffer> buffer) {
   ARROW_ASSIGN_OR_RAISE(auto data, internal::DeserializeFlightData(buffer));
   return impl_->ConsumeData(std::move(data));
 }
 
-Status FlightMessageDecoder::Consume(internal::FlightData data) {
+Future<> AsyncFlightMessageDecoder::Consume(internal::FlightData data) {
   return impl_->ConsumeData(std::move(data));
 }
 
-std::shared_ptr<Schema> FlightMessageDecoder::schema() const { return impl_->schema(); }
+std::shared_ptr<Schema> AsyncFlightMessageDecoder::schema() const { return impl_->schema(); }
 
 // --- FlightDataListener: transport state and the terminal callbacks ---
 
-FlightDataListener::FlightDataListener() = default;
-FlightDataListener::~FlightDataListener() = default;
+AsyncFlightDataListener::AsyncFlightDataListener() = default;
+AsyncFlightDataListener::~AsyncFlightDataListener() = default;
 
 namespace internal {
 
 FlightDataListenerTransport::~FlightDataListenerTransport() = default;
 
 void FlightDataListenerTransport::Install(
-    const std::shared_ptr<FlightDataListener>& listener,
+    const std::shared_ptr<AsyncFlightDataListener>& listener,
     FlightDataListenerTransport* transport) {
   if (listener == nullptr) return;
   std::lock_guard<std::mutex> lock(listener->transport_mutex_);
@@ -218,14 +218,14 @@ void FlightDataListenerTransport::Install(
 }
 
 void FlightDataListenerTransport::Clear(
-    const std::shared_ptr<FlightDataListener>& listener) {
+    const std::shared_ptr<AsyncFlightDataListener>& listener) {
   if (listener == nullptr) return;
   std::lock_guard<std::mutex> lock(listener->transport_mutex_);
   listener->transport_ = nullptr;
 }
 
 Status FlightDataListenerTransport::ReportFinish(
-    const std::shared_ptr<FlightDataListener>& listener, Status status) {
+    const std::shared_ptr<AsyncFlightDataListener>& listener, Status status) {
   if (listener == nullptr) return Status::OK();
   // First ending wins.  Atomic and lock-free: Cancel() holds the listener's
   // transport lock across its call into the transport, and the ending it
@@ -236,24 +236,24 @@ Status FlightDataListenerTransport::ReportFinish(
   }
   // OnFinish is application code; it may call back into the listener (as
   // Cancel() does), which is why nothing is held here.
-  return listener->OnFinish(std::move(status));
+  return listener->OnFinish(std::move(status)).status();
 }
 
 }  // namespace internal
 
-Status FlightDataListener::Cancel(Status status) {
+Future<> AsyncFlightDataListener::Cancel(Status status) {
   // Hold the lock across the call: Clear() takes it as the RPC finishes, so
   // while it is held the transport state cannot be cleared and the RPC the
   // pointer names is alive.  CancelUpload must therefore not re-enter this
   // listener (it only finishes the RPC); that is the contract of the hook.
   std::lock_guard<std::mutex> lock(transport_mutex_);
   if (transport_ == nullptr) {
-    return Status::Invalid(
+    return arrow::Future<>::MakeFinished(Status::Invalid(
         "no upload in flight to cancel: Cancel() must be called while the "
-        "upload's RPC is running");
+        "upload's RPC is running"));
   }
   transport_->CancelUpload(std::move(status));
-  return Status::OK();
+  return arrow::Future<>::MakeFinished(Status::OK());
 }
 
 }  // namespace arrow::flight

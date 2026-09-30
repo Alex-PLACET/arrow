@@ -823,7 +823,7 @@ class DoGetAsyncCall : public ::grpc::ClientReadReactor<pb::FlightData>,
   /// The demand is cleared before the user callback runs: the request is
   /// satisfied at OnNext() entry, so a reentrant RequestNext() from inside the
   /// callback must be accepted.
-  class ChunkForwarder : public FlightDataListener {
+  class ChunkForwarder : public AsyncFlightDataListener {
    public:
     explicit ChunkForwarder(DoGetAsyncCall* call) : call_(call) {}
 
@@ -832,7 +832,7 @@ class DoGetAsyncCall : public ::grpc::ClientReadReactor<pb::FlightData>,
       return Status::OK();
     }
 
-    Status OnNext(FlightStreamChunk chunk) override {
+    Future<> OnNext(FlightStreamChunk chunk) override {
       {
         std::lock_guard<std::mutex> guard(call_->mutex_);
         call_->request_pending_ = false;
@@ -840,7 +840,7 @@ class DoGetAsyncCall : public ::grpc::ClientReadReactor<pb::FlightData>,
         call_->produced_chunk_ = true;
       }
       call_->listener->OnNext(std::move(chunk));
-      return Status::OK();
+      return Future<>::MakeFinished(Status::OK());
     }
 
    private:
@@ -856,7 +856,7 @@ class DoGetAsyncCall : public ::grpc::ClientReadReactor<pb::FlightData>,
   /// an internal::FlightData directly (as ReadPayload does), so reads are
   /// zero-copy.
   internal::FlightData flight_data;
-  std::unique_ptr<FlightMessageDecoder> decoder;
+  std::unique_ptr<AsyncFlightMessageDecoder> decoder;
 
   /// Client-side (decode or user) error to report with the terminal status.
   /// Only touched on the thread of the read callback.
@@ -892,7 +892,7 @@ class DoGetAsyncCall : public ::grpc::ClientReadReactor<pb::FlightData>,
       : rpc(options),
         listener(std::move(listener)),
         garbage_bin_(std::move(garbage_bin)),
-        decoder(std::make_unique<FlightMessageDecoder>(
+        decoder(std::make_unique<AsyncFlightMessageDecoder>(
             std::make_shared<ChunkForwarder>(this), options.read_options)) {
     // Mirror ClientRpc exactly, so the two agree on when the call expires; this
     // instant is computed after gRPC's, so the hold is only ever dropped once
@@ -994,45 +994,47 @@ class DoGetAsyncCall : public ::grpc::ClientReadReactor<pb::FlightData>,
     produced_chunk_ = false;
     // Decode with the existing push decoder; it calls back into our forwarder,
     // which delivers the chunk (if any) to the user listener.
-    auto status = decoder->Consume(std::move(flight_data));
-    if (!status.ok()) {
-      // Report the failure through OnDone() rather than here, so that OnFinish()
-      // stays the single terminal notification; cancel so that OnDone() follows.
+    auto future = decoder->Consume(std::move(flight_data));
+    future.AddCallback([this](arrow::Status status) {
+      if (!status.ok()) {
+        // Report the failure through OnDone() rather than here, so that OnFinish()
+        // stays the single terminal notification; cancel so that OnDone() follows.
+        {
+          std::lock_guard<std::mutex> guard(mutex_);
+          app_reads_done_ = true;
+          // This read is done and no further one will start, so the hold may be
+          // dropped: leaving read_pending_ set here would keep gRPC from ever
+          // delivering OnDone().
+          read_pending_ = false;
+          if (client_status.ok()) {
+            client_status = std::move(status);
+          }
+        }
+        rpc.context.TryCancel();
+        MaybeReleaseHold();
+        return;
+      }
+      if (produced_chunk_) {
+        // The chunk satisfied the pending request (a reentrant RequestNext() from
+        // the user callback may already have armed the next read); do not read
+        // ahead.
+        MaybeReleaseHold();
+        return;
+      }
+      // Nothing was delivered (schema or dictionary message): keep reading for the
+      // pending request.  This is the one-message read-ahead.  As in RequestNext(),
+      // the arm is under the lock that MaybeReleaseHold() drops the hold under.
       {
         std::lock_guard<std::mutex> guard(mutex_);
-        app_reads_done_ = true;
-        // This read is done and no further one will start, so the hold may be
-        // dropped: leaving read_pending_ set here would keep gRPC from ever
-        // delivering OnDone().
-        read_pending_ = false;
-        if (client_status.ok()) {
-          client_status = std::move(status);
+        if (request_pending_ && !app_reads_done_) {
+          read_pending_ = true;
+          StartRead(reinterpret_cast<pb::FlightData*>(&flight_data));
+        } else {
+          read_pending_ = false;
         }
       }
-      rpc.context.TryCancel();
       MaybeReleaseHold();
-      return;
-    }
-    if (produced_chunk_) {
-      // The chunk satisfied the pending request (a reentrant RequestNext() from
-      // the user callback may already have armed the next read); do not read
-      // ahead.
-      MaybeReleaseHold();
-      return;
-    }
-    // Nothing was delivered (schema or dictionary message): keep reading for the
-    // pending request.  This is the one-message read-ahead.  As in RequestNext(),
-    // the arm is under the lock that MaybeReleaseHold() drops the hold under.
-    {
-      std::lock_guard<std::mutex> guard(mutex_);
-      if (request_pending_ && !app_reads_done_) {
-        read_pending_ = true;
-        StartRead(reinterpret_cast<pb::FlightData*>(&flight_data));
-      } else {
-        read_pending_ = false;
-      }
-    }
-    MaybeReleaseHold();
+    });
   }
 
   /// Drop the hold taken by PrepareCall() once it cannot protect anything any

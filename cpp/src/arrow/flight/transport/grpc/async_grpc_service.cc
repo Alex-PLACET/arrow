@@ -362,7 +362,7 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   /// deleted in OnDone, before the context is destroyed).
   /// \param `listener` is the per-RPC listener that will receive the uploaded data.
   DoPutReactor(AsyncCallContext flight_context,
-               std::shared_ptr<FlightDataListener> listener)
+               std::shared_ptr<AsyncFlightDataListener> listener)
       : flight_context_(std::move(flight_context)),
         listener_(std::move(listener)),
         decoder_(listener_) {
@@ -431,15 +431,15 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
 
     // Feed the Arrow buffer to the FlightMessageDecoder. This will trigger the
     // appropriate callbacks on the listener (OnSchemaDecoded / OnNext).
-    const Status decode_status = decoder_.Consume(std::move(arrow_buf));
-    if (!decode_status.ok()) {
-      // The listener's status is the transport error rejecting the upload.
-      FinishUpload(decode_status);
-      return;
-    }
-
-    // Read next FlightData.
-    StartRead(&request_buf_);
+    Future<> decode_status = decoder_.Consume(std::move(arrow_buf));
+    decode_status.AddCallback([this](arrow::Status status){
+      if (!status.ok()) {
+        // The listener's status is the transport error rejecting the upload.
+        FinishUpload(status);
+      }
+      // Read next FlightData.
+      StartRead(&request_buf_);
+    });
   }
 
   /// \brief Called when a write to the client has completed.
@@ -507,8 +507,8 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   }
 
   GrpcServerCallContext<::grpc::CallbackServerContext> flight_context_;
-  std::shared_ptr<FlightDataListener> listener_;
-  FlightMessageDecoder decoder_;
+  std::shared_ptr<AsyncFlightDataListener> listener_;
+  AsyncFlightMessageDecoder decoder_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer write_buf_;
   /// Set by the first ending: gRPC's Finish runs once, and so does each
@@ -1270,7 +1270,7 @@ AsyncGenericFlightService::AsyncGenericFlightService(
   if (method == kDoPutMethod) {
     // DoPut needs a listener to hand the incoming batches to; a server class
     // that returns none (the default) refuses uploads.
-    std::shared_ptr<FlightDataListener> listener =
+    std::shared_ptr<AsyncFlightDataListener> listener =
         base_->CreateDoPutListener(flight_context);
     if (!listener) {
       return new Unimplemented(

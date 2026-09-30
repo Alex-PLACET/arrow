@@ -138,12 +138,12 @@ class ResolvedStream : public AsyncFlightDataStream {
 class TestServerAsyncAdapter : public AsyncGenericFlightServerBase {
  public:
   explicit TestServerAsyncAdapter(FlightServerBase* inner,
-                                  std::shared_ptr<FlightDataListener> listener = nullptr)
+                                  std::shared_ptr<AsyncFlightDataListener> listener = nullptr)
       : inner_(inner), listener_(std::move(listener)) {}
 
   /// \brief Hands out the listener the test installed, if any; nullptr (the
   /// default) refuses uploads, which is the base class behavior.
-  std::shared_ptr<FlightDataListener> CreateDoPutListener(
+  std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
       const ServerCallContext& context) override {
     return listener_;
   }
@@ -382,7 +382,7 @@ class TestFlightServer : public FlightServerBase {
 // Records what the decoder hands to the application: the schema, every chunk,
 // and whether the consumer accepted it. OnNext returns whatever status the
 // test configured, so the upload's error path is reachable from here.
-class RecordingListener : public FlightDataListener {
+class RecordingListener : public AsyncFlightDataListener {
  public:
   arrow::Status OnSchemaDecoded(std::shared_ptr<arrow::Schema> schema) override {
     ++schema_count_;
@@ -445,11 +445,11 @@ class RecordingListener : public FlightDataListener {
 // the tests can assert on an upload cancelled from the server side.
 class FinishRecordingListener : public RecordingListener {
  public:
-  arrow::Status OnFinish(Status status) override {
+  arrow::Future<> OnFinish(Status status) override {
     std::lock_guard<std::mutex> lock(mutex_);
     finish_count_++;
     finish_status_ = std::move(status);
-    return arrow::Status::OK();
+    return arrow::Future<>::MakeFinished(arrow::Status::OK());
   }
 
   /// Cancel from whatever thread the test drives; records what Cancel() said.
@@ -493,7 +493,7 @@ class FinishRecordingListener : public RecordingListener {
 // flight).
 class TestUploadServerAsyncAdapter : public AsyncGenericFlightServerBase {
  public:
-  std::shared_ptr<FlightDataListener> CreateDoPutListener(
+  std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
       const ServerCallContext& context) override {
     auto listener = std::make_shared<FinishRecordingListener>();
     std::lock_guard<std::mutex> lock(mutex_);

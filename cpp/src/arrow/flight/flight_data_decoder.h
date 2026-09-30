@@ -33,7 +33,7 @@ namespace internal {
 struct FlightData;
 }  // namespace internal
 
-class FlightDataListener;
+class AsyncFlightDataListener;
 
 namespace internal {
 
@@ -58,18 +58,18 @@ class ARROW_FLIGHT_EXPORT FlightDataListenerTransport {
   /// Transport-only.  `transport` is the transport's own RPC state (for gRPC's
   /// callback API, the reactor itself); it stays valid until Clear(), and the
   /// listener only reaches it under the lock Clear() takes.
-  static void Install(const std::shared_ptr<FlightDataListener>& listener,
+  static void Install(const std::shared_ptr<AsyncFlightDataListener>& listener,
                       FlightDataListenerTransport* transport);
 
   /// \brief Clear the installed transport.  Transport-only; called as the RPC
   /// finishes, before the transport object dies, so a concurrent Cancel() can
   /// never reach a dead RPC.
-  static void Clear(const std::shared_ptr<FlightDataListener>& listener);
+  static void Clear(const std::shared_ptr<AsyncFlightDataListener>& listener);
 
   /// \brief Report the upload's terminal status to the listener, once.
   /// Transport-only.  Later calls are dropped, so every ending can report
   /// without coordinating with the others.
-  static Status ReportFinish(const std::shared_ptr<FlightDataListener>& listener,
+  static Status ReportFinish(const std::shared_ptr<AsyncFlightDataListener>& listener,
                              Status status);
 };
 
@@ -78,22 +78,22 @@ class ARROW_FLIGHT_EXPORT FlightDataListenerTransport {
 /// \brief A general listener class to receive events from FlightMessageDecoder
 ///
 /// User must implement callback methods for interested events.
-class ARROW_FLIGHT_EXPORT FlightDataListener : public ipc::Listener {
+class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
  public:
-  FlightDataListener();
-  ~FlightDataListener() override;
+  AsyncFlightDataListener();
+  ~AsyncFlightDataListener() override;
 
   /// \brief Called for each decoded FlightStreamChunk.
   ///
   /// chunk.data is the decoded RecordBatch, or nullptr for metadata-only
   /// messages.
-  virtual Status OnNext(FlightStreamChunk chunk) = 0;
+  virtual Future<> OnNext(FlightStreamChunk chunk) = 0;
 
   /// \brief Called when the descriptor of an upload is decoded.
   ///
   /// Fired before any schema or data of that upload, so the listener knows
   /// which upload it is being handed. A non-OK status rejects the upload.
-  virtual Status OnDescriptor(const FlightDescriptor& descriptor) { return Status::OK(); }
+  virtual Future<> OnDescriptor(const FlightDescriptor& descriptor) { return Future<>::MakeFinished(); }
 
   /// \brief Called once, when the upload ends, whichever way it ends.
   ///
@@ -103,7 +103,7 @@ class ARROW_FLIGHT_EXPORT FlightDataListener : public ipc::Listener {
   /// away, the transport failed, or the upload was rejected).  This is where a
   /// consumer commits or discards what it accumulated; the default does
   /// nothing, since a stream that only counts chunks needs no completion.
-  virtual Status OnFinish(Status status) { return Status::OK(); }
+  virtual Future<> OnFinish(Status status) { return Future<>::MakeFinished(); }
 
   /// \brief Cancel the upload with `status`, from any thread.
   ///
@@ -114,7 +114,7 @@ class ARROW_FLIGHT_EXPORT FlightDataListener : public ipc::Listener {
   /// longer in flight this reports Invalid instead of reaching a finished RPC.
   /// \return OK when the cancel was handed to the transport, or Invalid when
   /// there is no upload in flight.
-  Status Cancel(Status status);
+  Future<> Cancel(Status status);
 
  private:
   /// The transport installs and clears the state through
@@ -136,12 +136,12 @@ class ARROW_FLIGHT_EXPORT FlightDataListener : public ipc::Listener {
 ///
 /// This class decodes Apache Arrow Flight data format from arrow::Buffer
 /// and fires events on the provided FlightDataListener.
-class ARROW_FLIGHT_EXPORT FlightMessageDecoder {
+class ARROW_FLIGHT_EXPORT AsyncFlightMessageDecoder {
  public:
-  explicit FlightMessageDecoder(
-      std::shared_ptr<FlightDataListener> listener,
+  explicit AsyncFlightMessageDecoder(
+      std::shared_ptr<AsyncFlightDataListener> listener,
       ipc::IpcReadOptions options = ipc::IpcReadOptions::Defaults());
-  ~FlightMessageDecoder();
+  ~AsyncFlightMessageDecoder();
 
   /// \brief Decode one FlightData message directly from a buffer.
   ///
@@ -152,7 +152,7 @@ class ARROW_FLIGHT_EXPORT FlightMessageDecoder {
   /// \param[in] buffer a raw buffer directly from the transport. Example
   /// the arrow::Buffer extracted from the grpc::ByteBuffer from the gRPC transport.
   /// \return Status
-  Status Consume(std::shared_ptr<Buffer> buffer);
+  Future<> Consume(std::shared_ptr<Buffer> buffer);
 
   /// \brief Decode one FlightData message already deserialized by the transport.
   ///
@@ -160,7 +160,7 @@ class ARROW_FLIGHT_EXPORT FlightMessageDecoder {
   /// that hand out an internal::FlightData directly (the gRPC client reads FlightData
   /// straight into internal::FlightData).  This overload is internal to Arrow;
   /// applications should use Consume(Buffer).
-  Status Consume(internal::FlightData data);
+  Future<> Consume(internal::FlightData data);
 
   /// \brief The decoded schema.
   ///
@@ -169,8 +169,8 @@ class ARROW_FLIGHT_EXPORT FlightMessageDecoder {
   std::shared_ptr<Schema> schema() const;
 
  private:
-  class FlightMessageDecoderImpl;
-  std::unique_ptr<FlightMessageDecoderImpl> impl_;
+  class AsyncFlightMessageDecoderImpl;
+  std::unique_ptr<AsyncFlightMessageDecoderImpl> impl_;
 };
 
 }  // namespace arrow::flight

@@ -242,17 +242,17 @@ class DelayedAsyncStream : public flight::AsyncFlightDataStream {
 /// RPC answers UNIMPLEMENTED.
 class ExampleServer : public flight::AsyncGenericFlightServerBase {
  public:
-  arrow::Future<std::unique_ptr<flight::AsyncFlightDataStream>> DoGetAsync(
+  arrow::Future<std::shared_ptr<flight::AsyncFlightDataStream>> DoGetAsync(
       const flight::ServerCallContext& context, const flight::Ticket& request) override {
     std::cout << "DoGet: ticket=" << request.ticket << std::endl;
     auto schema = arrow::schema({arrow::field("value", arrow::int64())});
     auto reader = std::make_shared<BatchReader>(schema, FLAGS_batches);
-    std::unique_ptr<flight::AsyncFlightDataStream> stream =
-        std::make_unique<DelayedAsyncStream>(
+    std::shared_ptr<flight::AsyncFlightDataStream> stream =
+        std::make_shared<DelayedAsyncStream>(
             std::make_unique<flight::RecordBatchStream>(reader), FLAGS_batch_delay_ms);
     // The stream is ready here, but its payloads are not: the transport will
     // wait on the futures NextAsync() returns.
-    return arrow::Future<std::unique_ptr<flight::AsyncFlightDataStream>>::MakeFinished(
+    return arrow::Future<std::shared_ptr<flight::AsyncFlightDataStream>>::MakeFinished(
         std::move(stream));
   }
 };

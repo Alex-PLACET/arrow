@@ -138,7 +138,7 @@ class ARROW_FLIGHT_EXPORT AsyncGenericFlightServerBase {
   /// \return A shared pointer to the FlightDataListener handling the upload, or
   /// nullptr to refuse the upload.
   
-  virtual std::shared_ptr<FlightDataListener> CreateDoPutListener(
+  virtual std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
       const ServerCallContext& context);
 
   /// \brief Handle the handshake protocol with the client.
