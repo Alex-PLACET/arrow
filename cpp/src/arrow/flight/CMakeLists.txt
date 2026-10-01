@@ -191,6 +191,12 @@ set(ARROW_FLIGHT_SRCS
     transport_server_internal.cc
     # Bundle the gRPC impl with libarrow_flight
     transport/grpc/async_grpc_service.cc
+    transport/grpc/async_grpc_do_get.cc
+    transport/grpc/async_grpc_do_put.cc
+    transport/grpc/async_grpc_exchange.cc
+    transport/grpc/async_grpc_handshake.cc
+    transport/grpc/async_grpc_streaming.cc
+    transport/grpc/async_grpc_unary.cc
     transport/grpc/grpc_client.cc
     transport/grpc/grpc_server.cc
     transport/grpc/grpc_server_internal.cc

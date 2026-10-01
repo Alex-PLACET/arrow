@@ -1,0 +1,148 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#include "arrow/flight/transport/grpc/async_grpc_service_internal.h"
+
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <utility>
+
+namespace arrow::flight::transport::grpc::detail {
+
+namespace {
+
+template <typename T, typename PbT>
+class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
+ public:
+  using HandlerFn = std::function<arrow::Future<std::shared_ptr<T>>(
+      const ServerCallContext&, const FlightDescriptor&)>;
+
+  UnaryReactor(AsyncCallContext flight_context, HandlerFn handler)
+      : flight_context_(std::move(flight_context)), handler_(std::move(handler)) {
+    StartRead(&request_buf_);
+  }
+
+  void OnReadDone(bool ok) override {
+    if (!ok) {
+      FinishOnce(MakeFlightError(FlightStatusCode::Internal, "Failed to read request"));
+      return;
+    }
+    const auto descriptor = ParseProtoRequest<pb::FlightDescriptor, FlightDescriptor>(
+        request_buf_, "FlightDescriptor");
+    if (!descriptor.ok()) {
+      FinishOnce(descriptor.status());
+      return;
+    }
+    Hold();
+    arrow::Future<std::shared_ptr<T>> future = handler_(flight_context_, *descriptor);
+    future.AddCallback(
+        [this, future](const arrow::Result<std::shared_ptr<T>>& result) mutable {
+          if (finished_) {
+            ReleaseHold();
+            return;
+          }
+          if (!result.ok()) {
+            FinishOnce(result.status());
+            ReleaseHold();
+            return;
+          }
+          PbT response;
+          const auto status = SerializeOrNotFound(*future.MoveResult(), &response);
+          if (!status.ok()) {
+            FinishOnce(status);
+            ReleaseHold();
+            return;
+          }
+          response_buf_ = MakeWriteBuffer(response);
+          StartWrite(&response_buf_);
+          ReleaseHold();
+        });
+  }
+
+  void OnWriteDone(bool ok) override {
+    if (finished_) {
+      return;
+    }
+    FinishOnce(
+        ok ? arrow::Status::OK()
+           : MakeFlightError(FlightStatusCode::Internal, "Failed to write response"));
+  }
+
+  void OnCancel() override { FinishOnce(arrow::Status::Cancelled()); }
+
+  void OnDone() override { ReleaseHold(); }
+
+ private:
+  void FinishOnce(Status status) {
+    bool expected = false;
+    if (finished_.compare_exchange_strong(expected, true)) {
+      Finish(flight_context_.FinishRequest(status));
+    }
+  }
+
+  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
+  void ReleaseHold() {
+    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete this;
+    }
+  }
+
+  AsyncCallContext flight_context_;
+  HandlerFn handler_;
+  ::grpc::ByteBuffer request_buf_;
+  ::grpc::ByteBuffer response_buf_;
+  std::atomic<bool> finished_{false};
+  std::atomic<int> refs_{1};
+};
+
+template <typename T, typename PbT, typename HandlerFn>
+::grpc::ServerGenericBidiReactor* MakeUnaryReactor(AsyncCallContext flight_context,
+                                                   HandlerFn handler) {
+  return new UnaryReactor<T, PbT>(std::move(flight_context), std::move(handler));
+}
+
+}  // namespace
+
+::grpc::ServerGenericBidiReactor* MakeGetFlightInfoReactor(
+    AsyncCallContext flight_context, AsyncGenericFlightServerBase* base) {
+  return MakeUnaryReactor<FlightInfo, pb::FlightInfo>(
+      std::move(flight_context), [base](const ServerCallContext& context,
+                                        const FlightDescriptor& descriptor) {
+        return base->GetFlightInfoAsync(context, descriptor);
+      });
+}
+
+::grpc::ServerGenericBidiReactor* MakeGetSchemaReactor(
+    AsyncCallContext flight_context, AsyncGenericFlightServerBase* base) {
+  return MakeUnaryReactor<SchemaResult, pb::SchemaResult>(
+      std::move(flight_context), [base](const ServerCallContext& context,
+                                        const FlightDescriptor& descriptor) {
+        return base->GetSchemaAsync(context, descriptor);
+      });
+}
+
+::grpc::ServerGenericBidiReactor* MakePollFlightInfoReactor(
+    AsyncCallContext flight_context, AsyncGenericFlightServerBase* base) {
+  return MakeUnaryReactor<PollInfo, pb::PollInfo>(
+      std::move(flight_context), [base](const ServerCallContext& context,
+                                        const FlightDescriptor& descriptor) {
+        return base->PollFlightInfoAsync(context, descriptor);
+      });
+}
+
+}  // namespace arrow::flight::transport::grpc::detail
