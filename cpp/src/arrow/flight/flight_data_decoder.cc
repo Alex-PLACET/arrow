@@ -65,7 +65,7 @@ class FlightDataMessageReader : public ipc::MessageReader {
 
   /// Take the next queued message, if any, and return it. The app metadata of
   /// the message taken is stored internally and can be retrieved with
-  /// ReadAppMetadata(). Returns nullptr if no messages are queued.
+  /// ReadAppMetadata().
   /// \return The next queued message, or nullptr if no messages are queued.
   ::arrow::Result<std::unique_ptr<ipc::Message>> ReadNextMessage() override {
     if (queue_.empty()) {
@@ -110,21 +110,21 @@ class AsyncFlightMessageDecoder::AsyncFlightMessageDecoderImpl {
   /// \brief Consume a chunk of Flight data.
   /// \param data The Flight data to consume.
   /// \return A future carrying the listener's status for this message: a
-  /// non-OK result rejects the upload.  The descriptor of an upload is
-  /// reported before the rest of its first message is decoded.
+  /// non-OK result rejects the upload.
+  /// The descriptor of an upload is eported before the rest of its first message is
+  /// decoded.
   Future<> ConsumeData(internal::FlightData data) {
     if (!data.descriptor) {
       return ConsumeDataAfterDescriptor(std::move(data));
+    } else {
+      // The descriptor of an upload arrives with the first message of the
+      // upload, which also carries the schema: report the descriptor first, and
+      // decode the rest of that message once the listener's future resolves.
+      return listener_->OnDescriptor(*data.descriptor)
+          .Then([this, data = std::move(data)]() mutable {
+            return ConsumeDataAfterDescriptor(std::move(data));
+          });
     }
-    // The descriptor of an upload arrives with the first message of the
-    // upload, which also carries the schema: report the descriptor first, and
-    // decode the rest of that message once the listener's future resolves.  A
-    // bare return here would drop the schema (the next read would then fail
-    // to decode).
-    return listener_->OnDescriptor(*data.descriptor)
-        .Then([this, data = std::move(data)]() mutable {
-          return ConsumeDataAfterDescriptor(std::move(data));
-        });
   }
 
   std::shared_ptr<Schema> schema() const {
@@ -134,6 +134,12 @@ class AsyncFlightMessageDecoder::AsyncFlightMessageDecoderImpl {
  private:
   /// \brief Decode a FlightData message whose descriptor (if any) was already
   /// reported to the listener.
+  /// \param data The Flight data to consume after the descriptor has been reported.
+  /// \return A future carrying the listener's status for this message: a non-OK result
+  /// rejects the upload.
+  /// \note The descriptor of an upload is assumed to have been reported
+  /// before calling this method.
+  ///
   Future<> ConsumeDataAfterDescriptor(internal::FlightData data) {
     if (!data.metadata) {
       // Metadata-only message: no IPC content, just Flight app_metadata.
@@ -150,8 +156,6 @@ class AsyncFlightMessageDecoder::AsyncFlightMessageDecoderImpl {
     if (!batch_reader_) {
       // Initialize RecordBatchStreamReader and read the first IPC message.
       // It must be a schema.
-      // RecordBatchStreamReader requiring unique_ptr is slightly awkward
-      // since we want to keep a reference to the message reader.
       message_reader_->Push(std::move(message), std::move(data.app_metadata));
       ARROW_ASSIGN_OR_RAISE(
           batch_reader_,
@@ -229,24 +233,29 @@ FlightDataListenerTransport::~FlightDataListenerTransport() = default;
 void FlightDataListenerTransport::Install(
     const std::shared_ptr<AsyncFlightDataListener>& listener,
     FlightDataListenerTransport* transport) {
-  if (listener == nullptr) return;
+  if (listener == nullptr) {
+    return;
+  }
   std::lock_guard<std::mutex> lock(listener->transport_mutex_);
   listener->transport_ = transport;
 }
 
 void FlightDataListenerTransport::Clear(
     const std::shared_ptr<AsyncFlightDataListener>& listener) {
-  if (listener == nullptr) return;
+  if (listener == nullptr) {
+    return;
+  }
   std::lock_guard<std::mutex> lock(listener->transport_mutex_);
   listener->transport_ = nullptr;
 }
 
 Status FlightDataListenerTransport::ReportFinish(
     const std::shared_ptr<AsyncFlightDataListener>& listener, Status status) {
-  if (listener == nullptr) return Status::OK();
-  // First ending wins.  Atomic and lock-free: Cancel() holds the listener's
-  // transport lock across its call into the transport, and the ending it
-  // triggers reports from inside that call.
+  if (listener == nullptr) {
+    return Status::OK();
+  }
+  // Cancel() holds the listener's transport lock across its call into the transport, and
+  // the ending it triggers reports from inside that call.
   bool expected = false;
   if (!listener->finished_.compare_exchange_strong(expected, true)) {
     return Status::OK();
@@ -259,10 +268,6 @@ Status FlightDataListenerTransport::ReportFinish(
 }  // namespace internal
 
 Future<> AsyncFlightDataListener::Cancel(Status status) {
-  // Hold the lock across the call: Clear() takes it as the RPC finishes, so
-  // while it is held the transport state cannot be cleared and the RPC the
-  // pointer names is alive.  CancelUpload must therefore not re-enter this
-  // listener (it only finishes the RPC); that is the contract of the hook.
   std::lock_guard<std::mutex> lock(transport_mutex_);
   if (transport_ == nullptr) {
     return arrow::Future<>::MakeFinished(Status::Invalid(
