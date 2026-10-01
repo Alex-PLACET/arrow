@@ -28,6 +28,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -109,7 +110,7 @@ struct WorkerState {
   std::condition_variable ready;
   bool closed = false;
   /// The payload the transport is waiting for, if one was requested.
-  arrow::Future<flight::FlightPayload> pending;
+  arrow::Future<std::optional<flight::FlightPayload>> pending;
   bool has_pending = false;
   std::thread thread;
 };
@@ -134,7 +135,7 @@ void RunWorker(std::shared_ptr<WorkerState> state) {
     }
     // Take the request: after this, only this thread resolves the future.
     state->has_pending = false;
-    arrow::Future<flight::FlightPayload> future = state->pending;
+    arrow::Future<std::optional<flight::FlightPayload>> future = state->pending;
     lock.unlock();
     std::this_thread::sleep_for(std::chrono::milliseconds(state->delay_ms));
     lock.lock();
@@ -145,7 +146,15 @@ void RunWorker(std::shared_ptr<WorkerState> state) {
     if (cancelled) {
       future.MarkFinished(arrow::Status::Cancelled());
     } else {
-      future.MarkFinished(state->stream->Next());
+      auto payload = state->stream->Next();
+      if (!payload.ok()) {
+        future.MarkFinished(payload.status());
+      } else if (payload->ipc_message.metadata == nullptr) {
+        // End of stream: the async interface reports it as a nullopt.
+        future.MarkFinished(std::nullopt);
+      } else {
+        future.MarkFinished(std::move(*payload));
+      }
     }
     lock.lock();
   }
@@ -193,9 +202,9 @@ class DelayedAsyncStream : public flight::AsyncFlightDataStream {
         state_->stream->GetSchemaPayload());
   }
 
-  arrow::Future<flight::FlightPayload> NextAsync() override {
-    arrow::Future<flight::FlightPayload> future =
-        arrow::Future<flight::FlightPayload>::Make();
+  arrow::Future<std::optional<flight::FlightPayload>> NextAsync() override {
+    arrow::Future<std::optional<flight::FlightPayload>> future =
+        arrow::Future<std::optional<flight::FlightPayload>>::Make();
     {
       std::lock_guard<std::mutex> lock(state_->mutex);
       if (state_->closed) {
@@ -219,7 +228,7 @@ class DelayedAsyncStream : public flight::AsyncFlightDataStream {
   /// Does not join: called by the transport, whose threads must not block on
   /// the worker's sleep.
   void Stop() {
-    arrow::Future<flight::FlightPayload> pending;
+    arrow::Future<std::optional<flight::FlightPayload>> pending;
     {
       std::lock_guard<std::mutex> lock(state_->mutex);
       state_->closed = true;
