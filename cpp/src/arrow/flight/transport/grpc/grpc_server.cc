@@ -484,8 +484,7 @@ class GrpcServerTransport : public internal::ServerTransport {
       async_helper_ = std::make_shared<AsyncHelper>(
           /*auth_handler=*/nullptr, options.middleware, std::move(validate_token));
       async_service_ = std::make_unique<AsyncGenericFlightService>(
-          async_base_, memory_manager_, async_helper_,
-          std::move(handshake));
+          async_base_, async_helper_, std::move(handshake));
     } else {
       grpc_service_.reset(
           new GrpcServiceHandler(options.auth_handler, options.middleware, this));

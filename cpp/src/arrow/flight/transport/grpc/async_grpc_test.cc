@@ -722,19 +722,12 @@ class RejectingServerMiddlewareFactory : public ServerMiddlewareFactory {
 };
 
 // The gRPC transport builds the generic service with the shared context
-// helper (which runs middleware and auth) and the server's memory manager
-// (DoExchange's reader views bodies with it). Tests that register the service
-// on a hand-built grpc::ServerBuilder must pass both explicitly.
+// helper (which runs middleware and auth). Tests that register the service
+// on a hand-built grpc::ServerBuilder must pass it explicitly.
 std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>>
 MakeAsyncHelper() {
   return std::make_shared<GrpcServerCallContextHelper<::grpc::CallbackServerContext>>(
       /*auth_handler=*/nullptr, MiddlewareFactoryList{});
-}
-
-/// The memory manager the hand-built service in each test uses; the default
-/// CPU one, exactly what the real transport passes.
-std::shared_ptr<MemoryManager> MakeAsyncMemoryManager() {
-  return default_cpu_memory_manager();
 }
 
 // The method name no FlightService stub knows: the transport must answer it
@@ -800,8 +793,7 @@ std::pair<std::string, arrow::Status> UploadOneBatch(
 TEST(AsyncGrpcTest, BasicDoGet) {
   TestFlightServer inner_server;
   TestServerAsyncAdapter flight_server(&inner_server);
-  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
-                                    MakeAsyncHelper());
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;
@@ -853,8 +845,7 @@ TEST(AsyncGrpcTest, BasicDoPut) {
   // kept here so it can be asserted on after the RPC.
   auto listener = std::make_shared<RecordingListener>();
   TestServerAsyncAdapter flight_server(&inner_server, listener);
-  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
-                                    MakeAsyncHelper());
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;
@@ -912,8 +903,7 @@ TEST(AsyncGrpcTest, BasicDoPut) {
 TEST(AsyncGrpcTest, SchemaOnlyDoGet) {
   TestFlightServer inner_server;
   TestServerAsyncAdapter flight_server(&inner_server);
-  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
-                                    MakeAsyncHelper());
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;
@@ -1096,8 +1086,7 @@ TEST(AsyncGrpcTest, EmptyDoPut) {
   TestFlightServer inner_server;
   auto listener = std::make_shared<RecordingListener>();
   TestServerAsyncAdapter flight_server(&inner_server, listener);
-  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
-                                    MakeAsyncHelper());
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;
@@ -1139,8 +1128,7 @@ TEST(AsyncGrpcTest, MetadataOnlyPutChunk) {
   TestFlightServer inner_server;
   auto listener = std::make_shared<RecordingListener>();
   TestServerAsyncAdapter flight_server(&inner_server, listener);
-  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
-                                    MakeAsyncHelper());
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;
@@ -1183,8 +1171,7 @@ TEST(AsyncGrpcTest, DoPutRejectedByListener) {
   // The consumer rejects the upload.
   listener->set_next_status(arrow::Status::Invalid("listener rejected this upload"));
   TestServerAsyncAdapter flight_server(&inner_server, listener);
-  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
-                                    MakeAsyncHelper());
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;
@@ -1228,8 +1215,7 @@ TEST(AsyncGrpcTest, DoPutWithoutFactoryIsUnimplemented) {
   TestServerAsyncAdapter flight_server(&inner_server);
   // No listener factory: there is nothing to hand an upload to, so DoPut is
   // answered like any other method the service does not serve.
-  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
-                                    MakeAsyncHelper());
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;
@@ -1267,8 +1253,7 @@ TEST(AsyncGrpcTest, OtherMethodsAreUnimplemented) {
   TestFlightServer inner_server;
   auto listener = std::make_shared<RecordingListener>();
   TestServerAsyncAdapter flight_server(&inner_server, listener);
-  AsyncGenericFlightService service(&flight_server, MakeAsyncMemoryManager(),
-                                    MakeAsyncHelper());
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
 
   int port = 0;
   ::grpc::ServerBuilder builder;

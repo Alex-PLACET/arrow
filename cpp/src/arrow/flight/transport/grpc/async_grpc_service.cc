@@ -1451,16 +1451,11 @@ class Unimplemented : public ::grpc::ServerGenericBidiReactor {
 
 AsyncGenericFlightService::AsyncGenericFlightService(
     AsyncGenericFlightServerBase* async_base,
-    std::shared_ptr<MemoryManager> memory_manager,
     std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>> helper,
     HandshakeFn handshake_handler)
     : base_(async_base),
       helper_(std::move(helper)),
-      handshake_handler_(std::move(handshake_handler)) {
-  // The memory manager was only needed by the synchronous DoExchange bridge;
-  // the async exchange does not read bodies into Arrow buffers itself.
-  (void)memory_manager;
-}
+      handshake_handler_(std::move(handshake_handler)) {}
 
 ::grpc::ServerGenericBidiReactor* AsyncGenericFlightService::CreateReactor(
     ::grpc::GenericCallbackServerContext* context) {
