@@ -52,24 +52,20 @@ class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
     arrow::Future<std::shared_ptr<T>> future = handler_(flight_context_, *descriptor);
     future.AddCallback(
         [this, future](const arrow::Result<std::shared_ptr<T>>& result) mutable {
-          if (finished_) {
-            ReleaseHold();
-            return;
+          if (!finished_) {
+            if (!result.ok()) {
+              FinishOnce(result.status());
+            } else {
+              PbT response;
+              const auto status = SerializeOrNotFound(*future.MoveResult(), &response);
+              if (!status.ok()) {
+                FinishOnce(status);
+              } else {
+                response_buf_ = MakeWriteBuffer(response);
+                StartWrite(&response_buf_);
+              }
+            }
           }
-          if (!result.ok()) {
-            FinishOnce(result.status());
-            ReleaseHold();
-            return;
-          }
-          PbT response;
-          const auto status = SerializeOrNotFound(*future.MoveResult(), &response);
-          if (!status.ok()) {
-            FinishOnce(status);
-            ReleaseHold();
-            return;
-          }
-          response_buf_ = MakeWriteBuffer(response);
-          StartWrite(&response_buf_);
           ReleaseHold();
         });
   }
@@ -121,8 +117,8 @@ template <typename T, typename PbT, typename HandlerFn>
 ::grpc::ServerGenericBidiReactor* MakeGetFlightInfoReactor(
     AsyncCallContext flight_context, AsyncGenericFlightServerBase* base) {
   return MakeUnaryReactor<FlightInfo, pb::FlightInfo>(
-      std::move(flight_context), [base](const ServerCallContext& context,
-                                        const FlightDescriptor& descriptor) {
+      std::move(flight_context),
+      [base](const ServerCallContext& context, const FlightDescriptor& descriptor) {
         return base->GetFlightInfoAsync(context, descriptor);
       });
 }
@@ -130,8 +126,8 @@ template <typename T, typename PbT, typename HandlerFn>
 ::grpc::ServerGenericBidiReactor* MakeGetSchemaReactor(
     AsyncCallContext flight_context, AsyncGenericFlightServerBase* base) {
   return MakeUnaryReactor<SchemaResult, pb::SchemaResult>(
-      std::move(flight_context), [base](const ServerCallContext& context,
-                                        const FlightDescriptor& descriptor) {
+      std::move(flight_context),
+      [base](const ServerCallContext& context, const FlightDescriptor& descriptor) {
         return base->GetSchemaAsync(context, descriptor);
       });
 }
@@ -139,8 +135,8 @@ template <typename T, typename PbT, typename HandlerFn>
 ::grpc::ServerGenericBidiReactor* MakePollFlightInfoReactor(
     AsyncCallContext flight_context, AsyncGenericFlightServerBase* base) {
   return MakeUnaryReactor<PollInfo, pb::PollInfo>(
-      std::move(flight_context), [base](const ServerCallContext& context,
-                                        const FlightDescriptor& descriptor) {
+      std::move(flight_context),
+      [base](const ServerCallContext& context, const FlightDescriptor& descriptor) {
         return base->PollFlightInfoAsync(context, descriptor);
       });
 }

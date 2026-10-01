@@ -41,16 +41,13 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
     }
     Hold();
     Start().AddCallback([this](const arrow::Status& status) {
-      if (finished_) {
-        ReleaseHold();
-        return;
+      if (!finished_) {
+        if (!status.ok()) {
+          FinishOnce(status);
+        } else {
+          WriteNextMessage();
+        }
       }
-      if (!status.ok()) {
-        FinishOnce(status);
-        ReleaseHold();
-        return;
-      }
-      WriteNextMessage();
       ReleaseHold();
     });
   }
@@ -80,21 +77,15 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
     }
     Hold();
     NextMessage().AddCallback([this](const arrow::Result<bool>& has_next) {
-      if (finished_) {
-        ReleaseHold();
-        return;
+      if (!finished_) {
+        if (!has_next.ok()) {
+          FinishOnce(has_next.status());
+        } else if (!*has_next) {
+          FinishOnce(arrow::Status::OK());
+        } else {
+          StartWrite(&write_buf_);
+        }
       }
-      if (!has_next.ok()) {
-        FinishOnce(has_next.status());
-        ReleaseHold();
-        return;
-      }
-      if (!*has_next) {
-        FinishOnce(arrow::Status::OK());
-        ReleaseHold();
-        return;
-      }
-      StartWrite(&write_buf_);
       ReleaseHold();
     });
   }
@@ -202,10 +193,11 @@ class ListFlightsReactor final : public StreamingReactor {
     }
     criteria_ = *criteria;
     return base_->ListFlightsAsync(flight_context_, &criteria_)
-        .Then([this](const std::shared_ptr<AsyncFlightListing>& listing) -> arrow::Status {
-          listing_ = listing;
-          return arrow::Status::OK();
-        });
+        .Then(
+            [this](const std::shared_ptr<AsyncFlightListing>& listing) -> arrow::Status {
+              listing_ = listing;
+              return arrow::Status::OK();
+            });
   }
 
   arrow::Future<bool> NextMessage() override {

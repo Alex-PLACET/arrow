@@ -38,24 +38,32 @@ class ExchangeReader final : public AsyncFlightMessageReader {
 
   const FlightDescriptor& descriptor() const override { return descriptor_; }
 
+  /// Asynchronously retrieves the next chunk from the exchange. Returns a future that will
+  /// be completed when the next chunk is available, or with an error if the read fails.
+  /// \returns A future that will be completed with the next chunk or an error.
   arrow::Future<FlightStreamChunk> NextAsync() override {
+    using FSCFuture = arrow::Future<FlightStreamChunk>;
+
     if (pending_.is_valid() && !pending_.is_finished()) {
-      return arrow::Future<FlightStreamChunk>::MakeFinished(
+      return FSCFuture::MakeFinished(
           arrow::Status::Invalid("one NextAsync at a time"));
     }
     if (buffered_.has_value()) {
-      arrow::Future<FlightStreamChunk> out =
-          arrow::Future<FlightStreamChunk>::MakeFinished(std::move(*buffered_));
+      auto out =
+          FSCFuture::MakeFinished(std::move(*buffered_));
       buffered_.reset();
       return out;
     }
+
     if (!read_error_.ok()) {
-      return arrow::Future<FlightStreamChunk>::MakeFinished(read_error_);
+      return FSCFuture::MakeFinished(read_error_);
     }
+
     if (read_closed_) {
-      return arrow::Future<FlightStreamChunk>::MakeFinished(FlightStreamChunk{});
+      return FSCFuture::MakeFinished(FlightStreamChunk{});
     }
-    pending_ = arrow::Future<FlightStreamChunk>::Make();
+
+    pending_ = FSCFuture::Make();
     if (first_read_.has_value()) {
       internal::FlightData data = std::move(*first_read_);
       first_read_.reset();

@@ -430,9 +430,6 @@ class GrpcServiceHandler final : public FlightService::Service {
 // The ServerTransport implementation for gRPC. Manages the gRPC server itself.
 class GrpcServerTransport : public internal::ServerTransport {
  public:
-  // The base class only stores the FlightServerBase* (transport_server.h), so
-  // passing nullptr in async mode is safe: every synchronous path below is
-  // behind async_base_ != nullptr.
   GrpcServerTransport(FlightServerBase* base,
                       std::shared_ptr<MemoryManager> memory_manager,
                       AsyncGenericFlightServerBase* async_base = nullptr)
@@ -495,13 +492,6 @@ class GrpcServerTransport : public internal::ServerTransport {
     RETURN_NOT_OK(AddServerListeningPort(options, uri, &builder, &location_, &port));
 
     if (async_service_) {
-      // Registering the typed service alongside would NOT work: a method it
-      // claims (DoGet/DoPut) never reaches the generic handler, so the server
-      // would silently keep serving them synchronously. The generic service
-      // must REPLACE it. With no typed service registered, gRPC still routes
-      // unclaimed methods to it (it installs its own UNIMPLEMENTED fallback
-      // only when no generic service is registered at all), so every other
-      // RPC answers UNIMPLEMENTED through our fallback reactor.
       builder.RegisterCallbackGenericService(async_service_.get());
     } else {
       builder.RegisterService(grpc_service_.get());

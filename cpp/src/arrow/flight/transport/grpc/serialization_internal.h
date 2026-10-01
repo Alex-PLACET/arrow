@@ -52,8 +52,6 @@ arrow::Result<::grpc::Slice> SliceFromBuffer(const std::shared_ptr<Buffer>& buf)
 Status WrapGrpcBuffer(::grpc::ByteBuffer* cpp_buf, std::shared_ptr<Buffer>* out);
 
 /// Copy a gRPC ByteBuffer's slices into one contiguous string.
-///
-/// Dump() copies the bytes out, so the result does not alias the buffer.
 /// \param[in] buffer The gRPC ByteBuffer to copy from.
 /// \param[in] error_message The error message to use if the buffer cannot be dumped.
 /// \return The buffer's bytes, or an IOError carrying FlightStatusCode::Internal

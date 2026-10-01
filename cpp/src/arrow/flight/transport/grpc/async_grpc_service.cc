@@ -101,47 +101,42 @@ AsyncGenericFlightService::AsyncGenericFlightService(
     return new Unimplemented(prepare_status);
   }
 
-  if (method == kHandshakeMethod) {
-    if (!handshake_handler_) {
-      return new Unimplemented(::grpc::Status(
-          ::grpc::StatusCode::UNIMPLEMENTED,
-          "This service does not have an authentication mechanism enabled."));
+  switch (flight_method) {
+    case FlightMethod::Handshake:
+      if (!handshake_handler_) {
+        return new Unimplemented(::grpc::Status(
+            ::grpc::StatusCode::UNIMPLEMENTED,
+            "This service does not have an authentication mechanism enabled."));
+      }
+      return detail::MakeHandshakeReactor(std::move(flight_context), handshake_handler_);
+    case FlightMethod::GetFlightInfo:
+      return detail::MakeGetFlightInfoReactor(std::move(flight_context), base_);
+    case FlightMethod::GetSchema:
+      return detail::MakeGetSchemaReactor(std::move(flight_context), base_);
+    case FlightMethod::PollFlightInfo:
+      return detail::MakePollFlightInfoReactor(std::move(flight_context), base_);
+    case FlightMethod::ListActions:
+      return detail::MakeListActionsReactor(std::move(flight_context), base_);
+    case FlightMethod::DoAction:
+      return detail::MakeDoActionReactor(std::move(flight_context), base_);
+    case FlightMethod::ListFlights:
+      return detail::MakeListFlightsReactor(std::move(flight_context), base_);
+    case FlightMethod::DoExchange:
+      return detail::MakeExchangeReactor(std::move(flight_context), base_);
+    case FlightMethod::DoGet:
+      return detail::MakeDoGetReactor(std::move(flight_context), base_);
+    case FlightMethod::DoPut: {
+      std::shared_ptr<AsyncFlightDataListener> listener =
+          base_->CreateDoPutListener(flight_context);
+      if (!listener) {
+        return new Unimplemented(
+            ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
+                           "DoPut is not implemented: no listener available"));
+      }
+      return detail::MakeDoPutReactor(std::move(flight_context), std::move(listener));
     }
-    return detail::MakeHandshakeReactor(std::move(flight_context), handshake_handler_);
-  }
-  if (method == kGetFlightInfoMethod) {
-    return detail::MakeGetFlightInfoReactor(std::move(flight_context), base_);
-  }
-  if (method == kGetSchemaMethod) {
-    return detail::MakeGetSchemaReactor(std::move(flight_context), base_);
-  }
-  if (method == kPollFlightInfoMethod) {
-    return detail::MakePollFlightInfoReactor(std::move(flight_context), base_);
-  }
-  if (method == kListActionsMethod) {
-    return detail::MakeListActionsReactor(std::move(flight_context), base_);
-  }
-  if (method == kDoActionMethod) {
-    return detail::MakeDoActionReactor(std::move(flight_context), base_);
-  }
-  if (method == kListFlightsMethod) {
-    return detail::MakeListFlightsReactor(std::move(flight_context), base_);
-  }
-  if (method == kDoExchangeMethod) {
-    return detail::MakeExchangeReactor(std::move(flight_context), base_);
-  }
-  if (method == kDoGetMethod) {
-    return detail::MakeDoGetReactor(std::move(flight_context), base_);
-  }
-  if (method == kDoPutMethod) {
-    std::shared_ptr<AsyncFlightDataListener> listener =
-        base_->CreateDoPutListener(flight_context);
-    if (!listener) {
-      return new Unimplemented(
-          ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
-                         "DoPut is not implemented: no listener available"));
-    }
-    return detail::MakeDoPutReactor(std::move(flight_context), std::move(listener));
+    case FlightMethod::Invalid:
+      break;
   }
   return new Unimplemented(
       ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "Unknown method"));

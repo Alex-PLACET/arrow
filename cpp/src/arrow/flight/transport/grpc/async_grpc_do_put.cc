@@ -52,14 +52,6 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
       if (finished_.load()) {
         return;
       }
-      // A failed read means the client half-closed -- or that the RPC is being
-      // torn down (the client cancelled, or its deadline expired; gRPC
-      // completes a pending read with ok=false either way).  Only the
-      // acknowledgement write tells the two apart (it completes ok for a
-      // half-close the client accepted, and !ok once the call is dead), so the
-      // ending is reported from OnWriteDone, never here: reporting OK here
-      // raced OnCancel's report and could call a cancelled upload a clean
-      // finish.
       pb::PutResult pb_result;
       write_buf_ = MakeWriteBuffer(pb_result);
       StartWrite(&write_buf_);
@@ -75,23 +67,18 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
     }
 
     Future<> decode_status = decoder_.Consume(std::move(arrow_buf));
-    // The listener's future may resolve on any thread, possibly after the RPC
-    // is over: hold the reactor across the continuation (gRPC has no
-    // server-side holds), and stand down when an ending has already run.
     Hold();
     decode_status.AddCallback([this](arrow::Status status) {
       if (finished_) {
         // The RPC is over (cancelled while the listener was working): the
         // message is abandoned.
-        ReleaseHold();
-        return;
+      } else {
+        if (!status.ok()) {
+          FinishUpload(std::move(status));
+        } else {
+          StartRead(&request_buf_);
+        }
       }
-      if (!status.ok()) {
-        FinishUpload(std::move(status));
-        ReleaseHold();
-        return;
-      }
-      StartRead(&request_buf_);
       ReleaseHold();
     });
   }
@@ -109,9 +96,8 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
 
   void OnCancel() override {
     Status cancel_status = Status::Cancelled("the client cancelled the upload");
-    ARROW_WARN_NOT_OK(
-      arrow::flight::internal::FlightDataListenerTransport::ReportFinish(listener_,
-                                         cancel_status),
+    ARROW_WARN_NOT_OK(arrow::flight::internal::FlightDataListenerTransport::ReportFinish(
+                          listener_, cancel_status),
                       "Reporting the cancellation of an upload to the listener failed");
     FinishOnce(std::move(cancel_status));
   }
@@ -130,8 +116,8 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   }
 
   void FinishUpload(Status status) {
-    ARROW_WARN_NOT_OK(
-      arrow::flight::internal::FlightDataListenerTransport::ReportFinish(listener_, status),
+    ARROW_WARN_NOT_OK(arrow::flight::internal::FlightDataListenerTransport::ReportFinish(
+                          listener_, status),
                       "Reporting the end of an upload to the listener failed");
     FinishOnce(std::move(status));
   }

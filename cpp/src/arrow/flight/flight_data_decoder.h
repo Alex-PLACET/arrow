@@ -96,9 +96,8 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
   /// \brief Called once, when the upload ends, whichever way it ends.
   ///
   /// Runs on a transport thread, so it must not block.
-  // `status` is OK for an upload if the client ended normally, and the failure otherwise
-  // (the client went
-  /// away, the transport failed, or the upload was rejected).
+  /// `status` is OK for an upload if the client ended normally, and the failure otherwise
+  /// (the client went away, the transport failed, or the upload was rejected).
   ///
   /// \param status The terminal status of the upload.
   /// \return A future that completes when the finish has been processed.
@@ -113,6 +112,7 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
   /// Safe to call from any thread at any time: once the upload is no
   /// longer in flight this reports Invalid instead of reaching a finished RPC.
   /// \param status The status to cancel the upload with.
+  ///
   /// \return OK when the cancel was handed to the transport, or Invalid when
   /// there is no upload in flight.
   Future<> Cancel(Status status);
