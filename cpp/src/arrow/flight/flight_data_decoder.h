@@ -42,33 +42,28 @@ namespace internal {
 ///
 /// The transport owns this; the listener only holds a reference for as long as
 /// the RPC is live, and asks for it under a lock the transport takes to clear
-/// it (see FlightDataListenerTransport::Clear).  That is the same lifetime rule
-/// the client-side AsyncListenerBase uses for its AsyncRpc state.
+/// it (see FlightDataListenerTransport::Clear)
 class ARROW_FLIGHT_EXPORT FlightDataListenerTransport {
  public:
   virtual ~FlightDataListenerTransport();
 
   /// \brief Finish the upload's RPC with `status`, from any thread.
-  ///
-  /// The transport must make this idempotent and safe to call after the RPC
-  /// finished (as a no-op), so a racing Cancel() cannot use-after-free.
+  /// \param status The status to finish the upload with.
   virtual void CancelUpload(Status status) = 0;
 
   /// \brief Install `transport` on `listener` for the life of the RPC.
-  /// Transport-only.  `transport` is the transport's own RPC state (for gRPC's
-  /// callback API, the reactor itself); it stays valid until Clear(), and the
-  /// listener only reaches it under the lock Clear() takes.
+  /// \param listener The listener to install the transport on.
+  /// \param transport The transport to install.
   static void Install(const std::shared_ptr<AsyncFlightDataListener>& listener,
                       FlightDataListenerTransport* transport);
 
-  /// \brief Clear the installed transport.  Transport-only; called as the RPC
-  /// finishes, before the transport object dies, so a concurrent Cancel() can
-  /// never reach a dead RPC.
+  /// \brief Clear the installed transport.
+  /// \param listener The listener to clear the transport from.
   static void Clear(const std::shared_ptr<AsyncFlightDataListener>& listener);
 
   /// \brief Report the upload's terminal status to the listener, once.
-  /// Transport-only.  Later calls are dropped, so every ending can report
-  /// without coordinating with the others.
+  /// \param listener The listener to report the status to.
+  /// \param status The terminal status of the upload.
   static Status ReportFinish(const std::shared_ptr<AsyncFlightDataListener>& listener,
                              Status status);
 };
@@ -84,36 +79,39 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
   ~AsyncFlightDataListener() override;
 
   /// \brief Called for each decoded FlightStreamChunk.
-  ///
-  /// chunk.data is the decoded RecordBatch, or nullptr for metadata-only
-  /// messages.
+  /// \param chunk The decoded FlightStreamChunk.
+  /// \return A future that completes when the chunk has been processed.
   virtual Future<> OnNext(FlightStreamChunk chunk) = 0;
 
   /// \brief Called when the descriptor of an upload is decoded.
   ///
   /// Fired before any schema or data of that upload, so the listener knows
   /// which upload it is being handed. A non-OK status rejects the upload.
+  /// \param descriptor The decoded FlightDescriptor.
+  /// \return A future that completes when the descriptor has been processed.
   virtual Future<> OnDescriptor(const FlightDescriptor& descriptor) {
     return Future<>::MakeFinished();
   }
 
   /// \brief Called once, when the upload ends, whichever way it ends.
   ///
-  /// The counterpart of OnNext: after this, no other callback arrives.  Runs
-  /// on a transport thread, so it must not block.  `status` is OK for an upload
-  /// the client ended normally, and the failure otherwise (the client went
-  /// away, the transport failed, or the upload was rejected).  This is where a
-  /// consumer commits or discards what it accumulated; the default does
-  /// nothing, since a stream that only counts chunks needs no completion.
+  /// Runs on a transport thread, so it must not block. 
+  // `status` is OK for an upload if the client ended normally, and the failure otherwise (the client went
+  /// away, the transport failed, or the upload was rejected).
+  ///
+  /// \param status The terminal status of the upload.
+  /// \return A future that completes when the finish has been processed.
   virtual Future<> OnFinish(Status status) { return Future<>::MakeFinished(); }
 
   /// \brief Cancel the upload with `status`, from any thread.
   ///
   /// Finishes the RPC with that status without waiting for the client to end
-  /// the upload: the client's pending write or Close() reports it.  Use for a
-  /// server-side rejection discovered mid-upload (quota, bad batch, upstream
-  /// error).  Safe to call from any thread at any time: once the upload is no
+  /// the upload: the client's pending write or Close() reports it.
+  /// Use for a server-side rejection discovered mid-upload (quota, bad batch, upstream
+  /// error). 
+  /// Safe to call from any thread at any time: once the upload is no
   /// longer in flight this reports Invalid instead of reaching a finished RPC.
+  /// \param status The status to cancel the upload with.
   /// \return OK when the cancel was handed to the transport, or Invalid when
   /// there is no upload in flight.
   Future<> Cancel(Status status);
@@ -123,9 +121,7 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
   /// FlightDataListenerTransport::Install/Clear, both under this lock.
   friend class internal::FlightDataListenerTransport;
 
-  /// Whether OnFinish was already reported.  Atomic (not guarded by
-  /// transport_mutex_) on purpose: Cancel() holds that lock across its call
-  /// into the transport, and the transport reports the ending from inside it.
+  /// Whether OnFinish was already reported.
   std::atomic<bool> finished_{false};
 
   mutable std::mutex transport_mutex_;
@@ -140,6 +136,10 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
 /// and fires events on the provided AsyncFlightDataListener.
 class ARROW_FLIGHT_EXPORT AsyncFlightMessageDecoder {
  public:
+  /// \brief Construct an AsyncFlightMessageDecoder with the given listener and IPC read options.
+  ///
+  /// \param listener The listener that will receive decoded Flight messages.
+  /// \param options The IPC read options to use for decoding.
   explicit AsyncFlightMessageDecoder(
       std::shared_ptr<AsyncFlightDataListener> listener,
       ipc::IpcReadOptions options = ipc::IpcReadOptions::Defaults());
@@ -160,14 +160,12 @@ class ARROW_FLIGHT_EXPORT AsyncFlightMessageDecoder {
   ///
   /// Same as Consume(Buffer) but avoids a serialization round-trip for transports
   /// that hand out an internal::FlightData directly (the gRPC client reads FlightData
-  /// straight into internal::FlightData).  This overload is internal to Arrow;
-  /// applications should use Consume(Buffer).
+  /// straight into internal::FlightData).
+  /// \internal This method is intended for internal use within the Arrow library.
   Future<> Consume(internal::FlightData data);
 
   /// \brief The decoded schema.
-  ///
-  /// Available after the first Consume() call that contains a schema message.
-  /// Returns nullptr if no schema has been decoded yet.
+  /// \return The decoded schema, or nullptr if no schema has been decoded yet.
   std::shared_ptr<Schema> schema() const;
 
  private:
