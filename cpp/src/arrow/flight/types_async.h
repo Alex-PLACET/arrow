@@ -39,8 +39,7 @@ class ARROW_FLIGHT_EXPORT AsyncListenerBase {
 
   /// \brief Request cancellation of the RPC.
   ///
-  /// The RPC is not cancelled until AsyncListener::OnFinish is called.  Safe to
-  /// call from any thread, including while the RPC is finishing.
+  /// The RPC is not cancelled until AsyncListener::OnFinish is called.
   void TryCancel();
 
  protected:
@@ -63,7 +62,7 @@ class ARROW_FLIGHT_EXPORT AsyncListenerBase {
  private:
   friend class arrow::flight::internal::ClientTransport;
 
-  /// Guards rpc_state_; see LockRpcState().
+  /// Guards rpc_state_: see LockRpcState().
   mutable std::mutex rpc_state_mutex_;
 
   /// Transport-specific state for this RPC.  Transport
@@ -94,33 +93,9 @@ class ARROW_FLIGHT_EXPORT AsyncListener : public AsyncListenerBase {
 };
 
 /// \brief Callbacks for an asynchronous DoGet read.
-///
-/// Reuses AsyncListener<FlightStreamChunk>: OnNext() delivers decoded chunks and
-/// OnFinish() the terminal status; TryCancel() cancels the whole RPC.  Data is
-/// delivered only in response to RequestNext(): there is no eager drain, and at
-/// most one request may be outstanding.  With no request outstanding the
-/// transport starts no reads, so an application that stops calling RequestNext()
-/// bounds what the transport retains: one request reads ahead one FlightData
-/// message at a time until a chunk is produced (schema and dictionary messages
-/// are read through, and a run of dictionary messages is held until the record
-/// batch it belongs to arrives).
-///
-/// TryCancel() reaches the terminal OnFinish() even with no request outstanding,
-/// and so does an expired FlightCallOptions::timeout: the gRPC transport holds
-/// the callback stream open for reads started from application threads and
-/// releases that hold when the call's deadline expires, so the deadline is
-/// reported without another RequestNext().  Normal end of stream is not pushed:
-/// it is discovered by the request that finds no more data (as is a server-side
-/// terminal status that the transport only learns of when a read completes).
-/// Server errors keep their status message and, when the server sent rich
-/// trailers, a TransportStatusDetail carrying the exact remote code and
-/// details.
 class ARROW_FLIGHT_EXPORT AsyncDoGetListener : public AsyncListener<FlightStreamChunk> {
  public:
   /// \brief Request one more chunk.
-  ///
-  /// Nonblocking: Safe to call from any thread once FlightClient::DoGetAsync()
-  /// has been called, including from inside OnSchema()/OnNext().
   /// \return Returns OK if the request was accepted; it is then satisfied by exactly one
   /// OnNext() call (which may carry only Flight app_metadata) or ended by the terminal
   /// OnFinish().
@@ -128,6 +103,7 @@ class ARROW_FLIGHT_EXPORT AsyncDoGetListener : public AsyncListener<FlightStream
   /// Requests after the RPC finished are rejected.
   /// Rejection never suppresses the final OnFinish() or replaces its status.
   Status RequestNext();
+  
   /// \brief The schema of the stream.
   ///
   /// Called at most once, before the first data-bearing OnNext() and before

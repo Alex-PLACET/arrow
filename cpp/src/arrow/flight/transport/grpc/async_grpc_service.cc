@@ -15,22 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Reactors and dispatch for the async Flight service implemented on top of
-// gRPC's generic callback API (apache/arrow#49339).  Serves every
-// FlightService method: Handshake, DoGet, DoPut, the unary
-// GetFlightInfo/GetSchema/PollFlightInfo, the streaming
-// ListActions/DoAction/ListFlights, and DoExchange.
-//
-// Everything here except AsyncGenericFlightService is file-local: the reactors
-// are an implementation detail of the gRPC transport.
-
 #include "arrow/flight/transport/grpc/async_grpc_service.h"
 
 #include <algorithm>
 #include <atomic>
 #include <deque>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -42,11 +32,8 @@
 #include "arrow/flight/protocol_internal.h"
 #include "arrow/flight/serialization_internal.h"
 #include "arrow/flight/transport/grpc/serialization_internal.h"
-#include "arrow/flight/transport_server.h"
-#include "arrow/flight/transport_server_internal.h"
 #include "arrow/flight/types.h"
 #include "arrow/ipc/writer.h"
-#include "arrow/util/logging.h"
 
 namespace arrow::flight::transport::grpc {
 
@@ -54,9 +41,6 @@ namespace pb = arrow::flight::protocol;
 
 namespace {
 
-// The Arrow-side call context every reactor on this path carries; it is built
-// by the shared helper (which runs middleware and auth) from the raw gRPC
-// context, and every finish goes through its FinishRequest.
 using AsyncCallContext = GrpcServerCallContext<::grpc::CallbackServerContext>;
 
 constexpr std::string_view kPrefix = "/arrow.flight.protocol.FlightService/";
@@ -101,17 +85,22 @@ FlightMethod MethodFromName(std::string_view method) {
 
 /// Serialize one proto message into a ByteBuffer the caller must keep alive
 /// until the write completes (a reactor member, never a local).
+/// \tparam ProtoT The type of the proto message to serialize.
+/// \param[in] message The proto message to serialize.
+/// \return A gRPC ByteBuffer containing the serialized message.
 template <typename ProtoT>
 ::grpc::ByteBuffer MakeWriteBuffer(const ProtoT& message) {
   const std::string bytes = message.SerializeAsString();
   ::grpc::Slice slice(bytes);
-  return ::grpc::ByteBuffer(&slice, 1);
+  return {&slice, 1};
 }
 
 /// \brief Read `buf` as the proto message `PbT`.
 /// \param[in] what names the message in the "Failed to read/parse <what>"
 /// errors ("Ticket", "FlightDescriptor", …).
-template <typename PbT>
+/// \tparam PbT The type of the proto message to parse.
+/// \tparam T The type to convert the proto message to.
+template <typename PbT, typename T>
 arrow::Result<PbT> ParseProtoRequest(const ::grpc::ByteBuffer& buf,
                                      std::string_view what) {
   ARROW_ASSIGN_OR_RAISE(std::string bytes,
@@ -124,6 +113,12 @@ arrow::Result<PbT> ParseProtoRequest(const ::grpc::ByteBuffer& buf,
 }
 
 /// \brief Read `buf` as the proto message `PbT` and convert it to `T`.
+/// \tparam PbT The type of the proto message to parse.
+/// \tparam T The type to convert the proto message to.
+/// \param[in] buf The gRPC ByteBuffer containing the serialized proto message.
+/// \param[in] what Names the message in the "Failed to read/parse <what>"
+/// errors ("Ticket", "FlightDescriptor", …).
+/// \return The converted message of type `T`.
 template <typename PbT, typename T>
 arrow::Result<T> ParseProtoRequest(const ::grpc::ByteBuffer& buf, std::string_view what) {
   ARROW_ASSIGN_OR_RAISE(auto pb, ParseProtoRequest<PbT>(buf, what));
@@ -135,6 +130,11 @@ arrow::Result<T> ParseProtoRequest(const ::grpc::ByteBuffer& buf, std::string_vi
 /// \brief Serialize `value` into `*out`, or answer what the sync transport
 /// answers for a handler that returned OK without setting its result
 /// (grpc_server.cc: "Flight not found").
+/// \tparam T The type of the value to serialize.
+/// \tparam PbT The type of the proto message to serialize into.
+/// \param[in] value The value to serialize.
+/// \param[out] out The proto message to serialize into.
+/// \return Status indicating success or failure.
 template <typename T, typename PbT>
 arrow::Status SerializeOrNotFound(const std::shared_ptr<T>& value, PbT* out) {
   if (value == nullptr) {
@@ -149,12 +149,6 @@ arrow::Status SerializeOrNotFound(const std::shared_ptr<T>& value, PbT* out) {
 /// served on a bidi reactor used write-only: the request is read once, then
 /// one payload is written per OnWriteDone turn until the FlightDataStream
 /// ends.
-///
-/// The RPC never waits for the producer's pending future: every terminal
-/// path (end of stream, write failure, client cancel) calls Finish() itself
-/// from its own thread, and a continuation that runs after that stands down.
-/// gRPC keeps the call alive until Finish() runs, so a cancel with a pending
-/// producer future must finish here or the call -- and Shutdown() -- hangs.
 class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
  public:
   /// `flight_context` is prepared by the service (middleware/auth already
@@ -219,7 +213,7 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   /// \param[in] ok Whether the write was successful.
   void OnWriteDone(bool ok) override {
     if (finished_) {
-      return;  // the RPC is over; gRPC may still deliver this
+      return;  // the RPC is over. gRPC may still deliver this.
     }
     if (!ok) {
       // The write failed (usually because the client went away): the
@@ -235,13 +229,6 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   }
 
   /// \brief Called when the client cancels the request.
-  ///
-  /// The RPC must not wait for the producer's pending future: a future whose
-  /// resolver noticed the cancel may never complete, and gRPC keeps the call
-  /// (and this reactor) alive until Finish() runs.  Finish first -- a
-  /// continuation released synchronously by Close() then sees finished_ and
-  /// stands down -- and then tell the producer to stop, which is what
-  /// resolves a pending payload.
   void OnCancel() override {
     FinishOnce(arrow::Status::Cancelled());
     ARROW_WARN_NOT_OK(CloseStreamOnce(),
@@ -260,9 +247,7 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   }
 
   /// \brief Ensures that gRPC's Finish is called at most once, and never
-  /// after OnDone.  The middleware's CallCompleted runs inside the CAS:
-  /// racing finishers (a cancel against a completing continuation) must not
-  /// report the call completed twice.
+  /// after OnDone.
   void FinishOnce(Status status) {
     bool expected = false;
     if (finished_.compare_exchange_strong(expected, true)) {
@@ -271,8 +256,8 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   }
 
   /// \brief Close the producer at most once, from whichever terminal path
-  /// runs first.  Close() is how a stream with a pending payload is told to
-  /// stop; its status is the final status on the end-of-stream path.
+  /// runs first.
+  /// \return Status indicating success or failure of closing the stream.
   Status CloseStreamOnce() {
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true)) {
@@ -286,7 +271,7 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
 
   // gRPC's server callback API has no holds, so the reactor refcounts itself:
   // one reference for the RPC (released in OnDone) plus one per pending
-  // continuation.  Whichever thread releases the last reference deletes it.
+  // continuation. Whichever thread releases the last reference deletes it.
   void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
   void ReleaseHold() {
     if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -296,14 +281,6 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
 
   /// Serialize the next payload of the data stream and start writing it.
   /// Called once from OnReadDone (schema payload) and then once per OnWriteDone.
-  /// NextAsync() is the server's code: the payload can complete on any thread,
-  /// so the reactor holds itself across that callback and never touches the call
-  /// context once the RPC is dead.
-  ///
-  /// The payload sequence mirrors the sync DoGet contract,
-  /// ServerTransportBase::WriteDataStream (transport_server_internal.cc): schema
-  /// payload first, the end of the stream is the payload whose
-  /// ipc_message.metadata is null, Close() last.
   void WriteNextPayload() {
     if (finished_) {
       return;  // the RPC is over; gRPC may still deliver this
@@ -334,8 +311,8 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
       wrote_schema_ = true;
       std::optional<FlightPayload> payload = std::move(*result);
 
-      // End of stream: the last payload has no metadata.  The
-      // producer's Close() status is the final status.
+      // End of stream: the last payload has no metadata.
+      // The producer's Close() status is the final status.
       if (!payload.has_value()) {
         FinishOnce(CloseStreamOnce());
         ReleaseHold();
@@ -395,22 +372,13 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
       : flight_context_(std::move(flight_context)),
         listener_(std::move(listener)),
         decoder_(listener_) {
-    // The listener can now Cancel() this RPC; cleared in OnDone, before the
-    // reactor dies.
     internal::FlightDataListenerTransport::Install(listener_, this);
     StartRead(&request_buf_);
   }
 
   /// \brief Cancel the upload from the application side: finish the RPC with
   /// `status` without waiting for the client to end it.
-  ///
-  /// Callable from any thread (that is the point).  Idempotent: `finished_`
-  /// makes only the first ending take effect.  A Cancel() with an OK status is
-  /// meaningless (there is nothing to cancel successfully), so it is refused.
-  ///
-  /// The reactor refcounts itself here as DoGet's does: gRPC's callback API has
-  /// no holds, and OnDone delete this, so a cancel arriving from another
-  /// thread must keep the reactor alive across the call.
+  /// \param[in] `status` the status to finish the upload with. Must be non-OK.
   void CancelUpload(Status status) override {
     if (status.ok()) {
       status = Status::Invalid("Cancel() needs a non-OK status");
@@ -427,22 +395,13 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   /// closed its half of the stream.
   void OnReadDone(bool ok) override {
     if (!ok) {
-      // The read ended.  That is the client's clean half-close only when the
-      // RPC is still running with no ending claimed yet: on a server-side
-      // Cancel() (or a decode rejection) the teardown makes the pending read
-      // complete too, and that ending must keep its own status.
       if (finished_.load()) {
         return;
       }
-      // The client closed its half of the stream: the upload ended normally.
-      // Report that to the listener, then acknowledge the upload, which is
-      // what makes the client's DoPut return.
       ARROW_WARN_NOT_OK(
           internal::FlightDataListenerTransport::ReportFinish(listener_, Status::OK()),
           "Reporting the end of an upload to the listener failed");
       pb::PutResult pb_result;
-      // Not a local variable: StartWrite requires the ByteBuffer to remain
-      // valid until OnWriteDone.
       write_buf_ = MakeWriteBuffer(pb_result);
       StartWrite(&write_buf_);
       return;
@@ -481,14 +440,11 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
       FinishUpload(MakeFlightError(FlightStatusCode::Internal, "Write failed"));
       return;
     }
-    // The acknowledgement of the upload reached the client: the upload is done.
     FinishUpload(arrow::Status::OK());
   }
 
   /// \brief Called when the client cancels the RPC.
   void OnCancel() override {
-    // The client went away before ending the upload: the application must hear
-    // that the upload will not complete.
     ARROW_WARN_NOT_OK(
         internal::FlightDataListenerTransport::ReportFinish(
             listener_, Status::Cancelled("the client cancelled the upload")),
@@ -505,8 +461,8 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
  private:
   // gRPC's server callback API has no holds, so the reactor refcounts itself:
   // one reference for the RPC (released here) plus one per call in flight on
-  // another thread (CancelUpload).  Whichever thread releases the last
-  // reference deletes the reactor.  This is the DoGet reactor's idiom.
+  // another thread (CancelUpload). Whichever thread releases the last
+  // reference deletes the reactor.
   void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
   void ReleaseHold() {
     if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -528,9 +484,7 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   }
 
   /// \brief Ensures that gRPC's Finish is called at most once, and never
-  /// after OnDone.  The middleware's CallCompleted runs inside the CAS:
-  /// racing finishers (a cancel against a completing continuation) must not
-  /// report the call completed twice.
+  /// after OnDone.
   void FinishOnce(Status status) {
     bool expected = false;
     if (finished_.compare_exchange_strong(expected, true)) {

@@ -296,9 +296,7 @@ class ARROW_FLIGHT_EXPORT ServerSignalState {
 /// both server classes have one implementation of them.
 class ServerLifecycle {
  public:
-  /// \param[in] server_name names the server class in the
-  /// "uninitialized <server>" errors ("FlightServerBase",
-  /// "AsyncGenericFlightServerBase").
+  /// \param[in] server_name names the server class. Used in error logs.
   explicit ServerLifecycle(const char* server_name);
   ~ServerLifecycle();
 

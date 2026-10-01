@@ -1207,9 +1207,6 @@ std::unique_lock<std::mutex> AsyncListenerBase::LockRpcState() const {
 }
 
 void AsyncListenerBase::TryCancel() {
-  // Hold the state lock for the whole call.
-  // A finished RPC has no state left to cancel (ReleaseAsyncRpc() cleared it under this lock), and while the
-  // state is here the transport cannot release, and so cannot dispose of it.
   auto state_lock = LockRpcState();
   if (auto* rpc = rpc_state()) {
     rpc->TryCancel();
@@ -1217,8 +1214,6 @@ void AsyncListenerBase::TryCancel() {
 }
 
 Status AsyncDoGetListener::RequestNext() {
-  // As in TryCancel(): the state, and the read it arms, are used under the lock
-  // that the transport must take to release the state as the RPC finishes.
   auto state_lock = LockRpcState();
   auto* rpc = rpc_state();
   if (!rpc) {
