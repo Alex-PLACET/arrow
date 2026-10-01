@@ -149,6 +149,12 @@ arrow::Status SerializeOrNotFound(const std::shared_ptr<T>& value, PbT* out) {
 /// served on a bidi reactor used write-only: the request is read once, then
 /// one payload is written per OnWriteDone turn until the FlightDataStream
 /// ends.
+///
+/// The RPC never waits for the producer's pending future: every terminal
+/// path (end of stream, write failure, client cancel) calls Finish() itself
+/// from its own thread, and a continuation that runs after that stands down.
+/// gRPC keeps the call alive until Finish() runs, so a cancel with a pending
+/// producer future must finish here or the call -- and Shutdown() -- hangs.
 class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
  public:
   /// `flight_context` is prepared by the service (middleware/auth already
@@ -167,14 +173,13 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   void OnReadDone(bool ok) override {
     // Request has been read.
     if (!ok) {
-      FinishOnce(flight_context_.FinishRequest(
-          MakeFlightError(FlightStatusCode::Internal, "Failed to read request")));
+      FinishOnce(MakeFlightError(FlightStatusCode::Internal, "Failed to read request"));
       return;
     }
 
     const auto ticket = ParseTicket();
     if (!ticket.ok()) {
-      FinishOnce(flight_context_.FinishRequest(ticket.status()));
+      FinishOnce(ticket.status());
       return;
     }
 
@@ -188,26 +193,20 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
     future.AddCallback(
         [this, future](
             const arrow::Result<std::shared_ptr<AsyncFlightDataStream>>& result) mutable {
-          if (!result.ok()) {
-            FinishOnce(flight_context_.FinishRequest(result.status()));
+          if (finished_) {
+            // The RPC is over (cancelled while the future was pending): the
+            // arrived stream is dropped unwritten.
             ReleaseHold();
             return;
           }
-          if (cancelled_) {
-            // The RPC died while the future was pending.
-            auto stream = *future.MoveResult();
-            if (stream != nullptr) {
-              ARROW_WARN_NOT_OK(stream->Close(),
-                                "DoGet: closing the stream of a cancelled call failed");
-            }
-            FinishOnce(flight_context_.FinishRequest(arrow::Status::Cancelled()));
+          if (!result.ok()) {
+            FinishOnce(result.status());
             ReleaseHold();
             return;
           }
           async_data_stream_ = std::move(*future.MoveResult());
           if (async_data_stream_ == nullptr) {
-            FinishOnce(flight_context_.FinishRequest(
-                arrow::Status::KeyError("No data in this flight")));
+            FinishOnce(arrow::Status::KeyError("No data in this flight"));
             ReleaseHold();
             return;
           }
@@ -219,18 +218,16 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   /// \brief Called when a write operation has completed.
   /// \param[in] ok Whether the write was successful.
   void OnWriteDone(bool ok) override {
-    // We have finished writing. We can write the next payload or finish the
-    // stream.
+    if (finished_) {
+      return;  // the RPC is over; gRPC may still deliver this
+    }
     if (!ok) {
-      // The write failed (usually because the client went away): let the
-      // producer stop before finishing.
-      if (async_data_stream_ != nullptr) {
-        // This is the owning thread, so the close is safe here.
-        ARROW_WARN_NOT_OK(async_data_stream_->Close(),
-                          "DoGet: closing the data stream after a failed write failed");
-      }
-      FinishOnce(flight_context_.FinishRequest(
-          MakeFlightError(FlightStatusCode::Internal, "Write failed")));
+      // The write failed (usually because the client went away): the
+      // transport's diagnosis is the final status, and the producer is told
+      // to stop.
+      FinishOnce(MakeFlightError(FlightStatusCode::Internal, "Write failed"));
+      ARROW_WARN_NOT_OK(CloseStreamOnce(),
+                        "DoGet: closing the data stream after a failed write failed");
       return;
     }
     // Continue writing the next payload.
@@ -238,9 +235,18 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   }
 
   /// \brief Called when the client cancels the request.
-  /// This allows the server to stop producing data for a request that will no longer be
-  /// consumed.
-  void OnCancel() override { cancelled_ = true; }
+  ///
+  /// The RPC must not wait for the producer's pending future: a future whose
+  /// resolver noticed the cancel may never complete, and gRPC keeps the call
+  /// (and this reactor) alive until Finish() runs.  Finish first -- a
+  /// continuation released synchronously by Close() then sees finished_ and
+  /// stands down -- and then tell the producer to stop, which is what
+  /// resolves a pending payload.
+  void OnCancel() override {
+    FinishOnce(arrow::Status::Cancelled());
+    ARROW_WARN_NOT_OK(CloseStreamOnce(),
+                      "DoGet: closing the stream of a cancelled call failed");
+  }
 
   /// \brief Called when the RPC is fully done, regardless of success or cancellation.
   /// This is the last callback that will be invoked for this RPC.
@@ -253,13 +259,29 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
     return ParseProtoRequest<pb::Ticket, Ticket>(request_buf_, "Ticket");
   }
 
-  /// \brief Ensures that gRPC's Finish is called at most once, and never after OnDone.
-  /// \param[in] status The gRPC status to finish the call with.
-  void FinishOnce(::grpc::Status status) {
+  /// \brief Ensures that gRPC's Finish is called at most once, and never
+  /// after OnDone.  The middleware's CallCompleted runs inside the CAS:
+  /// racing finishers (a cancel against a completing continuation) must not
+  /// report the call completed twice.
+  void FinishOnce(Status status) {
     bool expected = false;
     if (finished_.compare_exchange_strong(expected, true)) {
-      Finish(std::move(status));
+      Finish(flight_context_.FinishRequest(status));
     }
+  }
+
+  /// \brief Close the producer at most once, from whichever terminal path
+  /// runs first.  Close() is how a stream with a pending payload is told to
+  /// stop; its status is the final status on the end-of-stream path.
+  Status CloseStreamOnce() {
+    bool expected = false;
+    if (!closed_.compare_exchange_strong(expected, true)) {
+      return Status::OK();
+    }
+    if (async_data_stream_ == nullptr) {
+      return Status::OK();
+    }
+    return async_data_stream_->Close();
   }
 
   // gRPC's server callback API has no holds, so the reactor refcounts itself:
@@ -283,46 +305,50 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   /// payload first, the end of the stream is the payload whose
   /// ipc_message.metadata is null, Close() last.
   void WriteNextPayload() {
-    if (cancelled_) {
-      FinishOnce(flight_context_.FinishRequest(arrow::Status::Cancelled()));
-      return;
+    if (finished_) {
+      return;  // the RPC is over; gRPC may still deliver this
     }
     Hold();  // the payload may complete on the server's own thread
-    arrow::Future<FlightPayload> next = wrote_schema_
-                                            ? async_data_stream_->NextAsync()
-                                            : async_data_stream_->GetSchemaPayloadAsync();
 
-    next.AddCallback([this](arrow::Result<FlightPayload> result) {
-      if (cancelled_) {
-        // The RPC died while the payload was pending.
-        FinishOnce(flight_context_.FinishRequest(arrow::Status::Cancelled()));
+    arrow::Future<std::optional<FlightPayload>> next;
+    if (!wrote_schema_) {
+      next = async_data_stream_->GetSchemaPayloadAsync().Then(
+          [](FlightPayload payload) -> std::optional<FlightPayload> {
+            return {std::move(payload)};
+          });
+    } else {
+      next = async_data_stream_->NextAsync();
+    }
+    next.AddCallback([this](arrow::Result<std::optional<FlightPayload>> result) {
+      if (finished_) {
+        // The RPC is over (cancelled): the payload is abandoned.
         ReleaseHold();
         return;
       }
-
       if (!result.ok()) {
-        FinishOnce(flight_context_.FinishRequest(result.status()));
+        FinishOnce(result.status());
         ReleaseHold();
         return;
       }
 
       wrote_schema_ = true;
-      FlightPayload payload = std::move(*result);
+      std::optional<FlightPayload> payload = std::move(*result);
 
-      // End of stream: the last payload has no metadata.
-      if (payload.ipc_message.metadata == nullptr) {
-        FinishOnce(flight_context_.FinishRequest(async_data_stream_->Close()));
+      // End of stream: the last payload has no metadata.  The
+      // producer's Close() status is the final status.
+      if (!payload.has_value()) {
+        FinishOnce(CloseStreamOnce());
         ReleaseHold();
         return;
       }
 
       bool own_buffer = false;
       const ::grpc::Status grpc_status =
-          FlightDataSerialize(payload, &write_buf_, &own_buffer);
+          FlightDataSerialize(*payload, &write_buf_, &own_buffer);
 
       if (!grpc_status.ok()) {
-        FinishOnce(flight_context_.FinishRequest(
-            MakeFlightError(FlightStatusCode::Internal, grpc_status.error_message())));
+        FinishOnce(
+            MakeFlightError(FlightStatusCode::Internal, grpc_status.error_message()));
         ReleaseHold();
         return;
       }
@@ -339,10 +365,11 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
   ::grpc::ByteBuffer write_buf_;
   std::shared_ptr<AsyncFlightDataStream> async_data_stream_;
   bool wrote_schema_ = false;
-  /// Set by OnCancel: a pending DoGetAsync continuation must not write or touch
-  /// the call context afterwards.
-  std::atomic<bool> cancelled_{false};
+  /// Set by the first FinishOnce: a pending continuation must not write or
+  /// touch the call context afterwards.
   std::atomic<bool> finished_{false};
+  /// Set by the first CloseStreamOnce.
+  std::atomic<bool> closed_{false};
   /// One reference for the RPC (released in OnDone) plus one per pending
   /// continuation.
   std::atomic<int> refs_{1};
@@ -497,15 +524,17 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
     ARROW_WARN_NOT_OK(
         internal::FlightDataListenerTransport::ReportFinish(listener_, status),
         "Reporting the end of an upload to the listener failed");
-    FinishOnce(flight_context_.FinishRequest(std::move(status)));
+    FinishOnce(std::move(status));
   }
 
-  /// \brief Ensures that gRPC's Finish is called at most once, and never after OnDone.
-  /// \param[in] status The gRPC status to finish the call with.
-  void FinishOnce(::grpc::Status status) {
+  /// \brief Ensures that gRPC's Finish is called at most once, and never
+  /// after OnDone.  The middleware's CallCompleted runs inside the CAS:
+  /// racing finishers (a cancel against a completing continuation) must not
+  /// report the call completed twice.
+  void FinishOnce(Status status) {
     bool expected = false;
     if (finished_.compare_exchange_strong(expected, true)) {
-      Finish(std::move(status));
+      Finish(flight_context_.FinishRequest(status));
     }
   }
 
@@ -616,14 +645,13 @@ class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
 
   void OnReadDone(bool ok) override {
     if (!ok) {
-      FinishOnce(flight_context_.FinishRequest(
-          MakeFlightError(FlightStatusCode::Internal, "Failed to read request")));
+      FinishOnce(MakeFlightError(FlightStatusCode::Internal, "Failed to read request"));
       return;
     }
     const auto descriptor = ParseProtoRequest<pb::FlightDescriptor, FlightDescriptor>(
         request_buf_, "FlightDescriptor");
     if (!descriptor.ok()) {
-      FinishOnce(flight_context_.FinishRequest(descriptor.status()));
+      FinishOnce(descriptor.status());
       return;
     }
     // The handler may complete its future on any thread: hold the reactor
@@ -632,21 +660,20 @@ class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
     arrow::Future<std::shared_ptr<T>> future = handler_(flight_context_, *descriptor);
     future.AddCallback(
         [this, future](const arrow::Result<std::shared_ptr<T>>& result) mutable {
-          if (cancelled_) {
-            // The RPC died while the future was pending.
-            FinishOnce(flight_context_.FinishRequest(arrow::Status::Cancelled()));
+          if (finished_) {
+            // The RPC is over (cancelled while the future was pending).
             ReleaseHold();
             return;
           }
           if (!result.ok()) {
-            FinishOnce(flight_context_.FinishRequest(result.status()));
+            FinishOnce(result.status());
             ReleaseHold();
             return;
           }
           PbT response;
           const auto status = SerializeOrNotFound(*future.MoveResult(), &response);
           if (!status.ok()) {
-            FinishOnce(flight_context_.FinishRequest(status));
+            FinishOnce(status);
             ReleaseHold();
             return;
           }
@@ -657,23 +684,33 @@ class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
   }
 
   void OnWriteDone(bool ok) override {
+    if (finished_) {
+      return;  // the RPC is over; gRPC may still deliver this
+    }
     // The failed-read and cancel paths never reach the write, so exactly one
     // path calls FinishOnce.
-    FinishOnce(flight_context_.FinishRequest(
+    FinishOnce(
         ok ? arrow::Status::OK()
-           : MakeFlightError(FlightStatusCode::Internal, "Failed to write response")));
+           : MakeFlightError(FlightStatusCode::Internal, "Failed to write response"));
   }
 
-  void OnCancel() override { cancelled_ = true; }
+  /// \brief Called when the client cancels the request.
+  ///
+  /// The RPC must not wait for the handler's pending future: finish here, so
+  /// gRPC can deliver OnDone; the continuation stands down when (if) it runs.
+  void OnCancel() override { FinishOnce(arrow::Status::Cancelled()); }
 
   void OnDone() override { ReleaseHold(); }
 
  private:
-  /// \brief Ensures that gRPC's Finish is called at most once, and never after OnDone.
-  void FinishOnce(::grpc::Status status) {
+  /// \brief Ensures that gRPC's Finish is called at most once, and never
+  /// after OnDone.  The middleware's CallCompleted runs inside the CAS:
+  /// racing finishers (a cancel against a completing continuation) must not
+  /// report the call completed twice.
+  void FinishOnce(Status status) {
     bool expected = false;
     if (finished_.compare_exchange_strong(expected, true)) {
-      Finish(std::move(status));
+      Finish(flight_context_.FinishRequest(status));
     }
   }
 
@@ -691,7 +728,6 @@ class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
   HandlerFn handler_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer response_buf_;
-  std::atomic<bool> cancelled_{false};
   std::atomic<bool> finished_{false};
   std::atomic<int> refs_{1};
 };
@@ -711,16 +747,15 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
 
   void OnReadDone(bool ok) override {
     if (!ok) {
-      FinishOnce(flight_context_.FinishRequest(
-          MakeFlightError(FlightStatusCode::Internal, "Failed to read request")));
+      FinishOnce(MakeFlightError(FlightStatusCode::Internal, "Failed to read request"));
       return;
     }
     // The handler may complete its future on any thread: hold the reactor
     // across the continuation (gRPC has no server-side holds).
     Hold();
     Start().AddCallback([this](const arrow::Status& status) {
-      if (cancelled_) {
-        FinishOnce(flight_context_.FinishRequest(arrow::Status::Cancelled()));
+      if (finished_) {
+        // The RPC is over (cancelled while the future was pending).
         ReleaseHold();
         return;
       }
@@ -728,7 +763,7 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
         // The handler's status is the RPC's status (a handler that completed
         // OK with no stream arrives here too: the concrete reactor mapped
         // that to CANCELLED, as the sync transport does).
-        FinishOnce(flight_context_.FinishRequest(status));
+        FinishOnce(status);
         ReleaseHold();
         return;
       }
@@ -738,15 +773,21 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
   }
 
   void OnWriteDone(bool ok) override {
+    if (finished_) {
+      return;  // the RPC is over; gRPC may still deliver this
+    }
     if (!ok) {
-      FinishOnce(flight_context_.FinishRequest(
-          MakeFlightError(FlightStatusCode::Internal, "Failed to write response")));
+      FinishOnce(MakeFlightError(FlightStatusCode::Internal, "Failed to write response"));
       return;
     }
     WriteNextMessage();
   }
 
-  void OnCancel() override { cancelled_ = true; }
+  /// \brief Called when the client cancels the request.
+  ///
+  /// The RPC must not wait for the handler's pending future: finish here, so
+  /// gRPC can deliver OnDone; the continuation stands down when (if) it runs.
+  void OnCancel() override { FinishOnce(arrow::Status::Cancelled()); }
 
   void OnDone() override { ReleaseHold(); }
 
@@ -760,26 +801,25 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
   virtual arrow::Future<bool> NextMessage() = 0;
 
   void WriteNextMessage() {
-    if (cancelled_) {
-      FinishOnce(flight_context_.FinishRequest(arrow::Status::Cancelled()));
-      return;
+    if (finished_) {
+      return;  // the RPC is over; gRPC may still deliver this
     }
     Hold();  // the message may be produced on any thread
     NextMessage().AddCallback([this](const arrow::Result<bool>& has_next) {
-      if (cancelled_) {
-        FinishOnce(flight_context_.FinishRequest(arrow::Status::Cancelled()));
+      if (finished_) {
+        // The RPC is over (cancelled): the message is abandoned.
         ReleaseHold();
         return;
       }
       if (!has_next.ok()) {
-        FinishOnce(flight_context_.FinishRequest(has_next.status()));
+        FinishOnce(has_next.status());
         ReleaseHold();
         return;
       }
       if (!*has_next) {
         // Nothing left to send: finish without ever arming a write, so the
         // RPC does not wait for an OnWriteDone that will not come.
-        FinishOnce(flight_context_.FinishRequest(arrow::Status::OK()));
+        FinishOnce(arrow::Status::OK());
         ReleaseHold();
         return;
       }
@@ -789,11 +829,14 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
   }
 
  protected:
-  /// \brief Ensures that gRPC's Finish is called at most once, and never after OnDone.
-  void FinishOnce(::grpc::Status status) {
+  /// \brief Ensures that gRPC's Finish is called at most once, and never
+  /// after OnDone.  The middleware's CallCompleted runs inside the CAS:
+  /// racing finishers (a cancel against a completing continuation) must not
+  /// report the call completed twice.
+  void FinishOnce(Status status) {
     bool expected = false;
     if (finished_.compare_exchange_strong(expected, true)) {
-      Finish(std::move(status));
+      Finish(flight_context_.FinishRequest(status));
     }
   }
 
@@ -811,7 +854,6 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
   AsyncGenericFlightServerBase* base_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer write_buf_;
-  std::atomic<bool> cancelled_{false};
   std::atomic<bool> finished_{false};
   std::atomic<int> refs_{1};
 };
@@ -1279,8 +1321,7 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
     if (!ok) {
       if (!started_) {
         // The client never sent the descriptor message.
-        FinishOnce(flight_context_.FinishRequest(
-            MakeFlightError(FlightStatusCode::Internal, "Failed to read request")));
+        FinishOnce(MakeFlightError(FlightStatusCode::Internal, "Failed to read request"));
         return;
       }
       // The client half-closed (or the stream broke): the read side is over.
@@ -1290,8 +1331,8 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
     const ::grpc::Status deserialized = FlightDataDeserialize(&read_buf_, &read_data_);
     if (!deserialized.ok()) {
       if (!started_) {
-        FinishOnce(flight_context_.FinishRequest(
-            MakeFlightError(FlightStatusCode::Internal, deserialized.error_message())));
+        FinishOnce(
+            MakeFlightError(FlightStatusCode::Internal, deserialized.error_message()));
         return;
       }
       // A message that cannot be deserialized breaks the whole exchange.
@@ -1302,8 +1343,8 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
     if (!started_) {
       started_ = true;
       if (read_data_.descriptor == nullptr) {
-        FinishOnce(flight_context_.FinishRequest(MakeFlightError(
-            FlightStatusCode::Internal, "Descriptor missing on first message")));
+        FinishOnce(MakeFlightError(FlightStatusCode::Internal,
+                                   "Descriptor missing on first message"));
         return;
       }
       reader_->SetDescriptor(*read_data_.descriptor);
@@ -1316,7 +1357,12 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
       arrow::Future<> exchange =
           base_->DoExchangeAsync(flight_context_, reader_, writer_);
       exchange.AddCallback([this](const arrow::Status& status) {
-        FinishOnce(flight_context_.FinishRequest(status));
+        if (finished_) {
+          // The RPC is over (cancelled while the handler was running).
+          ReleaseHold();
+          return;
+        }
+        FinishOnce(status);
         ReleaseHold();
       });
       return;
@@ -1325,10 +1371,19 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
     reader_->OnMessage(std::move(read_data_));
   }
 
-  void OnWriteDone(bool ok) override { writer_->OnWriteDone(ok); }
+  void OnWriteDone(bool ok) override {
+    if (finished_) {
+      return;  // the RPC is over; gRPC may still deliver this
+    }
+    writer_->OnWriteDone(ok);
+  }
 
+  /// \brief Called when the client cancels the request.
+  ///
+  /// Finish first (the handler's future may never resolve), then unwind the
+  /// reader and writer so a handler parked on their futures wakes up.
   void OnCancel() override {
-    cancelled_ = true;
+    FinishOnce(arrow::Status::Cancelled());
     reader_->OnCancelled();
     writer_->OnCancelled();
   }
@@ -1348,6 +1403,9 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
   /// \brief Serialize one payload into the write buffer and start the write.
   /// Called by ExchangeWriter; OnWriteDone() resumes it.
   arrow::Status WritePayload(FlightPayload payload) {
+    if (finished_) {
+      return arrow::Status::Cancelled("the exchange is over");
+    }
     bool own_buffer = false;
     const ::grpc::Status serialize =
         FlightDataSerialize(payload, &write_buf_, &own_buffer);
@@ -1360,12 +1418,14 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
   }
 
  private:
-  /// \brief Ensures that gRPC's Finish is called at most once, and never after
-  /// OnDone.
-  void FinishOnce(::grpc::Status status) {
+  /// \brief Ensures that gRPC's Finish is called at most once, and never
+  /// after OnDone.  The middleware's CallCompleted runs inside the CAS:
+  /// racing finishers (a cancel against a completing continuation) must not
+  /// report the call completed twice.
+  void FinishOnce(Status status) {
     bool expected = false;
     if (finished_.compare_exchange_strong(expected, true)) {
-      Finish(std::move(status));
+      Finish(flight_context_.FinishRequest(status));
     }
   }
 
@@ -1387,7 +1447,6 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
   ::grpc::ByteBuffer write_buf_;
   internal::FlightData read_data_;
   bool started_ = false;
-  std::atomic<bool> cancelled_{false};
   std::atomic<bool> finished_{false};
   std::atomic<int> refs_{1};
 };

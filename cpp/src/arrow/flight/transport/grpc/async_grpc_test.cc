@@ -941,6 +941,148 @@ TEST(AsyncGrpcTest, SchemaOnlyDoGet) {
   ASSERT_EQ(inner_server.ticket(), kSchemaOnlyTicket);
 }
 
+// A DoGet stream whose first payload never arrives: the producer is parked
+// forever, so only a client cancel can ever end the RPC.  `close_count` and
+// `next_awaits` let the test observe, from the test thread, that the payload
+// demand is live and that Close() was delivered exactly once.
+class HangingDoGetStream final : public AsyncFlightDataStream {
+ public:
+  HangingDoGetStream(std::shared_ptr<RecordBatchReader> reader,
+                     std::atomic<int>* next_awaits, std::atomic<int>* close_count)
+      : stream_(std::make_unique<flight::RecordBatchStream>(std::move(reader))),
+        next_awaits_(next_awaits),
+        close_count_(close_count) {}
+
+  std::shared_ptr<Schema> schema() override { return stream_->schema(); }
+
+  arrow::Future<FlightPayload> GetSchemaPayloadAsync() override {
+    return arrow::Future<FlightPayload>::MakeFinished(stream_->GetSchemaPayload());
+  }
+
+  arrow::Future<FlightPayload> NextAsync() override {
+    next_awaits_->fetch_add(1);
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_ = arrow::Future<FlightPayload>::Make();
+    return pending_;
+  }
+
+  // The transport's stop signal: resolve the pending payload so the producer
+  // does not park forever (mirrors the example's TimedAsyncStream::Close).
+  Status Close() override {
+    close_count_->fetch_add(1);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_.is_valid() && !pending_.is_finished()) {
+      pending_.MarkFinished(arrow::Status::Cancelled());
+    }
+    return Status::OK();
+  }
+
+ private:
+  std::unique_ptr<flight::RecordBatchStream> stream_;
+  std::atomic<int>* next_awaits_;
+  std::atomic<int>* close_count_;
+  std::mutex mutex_;
+  arrow::Future<FlightPayload> pending_;
+};
+
+// DoGet server with a configurable hang: kPrepare leaves DoGetAsync() pending
+// (no stream ever exists); kStream resolves the stream but leaves the first
+// payload pending.
+class HangingDoGetServer final : public AsyncGenericFlightServerBase {
+ public:
+  enum class HangAt { kPrepare, kStream };
+  explicit HangingDoGetServer(HangAt hang) : hang_(hang) {}
+
+  arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
+      const ServerCallContext&, const Ticket&) override {
+    if (hang_ == HangAt::kPrepare) {
+      return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::Make();
+    }
+    auto reader = arrow::RecordBatchReader::Make(
+                      {}, arrow::schema({arrow::field("value", arrow::int64())}))
+                      .ValueOrDie();
+    return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+        std::make_shared<HangingDoGetStream>(std::move(reader), &next_awaits,
+                                             &stream_closes));
+  }
+
+  std::atomic<int> next_awaits{0};
+  std::atomic<int> stream_closes{0};
+
+ private:
+  HangAt hang_;
+};
+
+TEST(AsyncGrpcTest, DoGetClientCancelWithPendingPayloadFinishes) {
+  // The client gives up while the producer's NextAsync() is pending: the
+  // transport must finish the RPC itself and deliver Close() to the producer,
+  // instead of waiting for a payload that will not come.  Without the fix the
+  // Shutdown()/Wait() below never return (gRPC keeps the call alive until
+  // Finish() runs), which is why this test runs under a shell timeout.
+  auto trace = std::make_shared<MiddlewareTrace>();
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingDoGetServer flight_server(HangingDoGetServer::HangAt::kStream);
+  FlightServerOptions options(location);
+  options.middleware = {
+      {"recording", std::make_shared<RecordingServerMiddlewareFactory>(trace)}};
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  // DoGet returns once the schema payload is written; the payload after it is
+  // the one that never comes.  Wait until the server has actually asked for
+  // it, so the cancel lands on a live demand (not a race with the schema
+  // write).
+  ASSERT_OK_AND_ASSIGN(auto reader, client->DoGet(Ticket{"hang"}));
+  ASSERT_TRUE(WaitFor([&flight_server] { return flight_server.next_awaits.load() >= 1; }))
+      << "the server never asked for its first payload";
+
+  reader->Cancel();
+  reader.reset();
+  ASSERT_OK(client->Close());
+
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // The producer was told to stop, exactly once.
+  EXPECT_EQ(1, flight_server.stream_closes.load());
+  // And the call reported completion exactly once (the CAS in FinishOnce).
+  std::lock_guard<std::mutex> guard(trace->mutex);
+  EXPECT_EQ(1, trace->call_completed);
+}
+
+TEST(AsyncGrpcTest, DoGetClientDeadlineWhilePreparingFinishes) {
+  // DoGetAsync() never resolves and the client's deadline expires: the RPC
+  // must end anyway.  Without the fix the Shutdown()/Wait() below never
+  // return.  No stream exists here, so Close() has nothing to deliver and the
+  // producer notices through ServerCallContext::is_cancelled().
+  auto trace = std::make_shared<MiddlewareTrace>();
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingDoGetServer flight_server(HangingDoGetServer::HangAt::kPrepare);
+  FlightServerOptions options(location);
+  options.middleware = {
+      {"recording", std::make_shared<RecordingServerMiddlewareFactory>(trace)}};
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(500);
+  auto reader = client->DoGet(impatient, Ticket{"hang"});
+  EXPECT_FALSE(reader.ok()) << "the deadline must expire while the server prepares";
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  EXPECT_EQ(0, flight_server.stream_closes.load())
+      << "no stream was ever prepared, so there is nothing to Close";
+  std::lock_guard<std::mutex> guard(trace->mutex);
+  EXPECT_EQ(1, trace->call_completed);
+}
+
 TEST(AsyncGrpcTest, EmptyDoPut) {
   TestFlightServer inner_server;
   auto listener = std::make_shared<RecordingListener>();
@@ -1251,6 +1393,37 @@ TEST(AsyncGrpcTest, PollFlightInfoIsServedAsync) {
   ASSERT_OK(flight_server.Wait());
 
   ASSERT_EQ("ping", inner_server.last_descriptor().cmd);
+}
+
+// A GetFlightInfo handler whose future never resolves: the deadline is the
+// only thing that can end the RPC.
+class HangingUnaryServer final : public AsyncGenericFlightServerBase {
+ public:
+  arrow::Future<std::shared_ptr<FlightInfo>> GetFlightInfoAsync(
+      const ServerCallContext&, const FlightDescriptor&) override {
+    return arrow::Future<std::shared_ptr<FlightInfo>>::Make();
+  }
+};
+
+TEST(AsyncGrpcTest, GetFlightInfoDeadlineWithPendingHandlerFinishes) {
+  // Without the fix, Shutdown() below never returns.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingUnaryServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(500);
+  auto status =
+      client->GetFlightInfo(impatient, FlightDescriptor::Command("hang")).status();
+  EXPECT_FALSE(status.ok()) << "the deadline must expire while the handler hangs";
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
 }
 
 TEST(AsyncGrpcTest, UnaryReactorPropagatesServerError) {
@@ -1748,6 +1921,75 @@ TEST(AsyncGrpcTest, DoExchangeClientDisconnectFinishes) {
       WaitFor([&flight_server] { return flight_server.exchanges_in_flight() == 0; });
   ASSERT_TRUE(drained) << "the exchange handler never left (in flight: "
                        << flight_server.exchanges_in_flight() << ")";
+
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+// A ListFlights handler whose future never resolves.
+class HangingListingServer final : public AsyncGenericFlightServerBase {
+ public:
+  arrow::Future<std::shared_ptr<AsyncFlightListing>> ListFlightsAsync(
+      const ServerCallContext&, const Criteria*) override {
+    return arrow::Future<std::shared_ptr<AsyncFlightListing>>::Make();
+  }
+};
+
+TEST(AsyncGrpcTest, ListFlightsDeadlineWithPendingHandlerFinishes) {
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingListingServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(500);
+  auto listing = client->ListFlights(impatient, Criteria("hang"));
+  EXPECT_FALSE(listing.ok()) << "the deadline must expire while the handler hangs";
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+// A DoExchange handler whose future never resolves.
+class HangingExchangeServer final : public AsyncGenericFlightServerBase {
+ public:
+  arrow::Future<> DoExchangeAsync(const ServerCallContext&,
+                                  std::shared_ptr<AsyncFlightMessageReader>,
+                                  std::shared_ptr<AsyncFlightMessageWriter>) override {
+    handler_started.fetch_add(1);
+    return arrow::Future<>::Make();  // never resolved
+  }
+
+  std::atomic<int> handler_started{0};
+};
+
+TEST(AsyncGrpcTest, DoExchangeClientCancelWithPendingHandlerFinishes) {
+  // The client walks away with the handler still parked: the transport must
+  // finish the RPC (and unwind reader/writer), not wait for the handler.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingExchangeServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto exchange,
+                       client->DoExchange(FlightDescriptor::Command("hang")));
+  // Wait until the handler is in (the descriptor reached it), so the cancel
+  // lands on a live handler rather than a race with dispatch.
+  ASSERT_TRUE(WaitFor([&flight_server] {
+    return flight_server.handler_started.load() >= 1;
+  })) << "the exchange handler never started";
+
+  exchange.reader->Cancel();
+  exchange.writer.reset();
+  exchange.reader.reset();
+  ASSERT_OK(client->Close());
 
   ASSERT_OK(flight_server.Shutdown());
   ASSERT_OK(flight_server.Wait());

@@ -34,6 +34,16 @@ namespace arrow::flight {
 ///
 /// The async transport pumps this stream through
 /// NextAsync()/GetSchemaPayloadAsync() and never blocks a gRPC callback thread.
+///
+/// The transport calls Close() at most once, from whichever ending comes
+/// first (end of stream, write failure, or the client cancelling the RPC): a
+/// stream whose payload future is still pending when the RPC dies gets
+/// Close() from a transport thread, and resolving that pending future there
+/// is how the stream is expected to stop.  Close() must not block.  When the
+/// RPC is cancelled while DoGetAsync() is still preparing the stream, there
+/// is no stream yet to Close(): the transport finishes the RPC anyway, and
+/// preparation should observe ServerCallContext::is_cancelled() and give up
+/// on its own.
 class ARROW_FLIGHT_EXPORT AsyncFlightDataStream {
  public:
   virtual ~AsyncFlightDataStream();
@@ -41,12 +51,19 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataStream {
   virtual std::shared_ptr<Schema> schema() = 0;
 
   /// \brief Like GetSchemaPayload(), but the payload arrives later.
+  /// \return A future completed with the schema payload. A non-OK status fails the RPC.
   virtual arrow::Future<FlightPayload> GetSchemaPayloadAsync() = 0;
 
   /// \brief Like Next(), but the payload arrives later.
-  /// The last payload has null metadata, as in the synchronous interface.
-  virtual arrow::Future<FlightPayload> NextAsync() = 0;
+  /// \return A future completed with the next payload, or with a nullopt once the stream is exhausted. A non-OK status fails the RPC.
+  virtual arrow::Future<std::optional<FlightPayload>> NextAsync() = 0;
 
+  /// \brief Stop the stream: the RPC it was producing for is over.
+  ///
+  /// Called at most once, possibly from any thread.  A pending
+  /// NextAsync()/GetSchemaPayloadAsync() future must be resolved here (or
+  /// abandoned knowingly): the transport does not wait for it.  On the
+  /// end-of-stream path the status Close() returns is the RPC's final status.
   virtual Status Close() { return Status::OK(); }
 };
 
@@ -218,6 +235,12 @@ class ARROW_FLIGHT_EXPORT AsyncGenericFlightServerBase {
   /// writes whatever stream it resolves to.
   /// \param[in] `context` is the server call context.
   /// \param[in] `request` is an opaque ticket The default answers UNIMPLEMENTED.
+  ///
+  /// If the RPC is cancelled while the returned future is pending, the
+  /// transport finishes the RPC without waiting for it, and the stream it
+  /// eventually resolves to is dropped unconsumed (Close() was already
+  /// delivered, before the stream existed).  A producer that must give up
+  /// early watches ServerCallContext::is_cancelled().
   virtual arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
       const ServerCallContext& context, const Ticket& request);
 
