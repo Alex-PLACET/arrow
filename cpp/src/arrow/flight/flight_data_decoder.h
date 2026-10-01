@@ -95,8 +95,9 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
 
   /// \brief Called once, when the upload ends, whichever way it ends.
   ///
-  /// Runs on a transport thread, so it must not block. 
-  // `status` is OK for an upload if the client ended normally, and the failure otherwise (the client went
+  /// Runs on a transport thread, so it must not block.
+  // `status` is OK for an upload if the client ended normally, and the failure otherwise
+  // (the client went
   /// away, the transport failed, or the upload was rejected).
   ///
   /// \param status The terminal status of the upload.
@@ -108,7 +109,7 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
   /// Finishes the RPC with that status without waiting for the client to end
   /// the upload: the client's pending write or Close() reports it.
   /// Use for a server-side rejection discovered mid-upload (quota, bad batch, upstream
-  /// error). 
+  /// error).
   /// Safe to call from any thread at any time: once the upload is no
   /// longer in flight this reports Invalid instead of reaching a finished RPC.
   /// \param status The status to cancel the upload with.
@@ -136,7 +137,8 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
 /// and fires events on the provided AsyncFlightDataListener.
 class ARROW_FLIGHT_EXPORT AsyncFlightMessageDecoder {
  public:
-  /// \brief Construct an AsyncFlightMessageDecoder with the given listener and IPC read options.
+  /// \brief Construct an AsyncFlightMessageDecoder with the given listener and IPC read
+  /// options.
   ///
   /// \param listener The listener that will receive decoded Flight messages.
   /// \param options The IPC read options to use for decoding.

@@ -26,8 +26,6 @@
 
 namespace arrow::flight::transport::grpc {
 
-// The shared helper's async handshake hook: one Handshake RPC adapted to the
-// server class's Handshake virtual.
 using HandshakeFn =
     GrpcServerCallContextHelper<::grpc::CallbackServerContext>::HandshakeFn;
 

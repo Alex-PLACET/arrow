@@ -56,7 +56,8 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataStream {
   virtual arrow::Future<FlightPayload> GetSchemaPayloadAsync() = 0;
 
   /// \brief Like Next(), but the payload arrives later.
-  /// \return A future completed with the next payload, or with a nullopt once the stream is exhausted. A non-OK status fails the RPC.
+  /// \return A future completed with the next payload, or with a nullopt once the stream
+  /// is exhausted. A non-OK status fails the RPC.
   virtual arrow::Future<std::optional<FlightPayload>> NextAsync() = 0;
 
   /// \brief Stop the stream: the RPC it was producing for is over.

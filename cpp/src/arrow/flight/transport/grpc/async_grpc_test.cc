@@ -2260,6 +2260,222 @@ TEST(AsyncGrpcTest, DoPutCancelAfterUploadIsInvalid) {
   ASSERT_EQ(listener->cancel_status().code(), arrow::StatusCode::Invalid);
 }
 
+/// A listener stuck inside OnNext(): the upload is parked in the application
+/// while the RPC underneath it dies.
+class HangingDoPutListener final : public FinishRecordingListener {
+ public:
+  arrow::Future<> OnNext(FlightStreamChunk) override {
+    next_awaits_.fetch_add(1);
+    return arrow::Future<>::Make();
+  }
+
+  std::atomic<int> next_awaits_{0};
+};
+
+/// A DoPut server that hands out a hanging listener; one per upload, like the
+/// production seam.
+class HangingDoPutServer final : public AsyncGenericFlightServerBase {
+ public:
+  std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
+      const ServerCallContext&) override {
+    auto listener = std::make_shared<HangingDoPutListener>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    listeners_.push_back(listener);
+    return listener;
+  }
+
+  bool listener_ready() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !listeners_.empty();
+  }
+
+  std::shared_ptr<HangingDoPutListener> listener(int i) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return listeners_[i];
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::shared_ptr<HangingDoPutListener>> listeners_;
+};
+
+TEST(AsyncGrpcTest, DoPutClientDeadlineWithPendingHandlerFinishes) {
+  // The client's deadline expires while the listener is still processing a
+  // chunk (its OnNext() future never resolves): the transport must finish the
+  // RPC itself instead of waiting for the listener.  Without the fix the
+  // Shutdown()/Wait() below never return (gRPC keeps the call alive until
+  // Finish() runs), which is why this test runs under a shell timeout.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingDoPutServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(1000);
+  auto put = client->DoPut(impatient, FlightDescriptor::Path({"hang"}), schema);
+  ASSERT_TRUE(put.ok()) << put.status();
+  (void)put->writer->WriteRecordBatch(*batch);
+
+  // From here the listener is inside OnNext() and the deadline does the rest.
+  ASSERT_TRUE(WaitFor([&flight_server] {
+    return flight_server.listener_ready() &&
+           flight_server.listener(0)->next_awaits_.load() >= 1;
+  })) << "the listener never saw a chunk";
+
+  ARROW_UNUSED(put->writer->Close());
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // The upload ended anyway, and the listener heard about it exactly once.
+  ASSERT_EQ(1, flight_server.listener(0)->finish_count());
+}
+
+TEST(AsyncGrpcTest, DoPutClientDeadlineWhileIdleIsNotACleanFinish) {
+  // The deadline expires while the server is idle (the batch was consumed and
+  // a read is armed): the upload was cut short by the client, so OnFinish()
+  // must not report it as a clean end -- only the acknowledgement write
+  // completing cleanly may say OK.
+  TestUploadServerAsyncAdapter flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(600);
+  auto put = client->DoPut(impatient, FlightDescriptor::Path({"idle"}), schema);
+  ASSERT_TRUE(put.ok()) << put.status();
+  ASSERT_OK(put->writer->WriteRecordBatch(*batch));
+
+  auto listener = flight_server.WaitForListener(0);
+  ASSERT_NE(listener, nullptr) << "the server never handed out a DoPut listener";
+  ASSERT_TRUE(WaitFor([&listener] { return listener->batches().size() >= 1; }));
+  // The batch is consumed; let the deadline fire on the idle upload.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+
+  // The deadline must have fired before Close(): that is what makes an OK
+  // finishing status impossible below.
+  const auto close_status = put->writer->Close();
+  ASSERT_FALSE(close_status.ok()) << "the deadline never fired; inconclusive";
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  ASSERT_EQ(1, listener->finish_count());
+  EXPECT_FALSE(listener->finish_status().ok())
+      << "a deadline-cancelled upload was reported as a clean finish: "
+      << listener->finish_status();
+}
+
+/// A listener whose OnNext() future the test resolves on demand: the upload
+/// parks in the application until the late-continuation test releases it.
+class DeferredDoPutListener final : public FinishRecordingListener {
+ public:
+  arrow::Future<> OnNext(FlightStreamChunk) override {
+    next_awaits_.fetch_add(1);
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_ = arrow::Future<>::Make();
+    return pending_;
+  }
+
+  /// Resolve the parked OnNext; OK releases the decode continuation.
+  void ResolvePending() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_.is_valid() && !pending_.is_finished()) {
+      pending_.MarkFinished(arrow::Status::OK());
+    }
+  }
+
+  std::atomic<int> next_awaits_{0};
+
+ private:
+  std::mutex mutex_;
+  arrow::Future<> pending_;
+};
+
+class DeferredDoPutServer final : public AsyncGenericFlightServerBase {
+ public:
+  std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
+      const ServerCallContext&) override {
+    auto listener = std::make_shared<DeferredDoPutListener>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    listener_ = listener;
+    return listener;
+  }
+
+  std::shared_ptr<DeferredDoPutListener> listener() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return listener_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::shared_ptr<DeferredDoPutListener> listener_;
+};
+
+TEST(AsyncGrpcTest, DoPutClientCancelWhileListenerParkedStaysSafe) {
+  // The listener's OnNext() resolves AFTER the deadline already finished the
+  // RPC: the parked decode continuation must stand down (release its hold,
+  // never touch the dead call) instead of use-after-freeing the reactor.
+  // The test resolves the parked future from its own thread; the server keeps
+  // its shared_ptr alive, so the resolution lands on the real listener.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  DeferredDoPutServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(600);
+  auto put = client->DoPut(impatient, FlightDescriptor::Path({"late"}), schema);
+  ASSERT_TRUE(put.ok()) << put.status();
+  ASSERT_OK(put->writer->WriteRecordBatch(*batch));
+
+  auto listener = flight_server.listener();
+  ASSERT_TRUE(WaitFor([&] {
+    listener = flight_server.listener();
+    return listener != nullptr && listener->next_awaits_.load() >= 1;
+  })) << "the listener never saw a chunk";
+
+  // Let the deadline finish the RPC while the listener is parked.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  ARROW_UNUSED(put->writer->Close());
+  ASSERT_OK(client->Close());
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  // Now resolve the parked listener: the continuation runs on the finished
+  // RPC.  If the guard/hold were wrong, this is where the UAF lands.
+  listener->ResolvePending();
+
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // The upload had ended once, and the late resolution did not add a second
+  // report or crash the reactor.
+  ASSERT_EQ(1, listener->finish_count());
+}
+
 TEST(AsyncGrpcTest, UseAsyncGrpcFlagUploadRejectedOnDescriptor) {
   // A handler that rejects the descriptor rejects the whole upload through
   // the same surface as an OnNext rejection: the writer's status.

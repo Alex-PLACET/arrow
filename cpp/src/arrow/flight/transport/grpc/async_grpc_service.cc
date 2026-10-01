@@ -395,11 +395,8 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   void OnReadDone(bool ok) override {
     if (!ok) {
       if (finished_.load()) {
-        return;
+        return;  // an ending already claimed the RPC
       }
-      ARROW_WARN_NOT_OK(
-          internal::FlightDataListenerTransport::ReportFinish(listener_, Status::OK()),
-          "Reporting the end of an upload to the listener failed");
       pb::PutResult pb_result;
       write_buf_ = MakeWriteBuffer(pb_result);
       StartWrite(&write_buf_);
@@ -420,13 +417,21 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
     // Feed the Arrow buffer to the AsyncFlightMessageDecoder. This will trigger the
     // appropriate callbacks on the listener (OnSchemaDecoded / OnNext).
     Future<> decode_status = decoder_.Consume(std::move(arrow_buf));
+    Hold();
     decode_status.AddCallback([this](arrow::Status status) {
+      if (finished_) {
+        ReleaseHold();
+        return;
+      }
       if (!status.ok()) {
         // The listener's status is the transport error rejecting the upload.
-        FinishUpload(status);
+        FinishUpload(std::move(status));
+        ReleaseHold();
+        return;
       }
       // Read next FlightData.
       StartRead(&request_buf_);
+      ReleaseHold();
     });
   }
 
@@ -434,20 +439,31 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   /// \param `ok` indicates whether the write was successful. If false, the client has
   /// closed its half of the stream.
   void OnWriteDone(bool ok) override {
+    if (finished_) {
+      return;  // the RPC is over; gRPC may still deliver this
+    }
     if (!ok) {
-      // The client closed its half of the stream before the write could complete.
+      // The client went away before the acknowledgement could be delivered:
+      // the upload did not end cleanly.
       FinishUpload(MakeFlightError(FlightStatusCode::Internal, "Write failed"));
       return;
     }
+    // The acknowledgement reached the client: this is the clean ending of the
+    // upload, and the only path that may report OK to the listener.
     FinishUpload(arrow::Status::OK());
   }
 
   /// \brief Called when the client cancels the RPC.
+  ///
+  /// The RPC must not wait for the listener's pending future: finish here, so
+  /// gRPC can deliver OnDone; a pending decode continuation stands down when
+  /// (if) it runs.
   void OnCancel() override {
+    Status cancel_status = Status::Cancelled("the client cancelled the upload");
     ARROW_WARN_NOT_OK(
-        internal::FlightDataListenerTransport::ReportFinish(
-            listener_, Status::Cancelled("the client cancelled the upload")),
+        internal::FlightDataListenerTransport::ReportFinish(listener_, cancel_status),
         "Reporting the cancellation of an upload to the listener failed");
+    FinishOnce(std::move(cancel_status));
   }
 
   /// \brief Called when the RPC is done, regardless of success, failure, or cancellation.
