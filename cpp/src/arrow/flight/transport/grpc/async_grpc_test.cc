@@ -23,6 +23,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -102,8 +103,16 @@ class ResolvedStream : public AsyncFlightDataStream {
   arrow::Future<FlightPayload> GetSchemaPayloadAsync() override {
     return arrow::Future<FlightPayload>::MakeFinished(stream_->GetSchemaPayload());
   }
-  arrow::Future<FlightPayload> NextAsync() override {
-    return arrow::Future<FlightPayload>::MakeFinished(stream_->Next());
+  arrow::Future<std::optional<FlightPayload>> NextAsync() override {
+    auto payload = stream_->Next();
+    if (!payload.ok()) {
+      return arrow::Future<std::optional<FlightPayload>>::MakeFinished(payload.status());
+    }
+    if (payload->ipc_message.metadata == nullptr) {
+      // End of stream: the async interface reports it as a nullopt.
+      return arrow::Future<std::optional<FlightPayload>>::MakeFinished(std::nullopt);
+    }
+    return arrow::Future<std::optional<FlightPayload>>::MakeFinished(std::move(*payload));
   }
   Status Close() override { return stream_->Close(); }
 
@@ -959,10 +968,10 @@ class HangingDoGetStream final : public AsyncFlightDataStream {
     return arrow::Future<FlightPayload>::MakeFinished(stream_->GetSchemaPayload());
   }
 
-  arrow::Future<FlightPayload> NextAsync() override {
+  arrow::Future<std::optional<FlightPayload>> NextAsync() override {
     next_awaits_->fetch_add(1);
     std::lock_guard<std::mutex> lock(mutex_);
-    pending_ = arrow::Future<FlightPayload>::Make();
+    pending_ = arrow::Future<std::optional<FlightPayload>>::Make();
     return pending_;
   }
 
@@ -982,7 +991,7 @@ class HangingDoGetStream final : public AsyncFlightDataStream {
   std::atomic<int>* next_awaits_;
   std::atomic<int>* close_count_;
   std::mutex mutex_;
-  arrow::Future<FlightPayload> pending_;
+  arrow::Future<std::optional<FlightPayload>> pending_;
 };
 
 // DoGet server with a configurable hang: kPrepare leaves DoGetAsync() pending

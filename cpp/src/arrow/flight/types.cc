@@ -1201,27 +1201,10 @@ TransportStatusDetail::Unwrap(const Status& status) {
 
 AsyncListenerBase::AsyncListenerBase() = default;
 AsyncListenerBase::~AsyncListenerBase() = default;
-
-std::unique_lock<std::mutex> AsyncListenerBase::LockRpcState() const {
-  return std::unique_lock<std::mutex>(rpc_state_mutex_);
-}
-
 void AsyncListenerBase::TryCancel() {
-  auto state_lock = LockRpcState();
-  if (auto* rpc = rpc_state()) {
-    rpc->TryCancel();
+  if (rpc_state_) {
+    rpc_state_->TryCancel();
   }
-}
-
-Status AsyncDoGetListener::RequestNext() {
-  auto state_lock = LockRpcState();
-  auto* rpc = rpc_state();
-  if (!rpc) {
-    return Status::Invalid(
-        "no RPC in progress: RequestNext() must be called after "
-        "FlightClient::DoGetAsync() and before OnFinish()");
-  }
-  return rpc->RequestNext();
 }
 
 }  // namespace flight

@@ -99,8 +99,7 @@ template <typename ProtoT>
 /// \param[in] what names the message in the "Failed to read/parse <what>"
 /// errors ("Ticket", "FlightDescriptor", …).
 /// \tparam PbT The type of the proto message to parse.
-/// \tparam T The type to convert the proto message to.
-template <typename PbT, typename T>
+template <typename PbT>
 arrow::Result<PbT> ParseProtoRequest(const ::grpc::ByteBuffer& buf,
                                      std::string_view what) {
   ARROW_ASSIGN_OR_RAISE(std::string bytes,
