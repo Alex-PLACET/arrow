@@ -23,11 +23,13 @@ install_headers(
         'client.h',
         'client_middleware.h',
         'client_tracing_middleware.h',
+        'flight_data_decoder.h',
         'middleware.h',
         'otel_logging.h',
         'platform.h',
         'server_auth.h',
         'server.h',
+        'server_async.h',
         'server_middleware.h',
         'server_tracing_middleware.h',
         'test_auth_handlers.h',
@@ -81,14 +83,23 @@ arrow_flight_srcs = [
     'client_cookie_middleware.cc',
     'client_tracing_middleware.cc',
     'cookie_internal.cc',
+    'flight_data_decoder.cc',
     'middleware.cc',
     'serialization_internal.cc',
     'server.cc',
+    'server_async.cc',
     'server_auth.cc',
     'server_tracing_middleware.cc',
     'transport.cc',
     'transport_server.cc',
     'transport_server_internal.cc',
+    'transport/grpc/async_grpc_service.cc',
+    'transport/grpc/async_grpc_do_get.cc',
+    'transport/grpc/async_grpc_do_put.cc',
+    'transport/grpc/async_grpc_exchange.cc',
+    'transport/grpc/async_grpc_handshake.cc',
+    'transport/grpc/async_grpc_streaming.cc',
+    'transport/grpc/async_grpc_unary.cc',
     'transport/grpc/grpc_client.cc',
     'transport/grpc/grpc_server.cc',
     'transport/grpc/grpc_server_internal.cc',
@@ -165,6 +176,18 @@ foreach flight_test : flight_tests
     )
     test(test_name, exc)
 endforeach
+
+async_grpc_test = executable(
+    'flight-async-grpc-test',
+    sources: [
+        'transport/grpc/async_grpc_test.cc',
+        # async_grpc_test.cc transitively includes Flight.grpc.pb.h
+        # so we must declare that here to avoid a race condition
+        flight_proto_grpc_files[1],
+    ],
+    dependencies: [arrow_test_dep, arrow_flight_test_dep],
+)
+test('flight-async-grpc-test', async_grpc_test)
 
 flight_test_dep_no_main = [
     arrow_dep,

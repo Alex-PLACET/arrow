@@ -1159,6 +1159,8 @@ class ARROW_FLIGHT_EXPORT ResultStream {
 struct ARROW_FLIGHT_EXPORT FlightStreamChunk {
  public:
   FlightStreamChunk() noexcept;
+  FlightStreamChunk(std::shared_ptr<RecordBatch> data,
+                    std::shared_ptr<Buffer> app_metadata) noexcept;
   ~FlightStreamChunk();
 
   std::shared_ptr<RecordBatch> data;

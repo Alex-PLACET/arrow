@@ -306,6 +306,64 @@ int PortFromLocation(const Location& location) {
   return maybe_uri.ValueUnsafe().port();
 }
 
+ServerLifecycle::ServerLifecycle(const char* server_name) : server_name_(server_name) {}
+
+ServerLifecycle::~ServerLifecycle() = default;
+
+Status ServerLifecycle::Init(const FlightServerOptions& options,
+                             std::unique_ptr<ServerTransport> transport) {
+  ARROW_ASSIGN_OR_RAISE(auto uri, ParseLocationUri(options.location));
+  transport_ = std::move(transport);
+  return transport_->Init(options, uri);
+}
+
+int ServerLifecycle::port() const { return PortFromLocation(location()); }
+
+Location ServerLifecycle::location() const { return transport_->location(); }
+
+Status ServerLifecycle::SetShutdownOnSignals(const std::vector<int>& signals) {
+  return signal_state_.SetShutdownOnSignals(signals);
+}
+
+Status ServerLifecycle::Serve() {
+  return signal_state_.Serve(
+      [this]() -> Status {
+        if (!transport_) {
+          return Status::UnknownError("Server did not start properly");
+        }
+        return transport_->Wait();
+      },
+      [this](const std::chrono::system_clock::time_point* deadline) -> Status {
+        return Shutdown(deadline);
+      },
+      "Server did not start properly", "Error shutting down server");
+}
+
+int ServerLifecycle::GotSignal() const { return signal_state_.GotSignal(); }
+
+Status ServerLifecycle::Shutdown(const std::chrono::system_clock::time_point* deadline) {
+  return signal_state_.Shutdown(
+      [this](const std::chrono::system_clock::time_point* maybe_deadline) -> Status {
+        if (!transport_) {
+          return Status::Invalid("Shutdown() on uninitialized ", server_name_);
+        }
+        if (maybe_deadline) {
+          return transport_->Shutdown(*maybe_deadline);
+        }
+        return transport_->Shutdown();
+      },
+      deadline);
+}
+
+Status ServerLifecycle::Wait() {
+  return signal_state_.Wait([this] {
+    if (!transport_) {
+      return Status::Invalid("Wait() on uninitialized ", server_name_);
+    }
+    return transport_->Wait();
+  });
+}
+
 Status ServerTransportBase::WriteDataStream(std::unique_ptr<FlightDataStream> data_stream,
                                             ServerDataStream* stream) const {
   if (!data_stream) {

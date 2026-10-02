@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/flight/flight_data_decoder.h"
 #include "arrow/flight/server_auth.h"
 #include "arrow/flight/type_fwd.h"
 #include "arrow/flight/types.h"       // IWYU pragma: keep

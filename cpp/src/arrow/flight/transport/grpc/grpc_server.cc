@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "arrow/flight/transport/grpc/async_grpc_service.h"
 #include "arrow/flight/transport/grpc/customize_grpc.h"
 
 #include <grpcpp/grpcpp.h>
@@ -429,7 +430,11 @@ class GrpcServiceHandler final : public FlightService::Service {
 // The ServerTransport implementation for gRPC. Manages the gRPC server itself.
 class GrpcServerTransport : public internal::ServerTransport {
  public:
-  using internal::ServerTransport::ServerTransport;
+  GrpcServerTransport(FlightServerBase* base,
+                      std::shared_ptr<MemoryManager> memory_manager,
+                      AsyncGenericFlightServerBase* async_base = nullptr)
+      : internal::ServerTransport(base, std::move(memory_manager)),
+        async_base_(async_base) {}
 
   static arrow::Result<std::unique_ptr<internal::ServerTransport>> Make(
       FlightServerBase* base, std::shared_ptr<MemoryManager> memory_manager) {
@@ -437,15 +442,60 @@ class GrpcServerTransport : public internal::ServerTransport {
         new GrpcServerTransport(base, std::move(memory_manager)));
   }
 
+  /// \brief Like Make(), for a server that is an AsyncGenericFlightServerBase.
+  ///
+  /// This is the async mode: the transport serves the async server's handlers
+  /// through the generic callback service, with no FlightServerBase involved.
+  static arrow::Result<std::unique_ptr<internal::ServerTransport>> MakeAsync(
+      AsyncGenericFlightServerBase* async_base,
+      std::shared_ptr<MemoryManager> memory_manager) {
+    return std::unique_ptr<internal::ServerTransport>(
+        new GrpcServerTransport(/*base=*/nullptr, std::move(memory_manager), async_base));
+  }
+
   Status Init(const FlightServerOptions& options, const arrow::util::Uri& uri) override {
-    grpc_service_.reset(
-        new GrpcServiceHandler(options.auth_handler, options.middleware, this));
+    if (async_base_ != nullptr) {
+      // The generic callback service runs middleware (through the shared helper)
+      // but cannot run the blocking ServerAuthHandler: it is driven from
+      // callback threads.  Refuse it rather than silently serving
+      // unauthenticated requests.
+      if (options.auth_handler) {
+        return Status::NotImplemented(
+            "AsyncGenericFlightServerBase does not support a blocking auth handler; "
+            "override Handshake/ValidateToken instead");
+      }
+      // The async hooks come from the server class itself: the transport was
+      // handed the async server, so no cast is needed.  The pointer stays valid
+      // for the server's lifetime: it IS the user's server object.
+      using AsyncHelper = GrpcServerCallContextHelper<::grpc::CallbackServerContext>;
+      AsyncHelper::HandshakeFn handshake =
+          [base = async_base_](const ServerCallContext& context,
+                               const std::string& request, std::string* response) {
+            return base->Handshake(context, request, response);
+          };
+      AsyncHelper::ValidateTokenFn validate_token =
+          [base = async_base_](const ServerCallContext& context, const std::string& token,
+                               std::string* peer_identity) {
+            return base->ValidateToken(context, token, peer_identity);
+          };
+      async_helper_ = std::make_shared<AsyncHelper>(
+          /*auth_handler=*/nullptr, options.middleware, std::move(validate_token));
+      async_service_ = std::make_unique<AsyncGenericFlightService>(
+          async_base_, async_helper_, std::move(handshake));
+    } else {
+      grpc_service_.reset(
+          new GrpcServiceHandler(options.auth_handler, options.middleware, this));
+    }
 
     ::grpc::ServerBuilder builder;
     int port = 0;
     RETURN_NOT_OK(AddServerListeningPort(options, uri, &builder, &location_, &port));
 
-    builder.RegisterService(grpc_service_.get());
+    if (async_service_) {
+      builder.RegisterCallbackGenericService(async_service_.get());
+    } else {
+      builder.RegisterService(grpc_service_.get());
+    }
     ConfigureServerBuilderOptions(options, &builder);
 
     grpc_server_ = builder.BuildAndStart();
@@ -470,6 +520,16 @@ class GrpcServerTransport : public internal::ServerTransport {
 
  private:
   std::unique_ptr<GrpcServiceHandler> grpc_service_;
+  /// Set when the transport serves an AsyncGenericFlightServerBase (the server
+  /// kind selects the mode); null for a plain FlightServerBase.
+  AsyncGenericFlightServerBase* async_base_ = nullptr;
+  // Set in async mode; shared with the service (and, from task T11 on, with the
+  // per-call auth hook). Declared before async_service_ so it outlives it.
+  std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>>
+      async_helper_;
+  // Set in async mode. Declared before grpc_server_ so it outlives it (the
+  // server holds a pointer to it).
+  std::unique_ptr<AsyncGenericFlightService> async_service_;
   std::unique_ptr<::grpc::Server> grpc_server_;
   Location location_;
 };
@@ -482,6 +542,8 @@ void InitializeFlightGrpcServer() {
     auto* registry = flight::internal::GetDefaultTransportRegistry();
     for (const auto& transport : {"grpc", "grpc+tls", "grpc+tcp", "grpc+unix"}) {
       ARROW_CHECK_OK(registry->RegisterServer(transport, GrpcServerTransport::Make));
+      ARROW_CHECK_OK(
+          registry->RegisterAsyncServer(transport, GrpcServerTransport::MakeAsync));
     }
   });
 }
