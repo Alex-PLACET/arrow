@@ -17,6 +17,7 @@
 
 #include "arrow/flight/transport/grpc/async_grpc_service_internal.h"
 
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -37,8 +38,9 @@ class ExchangeReader final : public AsyncFlightMessageReader {
 
   const FlightDescriptor& descriptor() const override { return descriptor_; }
 
-  /// Asynchronously retrieves the next chunk from the exchange. Returns a future that will
-  /// be completed when the next chunk is available, or with an error if the read fails.
+  /// Asynchronously retrieves the next chunk from the exchange. Returns a future that
+  /// will be completed when the next chunk is available, or with an error if the read
+  /// fails.
   /// \returns A future that will be completed with the next chunk or an error.
   arrow::Future<FlightStreamChunk> NextAsync() override {
     using FSCFuture = arrow::Future<FlightStreamChunk>;
@@ -56,7 +58,9 @@ class ExchangeReader final : public AsyncFlightMessageReader {
       return FSCFuture::MakeFinished(read_error_);
     }
 
-    if (read_closed_) {
+    if (read_closed_ || reactor_.load() == nullptr) {
+      // End of exchange: the reactor either saw the read side close or the RPC
+      // is over (and the reactor is gone), so no further read can be started.
       return FSCFuture::MakeFinished(FlightStreamChunk{});
     }
 
@@ -71,7 +75,10 @@ class ExchangeReader final : public AsyncFlightMessageReader {
     return pending_;
   }
 
-  void SetReactor(ExchangeReactor* reactor) { reactor_ = reactor; }
+  void SetReactor(ExchangeReactor* reactor) { reactor_.store(reactor); }
+  /// Called by the reactor once the exchange is over: from then on the handler's
+  /// reader must refuse to start reads instead of calling into a freed reactor.
+  void DetachReactor() { reactor_.store(nullptr); }
   void SetDescriptor(const FlightDescriptor& descriptor) { descriptor_ = descriptor; }
   void OfferFirstRead(internal::FlightData data) { first_read_ = std::move(data); }
 
@@ -151,7 +158,7 @@ class ExchangeReader final : public AsyncFlightMessageReader {
     ExchangeReader* reader_;
   };
 
-  ExchangeReactor* reactor_ = nullptr;
+  std::atomic<ExchangeReactor*> reactor_{nullptr};
   std::shared_ptr<ChunkListener> listener_;
   AsyncFlightMessageDecoder decoder_;
   FlightDescriptor descriptor_;
@@ -167,7 +174,15 @@ class ExchangeWriter final : public AsyncFlightMessageWriter {
  public:
   explicit ExchangeWriter(ExchangeReactor* reactor) : reactor_(reactor) {}
 
+  /// Called by the reactor once the exchange is over: from then on the handler's
+  /// writer must not call into a freed reactor.
+  void DetachReactor() { reactor_.store(nullptr); }
+
   arrow::Future<> BeginAsync(std::shared_ptr<Schema> schema) override {
+    if (reactor_.load() == nullptr) {
+      return arrow::Future<>::MakeFinished(arrow::Status::Cancelled(
+          "the exchange is over: the client disconnected or cancelled"));
+    }
     if (batch_writer_ != nullptr) {
       return arrow::Future<>::MakeFinished(
           arrow::Status::Invalid("This writer has already been started."));
@@ -260,6 +275,11 @@ class ExchangeWriter final : public AsyncFlightMessageWriter {
   }
 
   arrow::Future<> Flush() {
+    if (reactor_.load() == nullptr) {
+      // The exchange is over: report it rather than pumping into a dead reactor.
+      return arrow::Future<>::MakeFinished(arrow::Status::Cancelled(
+          "the exchange is over: the client disconnected or cancelled"));
+    }
     if (!flush_.is_valid() || flush_.is_finished()) {
       flush_ = arrow::Future<>::Make();
     }
@@ -275,7 +295,7 @@ class ExchangeWriter final : public AsyncFlightMessageWriter {
     }
   }
 
-  ExchangeReactor* reactor_;
+  std::atomic<ExchangeReactor*> reactor_;
   std::unique_ptr<ipc::RecordBatchWriter> batch_writer_;
   ipc::IpcWriteOptions options_ = ipc::IpcWriteOptions::Defaults();
   std::shared_ptr<Buffer> pending_app_metadata_;
@@ -354,6 +374,15 @@ class ExchangeReactor final : public AsyncReactorBase {
     writer_->OnCancelled();
   }
 
+  void OnDone() override {
+    // The handler may still hold the reader/writer: cut their back-pointers
+    // before this reactor is deleted so a late call fails cleanly instead of
+    // dereferencing freed memory.
+    reader_->DetachReactor();
+    writer_->DetachReactor();
+    AsyncReactorBase::OnDone();
+  }
+
   void StartReadNext() {
     if (!finished()) {
       StartRead(&read_buf_);
@@ -386,11 +415,12 @@ class ExchangeReactor final : public AsyncReactorBase {
 };
 
 void ExchangeReader::RequestRead() {
-  if (read_in_flight_ || read_closed_ || reactor_ == nullptr) {
+  ExchangeReactor* reactor = reactor_.load();
+  if (read_in_flight_ || read_closed_ || reactor == nullptr) {
     return;
   }
   read_in_flight_ = true;
-  reactor_->StartReadNext();
+  reactor->StartReadNext();
 }
 
 void ExchangeWriter::Pump() {
@@ -403,10 +433,17 @@ void ExchangeWriter::Pump() {
     }
     return;
   }
+  ExchangeReactor* reactor = reactor_.load();
+  if (reactor == nullptr) {
+    write_in_flight_ = false;
+    FailFlush(arrow::Status::Cancelled(
+        "the exchange is over: the client disconnected or cancelled"));
+    return;
+  }
   FlightPayload payload = std::move(queue_.front());
   queue_.pop_front();
   write_in_flight_ = true;
-  const auto status = reactor_->WritePayload(std::move(payload));
+  const auto status = reactor->WritePayload(std::move(payload));
   if (!status.ok()) {
     write_in_flight_ = false;
     FailFlush(std::move(status));
