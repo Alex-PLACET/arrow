@@ -65,13 +65,13 @@ FlightMethod MethodFromName(std::string_view method) {
 
 class Unimplemented : public ::grpc::ServerGenericBidiReactor {
  public:
-  explicit Unimplemented(::grpc::Status status) : status_(std::move(status)) {
-    Finish(status_);
+  Unimplemented(detail::AsyncCallContext& flight_context, ::grpc::Status status) {
+    Finish(flight_context.FinishRequest(status));
   }
-  void OnDone() override { delete this; }
 
- private:
-  ::grpc::Status status_;
+  explicit Unimplemented(::grpc::Status status) { Finish(status); }
+
+  void OnDone() override { delete this; }
 };
 
 }  // namespace
@@ -97,15 +97,19 @@ AsyncGenericFlightService::AsyncGenericFlightService(
           ? helper_->MakeCallContext(flight_method, context, &flight_context)
           : helper_->CheckAuth(flight_method, context, &flight_context);
   if (!prepare_status.ok()) {
+    // CheckAuth()/MakeCallContext() already ran FinishRequest() for this call,
+    // so only the gRPC status is left to send.
     return new Unimplemented(prepare_status);
   }
 
   switch (flight_method) {
     case FlightMethod::Handshake:
       if (!handshake_handler_) {
-        return new Unimplemented(::grpc::Status(
-            ::grpc::StatusCode::UNIMPLEMENTED,
-            "This service does not have an authentication mechanism enabled."));
+        return new Unimplemented(
+            flight_context,
+            ::grpc::Status(
+                ::grpc::StatusCode::UNIMPLEMENTED,
+                "This service does not have an authentication mechanism enabled."));
       }
       return detail::MakeHandshakeReactor(std::move(flight_context), handshake_handler_);
     case FlightMethod::GetFlightInfo:
@@ -129,6 +133,7 @@ AsyncGenericFlightService::AsyncGenericFlightService(
           base_->CreateDoPutListener(flight_context);
       if (!listener) {
         return new Unimplemented(
+            flight_context,
             ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
                            "DoPut is not implemented: no listener available"));
       }
@@ -138,6 +143,7 @@ AsyncGenericFlightService::AsyncGenericFlightService(
       break;
   }
   return new Unimplemented(
+      flight_context,
       ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED, "Unknown method"));
 }
 

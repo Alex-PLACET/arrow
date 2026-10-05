@@ -1163,6 +1163,40 @@ TEST(AsyncGrpcTest, DoPutWithoutFactoryIsUnimplemented) {
   server->Wait();
 }
 
+TEST(AsyncGrpcTest, MiddlewareCallCompletedRunsOnUnknownMethod) {
+  // Middleware that started for a call must also see CallCompleted when the
+  // call is answered by the UNIMPLEMENTED fallback reactor: otherwise tracing
+  // middleware leaks a span per unknown/unimplemented RPC.
+  auto trace = std::make_shared<MiddlewareTrace>();
+  TestFlightServer flight_server;
+  auto helper =
+      std::make_shared<GrpcServerCallContextHelper<::grpc::CallbackServerContext>>(
+          /*auth_handler=*/nullptr,
+          MiddlewareFactoryList{
+              {"recording", std::make_shared<RecordingServerMiddlewareFactory>(trace)}});
+  AsyncGenericFlightService service(&flight_server, helper);
+
+  int port = 0;
+  ::grpc::ServerBuilder builder;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(), &port);
+  builder.RegisterCallbackGenericService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+  ASSERT_NE(port, 0);
+
+  const ::grpc::Status status = CallUnknownMethod(port);
+  ASSERT_EQ(::grpc::StatusCode::UNIMPLEMENTED, status.error_code())
+      << status.error_message();
+
+  server->Shutdown();
+  server->Wait();
+
+  std::lock_guard<std::mutex> guard(trace->mutex);
+  EXPECT_EQ(1, trace->start_call) << "the middleware must have started for the call";
+  EXPECT_EQ(1, trace->call_completed)
+      << "CallCompleted must run for an UNIMPLEMENTED reply too";
+}
+
 TEST(AsyncGrpcTest, OtherMethodsAreUnimplemented) {
   TestFlightServer flight_server;
   auto listener = std::make_shared<RecordingListener>();
