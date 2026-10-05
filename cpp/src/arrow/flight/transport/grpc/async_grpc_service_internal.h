@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <string_view>
 
@@ -71,14 +72,70 @@ arrow::Status SerializeOrNotFound(const std::shared_ptr<T>& value, PbT* out) {
   return arrow::flight::internal::ToProto(*value, out);
 }
 
+/// \brief Lifetime and termination handling shared by the callback reactors.
+///
+/// A reactor's callbacks run on arbitrary gRPC threads, so it cannot be
+/// destroyed while one is outstanding: the RPC's own lifetime holds the initial
+/// reference (released in OnDone(), after which gRPC never touches the reactor),
+/// and every callback that may outlive its StartRead()/StartWrite() takes
+/// another one.  The last ReleaseHold() deletes the reactor.
+///
+/// The reactors inherit from this class rather than a plain
+/// ::grpc::ServerGenericBidiReactor so that the reference counting, the
+/// finish-once guarantee and the default OnCancel() live in one place.
+class AsyncReactorBase : public ::grpc::ServerGenericBidiReactor {
+ public:
+  explicit AsyncReactorBase(AsyncCallContext flight_context)
+      : flight_context_(std::move(flight_context)) {}
+
+  /// The default cancellation: report the RPC as cancelled and finish it.
+  /// Reactors with their own teardown override this and call it first.
+  void OnCancel() override { FinishOnce(arrow::Status::Cancelled()); }
+
+  void OnDone() override { ReleaseHold(); }
+
+ protected:
+  /// \brief Finish the RPC with this status; later calls are no-ops.
+  ///
+  /// The status is the one the client sees, so the first one wins: the other
+  /// paths (cancel after error, error after cancel) must not overwrite it.
+  void FinishOnce(arrow::Status status) {
+    bool expected = false;
+    if (finished_.compare_exchange_strong(expected, true)) {
+      Finish(flight_context_.FinishRequest(status));
+    }
+  }
+
+  /// Whether FinishOnce() has already run (i.e. the RPC's status is settled).
+  bool finished() const { return finished_.load(); }
+
+  /// The call context: handlers and the teardown paths need it.
+  AsyncCallContext& flight_context() { return flight_context_; }
+
+  /// \brief Account for work that may outlive the callback that started it.
+  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
+
+  /// \brief Drop a reference, deleting the reactor once the last one is gone.
+  void ReleaseHold() {
+    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete this;
+    }
+  }
+
+ private:
+  AsyncCallContext flight_context_;
+  std::atomic<bool> finished_{false};
+  std::atomic<int> refs_{1};
+};
+
 ::grpc::ServerGenericBidiReactor* MakeHandshakeReactor(AsyncCallContext flight_context,
                                                        HandshakeFn handshake_handler);
-::grpc::ServerGenericBidiReactor* MakeGetFlightInfoReactor(AsyncCallContext flight_context,
-                                                           AsyncGenericFlightServerBase* base);
-::grpc::ServerGenericBidiReactor* MakeGetSchemaReactor(AsyncCallContext flight_context,
-                                                       AsyncGenericFlightServerBase* base);
-::grpc::ServerGenericBidiReactor* MakePollFlightInfoReactor(AsyncCallContext flight_context,
-                                                            AsyncGenericFlightServerBase* base);
+::grpc::ServerGenericBidiReactor* MakeGetFlightInfoReactor(
+    AsyncCallContext flight_context, AsyncGenericFlightServerBase* base);
+::grpc::ServerGenericBidiReactor* MakeGetSchemaReactor(
+    AsyncCallContext flight_context, AsyncGenericFlightServerBase* base);
+::grpc::ServerGenericBidiReactor* MakePollFlightInfoReactor(
+    AsyncCallContext flight_context, AsyncGenericFlightServerBase* base);
 ::grpc::ServerGenericBidiReactor* MakeDoGetReactor(AsyncCallContext flight_context,
                                                    AsyncGenericFlightServerBase* base);
 ::grpc::ServerGenericBidiReactor* MakeDoPutReactor(

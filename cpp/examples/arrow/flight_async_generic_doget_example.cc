@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <signal.h>
+#include <csignal>
 #include <unistd.h>
 #if defined(__linux__)
 #  include <sys/prctl.h>

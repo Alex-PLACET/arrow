@@ -17,8 +17,8 @@
 
 #include "arrow/flight/transport/grpc/async_grpc_service.h"
 
-#include <algorithm>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include "arrow/flight/transport/grpc/async_grpc_service_internal.h"
@@ -41,27 +41,26 @@ constexpr std::string_view kListFlightsMethod = "ListFlights";
 constexpr std::string_view kGetFlightInfoMethod = "GetFlightInfo";
 constexpr std::string_view kGetSchemaMethod = "GetSchema";
 
+static const std::unordered_map<std::string_view, FlightMethod> kMethodMap = {
+    {kHandshakeMethod, FlightMethod::Handshake},
+    {kListFlightsMethod, FlightMethod::ListFlights},
+    {kGetFlightInfoMethod, FlightMethod::GetFlightInfo},
+    {kGetSchemaMethod, FlightMethod::GetSchema},
+    {kDoGetMethod, FlightMethod::DoGet},
+    {kDoPutMethod, FlightMethod::DoPut},
+    {kDoActionMethod, FlightMethod::DoAction},
+    {kListActionsMethod, FlightMethod::ListActions},
+    {kDoExchangeMethod, FlightMethod::DoExchange},
+    {kPollFlightInfoMethod, FlightMethod::PollFlightInfo},
+};
+
 FlightMethod MethodFromName(std::string_view method) {
   if (!method.starts_with(kPrefix)) {
     return FlightMethod::Invalid;
   }
   method.remove_prefix(kPrefix.size());
-  constexpr std::pair<std::string_view, FlightMethod> kMethods[] = {
-      {kHandshakeMethod, FlightMethod::Handshake},
-      {kListFlightsMethod, FlightMethod::ListFlights},
-      {kGetFlightInfoMethod, FlightMethod::GetFlightInfo},
-      {kGetSchemaMethod, FlightMethod::GetSchema},
-      {kDoGetMethod, FlightMethod::DoGet},
-      {kDoPutMethod, FlightMethod::DoPut},
-      {kDoActionMethod, FlightMethod::DoAction},
-      {kListActionsMethod, FlightMethod::ListActions},
-      {kDoExchangeMethod, FlightMethod::DoExchange},
-      {kPollFlightInfoMethod, FlightMethod::PollFlightInfo},
-  };
-
-  const auto it = std::ranges::find_if(
-      kMethods, [method](const auto& pair) { return pair.first == method; });
-  return it != std::end(kMethods) ? it->second : FlightMethod::Invalid;
+  const auto it = kMethodMap.find(method);
+  return it != kMethodMap.end() ? it->second : FlightMethod::Invalid;
 }
 
 class Unimplemented : public ::grpc::ServerGenericBidiReactor {

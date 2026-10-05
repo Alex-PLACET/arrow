@@ -17,7 +17,6 @@
 
 #include "arrow/flight/transport/grpc/async_grpc_service_internal.h"
 
-#include <atomic>
 #include <functional>
 #include <memory>
 #include <utility>
@@ -27,13 +26,13 @@ namespace arrow::flight::transport::grpc::detail {
 namespace {
 
 template <typename T, typename PbT>
-class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
+class UnaryReactor final : public AsyncReactorBase {
  public:
   using HandlerFn = std::function<arrow::Future<std::shared_ptr<T>>(
       const ServerCallContext&, const FlightDescriptor&)>;
 
   UnaryReactor(AsyncCallContext flight_context, HandlerFn handler)
-      : flight_context_(std::move(flight_context)), handler_(std::move(handler)) {
+      : AsyncReactorBase(std::move(flight_context)), handler_(std::move(handler)) {
     StartRead(&request_buf_);
   }
 
@@ -49,10 +48,10 @@ class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
       return;
     }
     Hold();
-    arrow::Future<std::shared_ptr<T>> future = handler_(flight_context_, *descriptor);
+    arrow::Future<std::shared_ptr<T>> future = handler_(flight_context(), *descriptor);
     future.AddCallback(
         [this, future](const arrow::Result<std::shared_ptr<T>>& result) mutable {
-          if (!finished_) {
+          if (!finished()) {
             if (!result.ok()) {
               FinishOnce(result.status());
             } else {
@@ -71,7 +70,7 @@ class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
   }
 
   void OnWriteDone(bool ok) override {
-    if (finished_) {
+    if (finished()) {
       return;
     }
     FinishOnce(
@@ -79,31 +78,10 @@ class UnaryReactor final : public ::grpc::ServerGenericBidiReactor {
            : MakeFlightError(FlightStatusCode::Internal, "Failed to write response"));
   }
 
-  void OnCancel() override { FinishOnce(arrow::Status::Cancelled()); }
-
-  void OnDone() override { ReleaseHold(); }
-
  private:
-  void FinishOnce(Status status) {
-    bool expected = false;
-    if (finished_.compare_exchange_strong(expected, true)) {
-      Finish(flight_context_.FinishRequest(status));
-    }
-  }
-
-  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
-  void ReleaseHold() {
-    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      delete this;
-    }
-  }
-
-  AsyncCallContext flight_context_;
   HandlerFn handler_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer response_buf_;
-  std::atomic<bool> finished_{false};
-  std::atomic<int> refs_{1};
 };
 
 template <typename T, typename PbT, typename HandlerFn>

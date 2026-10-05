@@ -17,7 +17,6 @@
 
 #include "arrow/flight/transport/grpc/async_grpc_service_internal.h"
 
-#include <atomic>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -45,12 +44,10 @@ class ExchangeReader final : public AsyncFlightMessageReader {
     using FSCFuture = arrow::Future<FlightStreamChunk>;
 
     if (pending_.is_valid() && !pending_.is_finished()) {
-      return FSCFuture::MakeFinished(
-          arrow::Status::Invalid("one NextAsync at a time"));
+      return FSCFuture::MakeFinished(arrow::Status::Invalid("one NextAsync at a time"));
     }
     if (buffered_.has_value()) {
-      auto out =
-          FSCFuture::MakeFinished(std::move(*buffered_));
+      auto out = FSCFuture::MakeFinished(std::move(*buffered_));
       buffered_.reset();
       return out;
     }
@@ -287,10 +284,10 @@ class ExchangeWriter final : public AsyncFlightMessageWriter {
   bool write_in_flight_ = false;
 };
 
-class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
+class ExchangeReactor final : public AsyncReactorBase {
  public:
   ExchangeReactor(AsyncCallContext flight_context, AsyncGenericFlightServerBase* base)
-      : flight_context_(std::move(flight_context)),
+      : AsyncReactorBase(std::move(flight_context)),
         base_(base),
         reader_(std::make_shared<ExchangeReader>()),
         writer_(std::make_shared<ExchangeWriter>(this)) {
@@ -299,7 +296,7 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
   }
 
   void OnReadDone(bool ok) override {
-    if (finished_) {
+    if (finished()) {
       return;
     }
     if (!ok) {
@@ -332,13 +329,11 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
       reader_->OfferFirstRead(std::move(read_data_));
       Hold();
       arrow::Future<> exchange =
-          base_->DoExchangeAsync(flight_context_, reader_, writer_);
+          base_->DoExchangeAsync(flight_context(), reader_, writer_);
       exchange.AddCallback([this](const arrow::Status& status) {
-        if (finished_) {
-          ReleaseHold();
-          return;
+        if (!finished()) {
+          FinishOnce(status);
         }
-        FinishOnce(status);
         ReleaseHold();
       });
       return;
@@ -347,7 +342,7 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
   }
 
   void OnWriteDone(bool ok) override {
-    if (finished_) {
+    if (finished()) {
       return;
     }
     writer_->OnWriteDone(ok);
@@ -359,16 +354,14 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
     writer_->OnCancelled();
   }
 
-  void OnDone() override { ReleaseHold(); }
-
   void StartReadNext() {
-    if (!finished_) {
+    if (!finished()) {
       StartRead(&read_buf_);
     }
   }
 
   arrow::Status WritePayload(FlightPayload payload) {
-    if (finished_) {
+    if (finished()) {
       return arrow::Status::Cancelled("the exchange is over");
     }
     bool own_buffer = false;
@@ -383,21 +376,6 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
   }
 
  private:
-  void FinishOnce(Status status) {
-    bool expected = false;
-    if (finished_.compare_exchange_strong(expected, true)) {
-      Finish(flight_context_.FinishRequest(status));
-    }
-  }
-
-  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
-  void ReleaseHold() {
-    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      delete this;
-    }
-  }
-
-  AsyncCallContext flight_context_;
   AsyncGenericFlightServerBase* base_;
   std::shared_ptr<ExchangeReader> reader_;
   std::shared_ptr<ExchangeWriter> writer_;
@@ -405,8 +383,6 @@ class ExchangeReactor final : public ::grpc::ServerGenericBidiReactor {
   ::grpc::ByteBuffer write_buf_;
   internal::FlightData read_data_;
   bool started_ = false;
-  std::atomic<bool> finished_{false};
-  std::atomic<int> refs_{1};
 };
 
 void ExchangeReader::RequestRead() {

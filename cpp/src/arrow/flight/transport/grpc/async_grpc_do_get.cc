@@ -27,10 +27,10 @@ namespace arrow::flight::transport::grpc::detail {
 namespace {
 
 /// Serve one DoGet RPC over the generic callback API.
-class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
+class DoGetReactor : public AsyncReactorBase {
  public:
   DoGetReactor(AsyncCallContext flight_context, AsyncGenericFlightServerBase* base)
-      : flight_context_(std::move(flight_context)), base_(base) {
+      : AsyncReactorBase(std::move(flight_context)), base_(base) {
     StartRead(&request_buf_);
   }
 
@@ -48,31 +48,28 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
 
     Hold();
     arrow::Future<std::shared_ptr<AsyncFlightDataStream>> future =
-        base_->DoGetAsync(flight_context_, *ticket);
+        base_->DoGetAsync(flight_context(), *ticket);
     future.AddCallback(
-        [this, future](const arrow::Result<std::shared_ptr<AsyncFlightDataStream>>& result) mutable {
-          if (finished_) {
-            ReleaseHold();
-            return;
+        [this, future](
+            const arrow::Result<std::shared_ptr<AsyncFlightDataStream>>& result) mutable {
+          if (!finished()) {
+            if (!result.ok()) {
+              FinishOnce(result.status());
+            } else {
+              async_data_stream_ = *future.MoveResult();
+              if (async_data_stream_ == nullptr) {
+                FinishOnce(arrow::Status::KeyError("No data in this flight"));
+              } else {
+                WriteNextPayload();
+              }
+            }
           }
-          if (!result.ok()) {
-            FinishOnce(result.status());
-            ReleaseHold();
-            return;
-          }
-          async_data_stream_ = *future.MoveResult();
-          if (async_data_stream_ == nullptr) {
-            FinishOnce(arrow::Status::KeyError("No data in this flight"));
-            ReleaseHold();
-            return;
-          }
-          WriteNextPayload();
           ReleaseHold();
         });
   }
 
   void OnWriteDone(bool ok) override {
-    if (finished_) {
+    if (finished()) {
       return;
     }
     if (!ok) {
@@ -90,18 +87,9 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
                       "DoGet: closing the stream of a cancelled call failed");
   }
 
-  void OnDone() override { ReleaseHold(); }
-
  private:
   arrow::Result<Ticket> ParseTicket() {
     return ParseProtoRequest<pb::Ticket, Ticket>(request_buf_, "Ticket");
-  }
-
-  void FinishOnce(Status status) {
-    bool expected = false;
-    if (finished_.compare_exchange_strong(expected, true)) {
-      Finish(flight_context_.FinishRequest(status));
-    }
   }
 
   Status CloseStreamOnce() {
@@ -115,15 +103,8 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
     return async_data_stream_->Close();
   }
 
-  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
-  void ReleaseHold() {
-    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      delete this;
-    }
-  }
-
   void WriteNextPayload() {
-    if (finished_) {
+    if (finished()) {
       return;
     }
     Hold();
@@ -138,48 +119,37 @@ class DoGetReactor : public ::grpc::ServerGenericBidiReactor {
       next = async_data_stream_->NextAsync();
     }
     next.AddCallback([this](arrow::Result<std::optional<FlightPayload>> result) {
-      if (finished_) {
-        ReleaseHold();
-        return;
+      if (!finished()) {
+        if (!result.ok()) {
+          FinishOnce(result.status());
+        } else {
+          wrote_schema_ = true;
+          std::optional<FlightPayload> payload = std::move(*result);
+          if (!payload.has_value()) {
+            FinishOnce(CloseStreamOnce());
+          } else {
+            bool own_buffer = false;
+            const ::grpc::Status grpc_status =
+                FlightDataSerialize(*payload, &write_buf_, &own_buffer);
+            if (!grpc_status.ok()) {
+              FinishOnce(MakeFlightError(FlightStatusCode::Internal,
+                                         grpc_status.error_message()));
+            } else {
+              StartWrite(&write_buf_);
+            }
+          }
+        }
       }
-      if (!result.ok()) {
-        FinishOnce(result.status());
-        ReleaseHold();
-        return;
-      }
-
-      wrote_schema_ = true;
-      std::optional<FlightPayload> payload = std::move(*result);
-      if (!payload.has_value()) {
-        FinishOnce(CloseStreamOnce());
-        ReleaseHold();
-        return;
-      }
-
-      bool own_buffer = false;
-      const ::grpc::Status grpc_status =
-          FlightDataSerialize(*payload, &write_buf_, &own_buffer);
-      if (!grpc_status.ok()) {
-        FinishOnce(
-            MakeFlightError(FlightStatusCode::Internal, grpc_status.error_message()));
-        ReleaseHold();
-        return;
-      }
-
-      StartWrite(&write_buf_);
       ReleaseHold();
     });
   }
 
-  AsyncCallContext flight_context_;
   AsyncGenericFlightServerBase* base_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer write_buf_;
   std::shared_ptr<AsyncFlightDataStream> async_data_stream_;
   bool wrote_schema_ = false;
-  std::atomic<bool> finished_{false};
   std::atomic<bool> closed_{false};
-  std::atomic<int> refs_{1};
 };
 
 }  // namespace

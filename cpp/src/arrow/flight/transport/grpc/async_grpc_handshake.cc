@@ -24,30 +24,34 @@ namespace arrow::flight::transport::grpc::detail {
 
 namespace {
 
-/// Serve the Handshake RPC over the generic callback API.
-class HandshakeReactor : public ::grpc::ServerGenericBidiReactor {
+/// Serve the Handshake RPC over the generic callback API.  The handler is
+/// synchronous, so every path finishes the RPC from the callback that started
+/// it: no callback outlives its read or write, and the single reference the base
+/// class holds is enough.
+class HandshakeReactor final : public AsyncReactorBase {
  public:
   HandshakeReactor(AsyncCallContext flight_context, HandshakeFn handshake_handler)
-      : flight_context_(std::move(flight_context)),
+      : AsyncReactorBase(std::move(flight_context)),
         handshake_handler_(std::move(handshake_handler)) {
     StartRead(&request_buf_);
   }
 
   void OnReadDone(bool ok) override {
     if (!ok) {
-      Finish(flight_context_.FinishRequest(
-          MakeFlightError(FlightStatusCode::Internal, "Failed to read request")));
+      FinishOnce(MakeFlightError(FlightStatusCode::Internal, "Failed to read request"));
       return;
     }
-    auto request = ParseProtoRequest<pb::HandshakeRequest>(request_buf_, "HandshakeRequest");
+    auto request =
+        ParseProtoRequest<pb::HandshakeRequest>(request_buf_, "HandshakeRequest");
     if (!request.ok()) {
-      Finish(flight_context_.FinishRequest(std::move(request).status()));
+      FinishOnce(std::move(request).status());
       return;
     }
     std::string response;
-    const auto status = handshake_handler_(flight_context_, request->payload(), &response);
+    const auto status =
+        handshake_handler_(flight_context(), request->payload(), &response);
     if (!status.ok()) {
-      Finish(flight_context_.FinishRequest(status));
+      FinishOnce(status);
       return;
     }
     pb::HandshakeResponse pb_response;
@@ -57,15 +61,12 @@ class HandshakeReactor : public ::grpc::ServerGenericBidiReactor {
   }
 
   void OnWriteDone(bool ok) override {
-    Finish(flight_context_.FinishRequest(
+    FinishOnce(
         ok ? arrow::Status::OK()
-           : MakeFlightError(FlightStatusCode::Internal, "Failed to write response")));
+           : MakeFlightError(FlightStatusCode::Internal, "Failed to write response"));
   }
 
-  void OnDone() override { delete this; }
-
  private:
-  AsyncCallContext flight_context_;
   HandshakeFn handshake_handler_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer write_buf_;
@@ -73,8 +74,8 @@ class HandshakeReactor : public ::grpc::ServerGenericBidiReactor {
 
 }  // namespace
 
-::grpc::ServerGenericBidiReactor* MakeHandshakeReactor(
-    AsyncCallContext flight_context, HandshakeFn handshake_handler) {
+::grpc::ServerGenericBidiReactor* MakeHandshakeReactor(AsyncCallContext flight_context,
+                                                       HandshakeFn handshake_handler) {
   return new HandshakeReactor(std::move(flight_context), std::move(handshake_handler));
 }
 

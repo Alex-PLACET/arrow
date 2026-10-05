@@ -17,7 +17,6 @@
 
 #include "arrow/flight/transport/grpc/async_grpc_service_internal.h"
 
-#include <atomic>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -27,10 +26,10 @@ namespace arrow::flight::transport::grpc::detail {
 namespace {
 
 /// One request message in, N response messages out, then finish.
-class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
+class StreamingReactor : public AsyncReactorBase {
  public:
   StreamingReactor(AsyncCallContext flight_context, AsyncGenericFlightServerBase* base)
-      : flight_context_(std::move(flight_context)), base_(base) {
+      : AsyncReactorBase(std::move(flight_context)), base_(base) {
     StartRead(&request_buf_);
   }
 
@@ -41,7 +40,7 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
     }
     Hold();
     Start().AddCallback([this](const arrow::Status& status) {
-      if (!finished_) {
+      if (!finished()) {
         if (!status.ok()) {
           FinishOnce(status);
         } else {
@@ -53,7 +52,7 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
   }
 
   void OnWriteDone(bool ok) override {
-    if (finished_) {
+    if (finished()) {
       return;
     }
     if (!ok) {
@@ -63,21 +62,17 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
     WriteNextMessage();
   }
 
-  void OnCancel() override { FinishOnce(arrow::Status::Cancelled()); }
-
-  void OnDone() override { ReleaseHold(); }
-
  protected:
   virtual arrow::Future<> Start() = 0;
   virtual arrow::Future<bool> NextMessage() = 0;
 
   void WriteNextMessage() {
-    if (finished_) {
+    if (finished()) {
       return;
     }
     Hold();
     NextMessage().AddCallback([this](const arrow::Result<bool>& has_next) {
-      if (!finished_) {
+      if (!finished()) {
         if (!has_next.ok()) {
           FinishOnce(has_next.status());
         } else if (!*has_next) {
@@ -90,26 +85,9 @@ class StreamingReactor : public ::grpc::ServerGenericBidiReactor {
     });
   }
 
-  void FinishOnce(Status status) {
-    bool expected = false;
-    if (finished_.compare_exchange_strong(expected, true)) {
-      Finish(flight_context_.FinishRequest(status));
-    }
-  }
-
-  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
-  void ReleaseHold() {
-    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      delete this;
-    }
-  }
-
-  AsyncCallContext flight_context_;
   AsyncGenericFlightServerBase* base_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer write_buf_;
-  std::atomic<bool> finished_{false};
-  std::atomic<int> refs_{1};
 };
 
 class ListActionsReactor final : public StreamingReactor {
@@ -118,7 +96,7 @@ class ListActionsReactor final : public StreamingReactor {
 
  protected:
   arrow::Future<> Start() override {
-    return base_->ListActionsAsync(flight_context_)
+    return base_->ListActionsAsync(flight_context())
         .Then([this](const std::vector<ActionType>& actions) -> arrow::Status {
           actions_ = actions;
           next_ = 0;
@@ -154,7 +132,7 @@ class DoActionReactor final : public StreamingReactor {
     if (!action.ok()) {
       return arrow::Future<>::MakeFinished(action.status());
     }
-    return base_->DoActionAsync(flight_context_, *action)
+    return base_->DoActionAsync(flight_context(), *action)
         .Then([this](const std::shared_ptr<AsyncResultStream>& stream) -> arrow::Status {
           if (stream == nullptr) {
             return arrow::Status::Cancelled();
@@ -192,7 +170,7 @@ class ListFlightsReactor final : public StreamingReactor {
       return arrow::Future<>::MakeFinished(criteria.status());
     }
     criteria_ = *criteria;
-    return base_->ListFlightsAsync(flight_context_, &criteria_)
+    return base_->ListFlightsAsync(flight_context(), &criteria_)
         .Then(
             [this](const std::shared_ptr<AsyncFlightListing>& listing) -> arrow::Status {
               listing_ = listing;

@@ -17,7 +17,6 @@
 
 #include "arrow/flight/transport/grpc/async_grpc_service_internal.h"
 
-#include <atomic>
 #include <memory>
 #include <utility>
 
@@ -26,12 +25,12 @@ namespace arrow::flight::transport::grpc::detail {
 namespace {
 
 /// Serve one DoPut RPC over the generic callback API.
-class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
+class DoPutReactor : public AsyncReactorBase,
                      public arrow::flight::internal::FlightDataListenerTransport {
  public:
   DoPutReactor(AsyncCallContext flight_context,
                std::shared_ptr<AsyncFlightDataListener> listener)
-      : flight_context_(std::move(flight_context)),
+      : AsyncReactorBase(std::move(flight_context)),
         listener_(std::move(listener)),
         decoder_(listener_) {
     arrow::flight::internal::FlightDataListenerTransport::Install(listener_, this);
@@ -49,7 +48,7 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
 
   void OnReadDone(bool ok) override {
     if (!ok) {
-      if (finished_.load()) {
+      if (finished()) {
         return;
       }
       pb::PutResult pb_result;
@@ -69,7 +68,7 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
     Future<> decode_status = decoder_.Consume(std::move(arrow_buf));
     Hold();
     decode_status.AddCallback([this](arrow::Status status) {
-      if (finished_) {
+      if (finished()) {
         // The RPC is over (cancelled while the listener was working): the
         // message is abandoned.
       } else {
@@ -84,7 +83,7 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   }
 
   void OnWriteDone(bool ok) override {
-    if (finished_) {
+    if (finished()) {
       return;
     }
     if (!ok) {
@@ -108,13 +107,6 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
   }
 
  private:
-  void Hold() { refs_.fetch_add(1, std::memory_order_relaxed); }
-  void ReleaseHold() {
-    if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      delete this;
-    }
-  }
-
   void FinishUpload(Status status) {
     ARROW_WARN_NOT_OK(arrow::flight::internal::FlightDataListenerTransport::ReportFinish(
                           listener_, status),
@@ -122,20 +114,10 @@ class DoPutReactor : public ::grpc::ServerGenericBidiReactor,
     FinishOnce(std::move(status));
   }
 
-  void FinishOnce(Status status) {
-    bool expected = false;
-    if (finished_.compare_exchange_strong(expected, true)) {
-      Finish(flight_context_.FinishRequest(status));
-    }
-  }
-
-  AsyncCallContext flight_context_;
   std::shared_ptr<AsyncFlightDataListener> listener_;
   AsyncFlightMessageDecoder decoder_;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer write_buf_;
-  std::atomic<bool> finished_{false};
-  std::atomic<int> refs_{1};
 };
 
 }  // namespace

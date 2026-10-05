@@ -32,30 +32,28 @@ namespace arrow::flight {
 
 /// \brief Interface that produces a sequence of IPC payloads to be sent in
 /// FlightData protobuf messages, where a payload may arrive later.
-///
-/// The async transport pumps this stream through
-/// NextAsync()/GetSchemaPayloadAsync() and never blocks a gRPC callback thread.
-///
-/// The transport calls Close() at most once, from whichever ending comes
-/// first (end of stream, write failure, or the client cancelling the RPC): a
-/// stream whose payload future is still pending when the RPC dies gets
-/// Close() from a transport thread, and resolving that pending future there
-/// is how the stream is expected to stop.  Close() must not block.  When the
-/// RPC is cancelled while DoGetAsync() is still preparing the stream, there
-/// is no stream yet to Close(): the transport finishes the RPC anyway, and
-/// preparation should observe ServerCallContext::is_cancelled() and give up
-/// on its own.
 class ARROW_FLIGHT_EXPORT AsyncFlightDataStream {
  public:
   virtual ~AsyncFlightDataStream();
 
+  /// \brief The schema of the payloads this stream produces.
+  ///
+  /// The transport never calls this: the schema the client sees is the one
+  /// GetSchemaPayloadAsync() returns.
+  /// \return The schema of the payloads this stream produces.
   virtual std::shared_ptr<Schema> schema() = 0;
 
   /// \brief Like GetSchemaPayload(), but the payload arrives later.
+  ///
+  /// Called once, before any NextAsync() payload is requested.
   /// \return A future completed with the schema payload. A non-OK status fails the RPC.
   virtual arrow::Future<FlightPayload> GetSchemaPayloadAsync() = 0;
 
   /// \brief Like Next(), but the payload arrives later.
+  ///
+  /// The transport keeps one call in flight at a time and only asks again once
+  /// the previous payload has been written.
+  ///
   /// \return A future completed with the next payload, or with a nullopt once the stream
   /// is exhausted. A non-OK status fails the RPC.
   virtual arrow::Future<std::optional<FlightPayload>> NextAsync() = 0;
@@ -64,8 +62,12 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataStream {
   ///
   /// Called at most once, possibly from any thread.  A pending
   /// NextAsync()/GetSchemaPayloadAsync() future must be resolved here (or
-  /// abandoned knowingly): the transport does not wait for it.  On the
-  /// end-of-stream path the status Close() returns is the RPC's final status.
+  /// abandoned knowingly): the transport does not wait for it.
+  /// Its return status becomes the RPC's final status only on the normal end-of-stream
+  /// path (after NextAsync() reports end of stream).
+  /// On every other path (write failure, cancellation) the RPC already has a status and
+  /// the returned status is discarded.
+  /// \return The status of closing the stream.
   virtual Status Close() { return Status::OK(); }
 };
 
@@ -99,11 +101,12 @@ class ARROW_FLIGHT_EXPORT AsyncResultStream {
 /// \brief The reader of one DoExchange: the messages the client sends, pulled
 /// one NextAsync() at a time.
 ///
-/// Runs on the thread that calls it; at most one NextAsync() may be
-/// outstanding.  Schema and dictionary messages are read through (they are not
-/// chunks), a metadata-only message is a chunk with a null data member, and
-/// the chunk whose members are both null ends the exchange.  The reader must
-/// not be used after the future returned by DoExchangeAsync completes.
+/// Runs on the thread that calls it, at most one NextAsync() may be
+/// outstanding.
+/// Schema and dictionary messages are read through (they are not chunks), a metadata-only
+/// message is a chunk with a null data member, and the chunk whose members are both null
+/// ends the exchange.
+/// The reader must not be used after the future returned by DoExchangeAsync completes.
 class ARROW_FLIGHT_EXPORT AsyncFlightMessageReader {
  public:
   virtual ~AsyncFlightMessageReader();
@@ -112,32 +115,48 @@ class ARROW_FLIGHT_EXPORT AsyncFlightMessageReader {
   virtual const FlightDescriptor& descriptor() const = 0;
 
   /// \brief The next message of the exchange, decoded.
+  /// \return A future completed with the next chunk, both of its members are
+  /// null at the end of the exchange. A non-OK status fails the RPC.
   virtual arrow::Future<FlightStreamChunk> NextAsync() = 0;
 };
 
 /// \brief The writer of one DoExchange: the messages the server sends back.
 ///
-/// Runs on the thread that calls it; await each returned future before
-/// writing again.  The writer must not be used after the future returned by
+/// Runs on the thread that calls it, await each returned future before
+/// writing again. The writer must not be used after the future returned by
 /// DoExchangeAsync completes.
 class ARROW_FLIGHT_EXPORT AsyncFlightMessageWriter {
  public:
   virtual ~AsyncFlightMessageWriter();
 
   /// \brief Start the writer with the schema of the messages it will write.
+  /// Must be called before any record batch is written.
+  /// \param schema The schema of the messages to be written.
+  /// \return A future that completes once the writer is ready to accept messages.
   virtual arrow::Future<> BeginAsync(std::shared_ptr<Schema> schema) = 0;
 
   /// \brief Write one record batch.
+  /// \param batch The record batch to write.
+  /// \return A future that completes once the batch has been written.
   virtual arrow::Future<> WriteRecordBatchAsync(const RecordBatch& batch) = 0;
 
   /// \brief Write one application-metadata-only message.
+  /// \param app_metadata The application metadata to write.
+  /// \return A future that completes once the metadata has been written.
   virtual arrow::Future<> WriteMetadataAsync(std::shared_ptr<Buffer> app_metadata) = 0;
 
   /// \brief Write one record batch with application metadata attached.
+  /// \param batch The record batch to write.
+  /// \param app_metadata The application metadata to attach.
+  /// \return A future that completes once the batch and metadata have been written.
   virtual arrow::Future<> WriteWithMetadataAsync(
       const RecordBatch& batch, std::shared_ptr<Buffer> app_metadata) = 0;
 
-  /// \brief Finish the write side.
+  /// \brief Finish the write side: end the IPC stream.
+  ///
+  /// Call once, after the last message, then await it before completing
+  /// DoExchangeAsync's future.
+  /// \return A future that completes once the write side has been closed.
   virtual arrow::Future<> CloseAsync() = 0;
 };
 
@@ -151,6 +170,7 @@ class ARROW_FLIGHT_EXPORT AsyncFlightMessageWriter {
 ///   arrow::Future<std::shared_ptr<arrow::flight::FlightInfo>> GetFlightInfoAsync(
 ///       const arrow::flight::ServerCallContext&,
 ///       const arrow::flight::FlightDescriptor&) override;
+///
 ///   arrow::Future<std::shared_ptr<arrow::flight::AsyncFlightDataStream>> DoGetAsync(
 ///       const arrow::flight::ServerCallContext&,
 ///       const arrow::flight::Ticket&) override;
@@ -161,115 +181,177 @@ class ARROW_FLIGHT_EXPORT AsyncFlightMessageWriter {
 /// when the answer is ready, and no gRPC callback thread is ever held waiting
 /// for one.  Handlers that do run inline should still return promptly: blocking
 /// a callback thread starves new connections, because gRPC's thread pool grows
-/// at most about one thread per second.
+/// at most about 1 thread/second.
+///
+/// All handlers must be non-blocking and return promptly.
+/// Non overriding handlers will return `Status::NotImplemented` by default.
+///
+/// Authentication goes through Handshake()/ValidateToken(): a blocking
+/// ServerAuthHandler in FlightServerOptions is not supported, and Init()
+/// rejects it.
 class ARROW_FLIGHT_EXPORT AsyncGenericFlightServerBase {
  public:
   AsyncGenericFlightServerBase();
   virtual ~AsyncGenericFlightServerBase();
 
+  /// \brief Initialize the server listening at the given location.
+  /// Must be called before any other method.
+  /// \param options The server options to use for initialization.
+  /// \return Status indicating success or failure of the initialization.
   Status Init(const FlightServerOptions& options);
+
+  /// \return The port number the server is listening on, or a non-positive value if there
+  /// is no port.
   int port() const;
+
+  /// \return The address the server is listening on.
+  /// \warning Only valid after Init() has been called.
   Location location() const;
+
+  /// \brief Set the server to stop on any of the given signal numbers.
+  /// \warning Must be called before Serve().
+  /// \param signals The signal numbers on which the server should shut down.
+  /// \return Status indicating success or failure of setting the shutdown signals.
   Status SetShutdownOnSignals(const std::vector<int> signals);
+
+  /// \brief Start serving. Blocks until the server shuts down, which happens
+  /// when Shutdown() is called or a registered signal arrives.
+  /// \return Status indicating success or failure of starting the server.
   Status Serve();
+
+  /// \return The signal number that interrupted Serve(), or 0.
+  /// \note Only valid after Serve() has returned.
   int GotSignal() const;
+
+  /// \brief Shut down the server, blocking until in-flight RPCs finish.
+  /// May be called from another thread or a signal handler while Serve()
+  /// blocks, with an optional deadline.
+  /// \param[in] deadline is an optional time point by which the server should complete shutdown.
+  /// \return Status indicating success or failure of the shutdown operation.
+  /// \warning Call at most once.
   Status Shutdown(const std::chrono::system_clock::time_point* deadline = NULLPTR);
+
+  /// \brief Block until the server shuts down. Does not respond to signals.
   Status Wait();
 
   /// \brief Asynchronously retrieve a list of available fields given an
-  /// optional opaque criteria.  See FlightServerBase::ListFlights.
+  /// optional opaque criteria.
+  /// \param[in] context is the server call context.
+  /// \param[in] criteria is the optional opaque criteria for listing flights.
+  /// \see FlightServerBase::ListFlights
   ///
   /// \return A future completed with the listing, or with a non-OK status to
-  /// fail the RPC.  A future completed with a nullptr listing serves an empty
-  /// listing.  The transport pulls the listing one NextAsync() at a time; the
-  /// criteria pointer is only valid for the duration of the call.
+  /// fail the RPC.
+  /// A future completed with a nullptr listing serves an empty listing.
+  /// The transport pulls the listing one NextAsync() at a time; the criteria pointer is
+  /// never null and is only valid for the duration of the call.
   virtual arrow::Future<std::shared_ptr<AsyncFlightListing>> ListFlightsAsync(
       const ServerCallContext& context, const Criteria* criteria);
 
   /// \brief Asynchronously retrieve the schema and an access plan for the
-  /// indicated descriptor.  See FlightServerBase::GetFlightInfo.
+  /// indicated descriptor.
+  /// \see FlightServerBase::GetFlightInfo
+  /// \param[in] context is the server call context.
+  /// \param[in] request is the flight descriptor for which to retrieve the info.
   ///
   /// \return A future completed with the info, or with a non-OK status to
-  /// fail the RPC.  A nullptr info answers `KeyError("Flight not found")`, as
+  /// fail the RPC. A `nullptr` info answers `KeyError("Flight not found")`, as
   /// a synchronous server that returns OK without setting the response does.
   virtual arrow::Future<std::shared_ptr<FlightInfo>> GetFlightInfoAsync(
       const ServerCallContext& context, const FlightDescriptor& request);
 
   /// \brief Asynchronously retrieve the current status of the target query.
-  /// See FlightServerBase::PollFlightInfo.
+  /// \param[in] context is the server call context.
+  /// \param[in] request is the flight descriptor for which to retrieve the status.
+  /// \see FlightServerBase::PollFlightInfo.
+  /// \return A future completed with the info, or with a non-OK status to
+  /// fail the RPC.  A nullptr info answers `KeyError("Flight not found")`.
   virtual arrow::Future<std::shared_ptr<PollInfo>> PollFlightInfoAsync(
       const ServerCallContext& context, const FlightDescriptor& request);
 
   /// \brief Asynchronously retrieve the schema for the indicated descriptor.
-  /// See FlightServerBase::GetSchema.
+  /// \param[in] context is the server call context.
+  /// \param[in] request is the flight descriptor for which to retrieve the schema.
+  /// \see FlightServerBase::GetSchema.
+  /// \return A future completed with the schema, or with a non-OK status to
+  /// fail the RPC.
+  /// A `nullptr` schema answers `KeyError("Flight not found")`.
   virtual arrow::Future<std::shared_ptr<SchemaResult>> GetSchemaAsync(
       const ServerCallContext& context, const FlightDescriptor& request);
 
   /// \brief Asynchronously execute an action, returning a stream of zero or
-  /// more results.  See FlightServerBase::DoAction.
-  ///
+  /// more results.
+  /// \param[in] context is the server call context.
+  /// \param[in] action is the action to execute.
+  /// \see FlightServerBase::DoAction.
   /// \return A future completed with the result stream, or with a non-OK
-  /// status to fail the RPC.  A future completed with a nullptr stream
+  /// status to fail the RPC. A future completed with a `nullptr` stream
   /// answers CANCELLED, as a synchronous server that returns OK without a
-  /// stream does.  The transport pulls the stream one NextAsync() at a time.
+  /// stream does.
+  /// The transport pulls the stream one NextAsync() at a time.
   virtual arrow::Future<std::shared_ptr<AsyncResultStream>> DoActionAsync(
       const ServerCallContext& context, const Action& action);
 
-  /// \brief Asynchronously retrieve the list of available actions.  See
-  /// FlightServerBase::ListActions.
+  /// \brief Asynchronously retrieve the list of available actions.
+  /// \param[in] context is the server call context.
+  /// \see FlightServerBase::ListActions.
   virtual arrow::Future<std::vector<ActionType>> ListActionsAsync(
       const ServerCallContext& context);
 
   /// \brief Asynchronously process a bidirectional stream of IPC payloads.
-  /// See FlightServerBase::DoExchange.
-  ///
-  /// \return A future completed when the exchange is over; its status is the
-  /// RPC's status.  While it runs, consume the client's messages through the
-  /// reader and send the server's through the writer.  Both must not be used
-  /// after the future completes.
+  /// \see FlightServerBase::DoExchange.
+  /// \param[in] context is the server call context.
+  /// \param[in] reader is the asynchronous reader for the client's messages.
+  /// \param[in] writer is the asynchronous writer for the server's messages.
+  /// \return A future completed when the exchange is over, its status is the
+  /// RPC's status.
+  /// While it runs, consume the client's messages through the reader and send the
+  /// server's through the writer. Both must not be used after the future completes.
   virtual arrow::Future<> DoExchangeAsync(
       const ServerCallContext& context, std::shared_ptr<AsyncFlightMessageReader> reader,
       std::shared_ptr<AsyncFlightMessageWriter> writer);
 
   /// \brief The stream serving one DoGet RPC, possibly later.
   ///
-  /// \return Complete the returned future from your own thread or pool, the transport
-  /// writes whatever stream it resolves to.
-  /// \param[in] `context` is the server call context.
-  /// \param[in] `request` is an opaque ticket The default answers UNIMPLEMENTED.
+  /// Called after the ticket is parsed; the request is only valid for the
+  /// duration of the call.
+  /// \param[in] context is the server call context.
+  /// \param[in] request is an opaque ticket.
+  /// \return A future completed with the stream to serve, or with a non-OK
+  /// status to fail the RPC. 
+  /// A future completed with a `nullptr` stream answers `KeyError("No data in this flight")`.
+  /// Complete the future from your ownthread or pool: the transport writes whatever stream it resolves to, and
+  /// must not be blocked waiting for it.
   ///
   /// If the RPC is cancelled while the returned future is pending, the
   /// transport finishes the RPC without waiting for it, and the stream it
-  /// eventually resolves to is dropped unconsumed (Close() was already
-  /// delivered, before the stream existed).  A producer that must give up
-  /// early watches ServerCallContext::is_cancelled().
+  /// eventually resolves to is dropped without Close() ever being delivered
+  /// (the transport no longer holds the stream).
   virtual arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
       const ServerCallContext& context, const Ticket& request);
 
   /// \brief Create the AsyncFlightDataListener serving one DoPut RPC.
-  ///
+  /// \see AsyncFlightDataListener
   /// \param[in] `context` is the server call context.
   /// \return A shared pointer to the AsyncFlightDataListener handling the upload, or
-  /// nullptr to refuse the upload.
-
+  /// `nullptr` to refuse the upload.
   virtual std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
       const ServerCallContext& context);
 
   /// \brief Handle the handshake protocol with the client.
-  ///
-  /// `request` is the client's handshake message; write the response into
-  /// `*response`.  Return a non-OK status to fail the RPC
-  /// (FlightStatusCode::Unauthenticated rejects the client).  Runs inline on a
-  /// gRPC callback thread: do not block.  The default answers UNIMPLEMENTED.
+  /// \param[in] context is the server call context.
+  /// \param[in] request is the client's handshake message.
+  /// \param[out] response is where the server writes its handshake response.
+  /// \return Status indicating success or failure of the handshake.
   virtual Status Handshake(const ServerCallContext& context, const std::string& request,
                            std::string* response);
 
   /// \brief Validate the token sent in the `auth-token-bin` header of RPCs
   /// issued after a successful Handshake().
-  ///
-  /// Runs inline on the RPC dispatch path for every method except Handshake.  On
-  /// success, set `peer_identity` to the authenticated identity.  The default
-  /// keeps the transport-level (TLS) identity and ignores the token.
+  /// \param[in] context is the server call context.
+  /// \param[in] token is the authentication token sent by the client.
+  /// \param[out] peer_identity is set to the authenticated identity on success.
+  /// \return Status indicating success or failure of the token validation.
   virtual Status ValidateToken(const ServerCallContext& context, const std::string& token,
                                std::string* peer_identity);
 
