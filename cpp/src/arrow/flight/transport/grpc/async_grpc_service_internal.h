@@ -28,12 +28,15 @@
 #include "arrow/flight/flight_data_decoder.h"
 #include "arrow/flight/serialization_internal.h"
 #include "arrow/flight/server_async.h"
+#include "arrow/flight/transport/grpc/async_grpc_compat.h"
 #include "arrow/flight/transport/grpc/async_grpc_service.h"
 #include "arrow/flight/transport/grpc/serialization_internal.h"
 
 namespace arrow::flight::transport::grpc::detail {
 
 namespace pb = arrow::flight::protocol;
+
+#ifdef ARROW_FLIGHT_HAS_ASYNC_SERVER
 
 using AsyncCallContext = GrpcServerCallContext<::grpc::CallbackServerContext>;
 
@@ -148,5 +151,7 @@ class AsyncReactorBase : public ::grpc::ServerGenericBidiReactor {
     AsyncCallContext flight_context, AsyncGenericFlightServerBase* base);
 ::grpc::ServerGenericBidiReactor* MakeExchangeReactor(AsyncCallContext flight_context,
                                                       AsyncGenericFlightServerBase* base);
+
+#endif  // ARROW_FLIGHT_HAS_ASYNC_SERVER
 
 }  // namespace arrow::flight::transport::grpc::detail

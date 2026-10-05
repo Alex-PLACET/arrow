@@ -19,12 +19,13 @@
 
 #include <memory>
 
-#include <grpcpp/generic/callback_generic_service.h>
-
 #include "arrow/flight/server_async.h"
+#include "arrow/flight/transport/grpc/async_grpc_compat.h"
 #include "arrow/flight/transport/grpc/grpc_server_internal.h"
 
 namespace arrow::flight::transport::grpc {
+
+#ifdef ARROW_FLIGHT_HAS_ASYNC_SERVER
 
 using HandshakeFn =
     GrpcServerCallContextHelper<::grpc::CallbackServerContext>::HandshakeFn;
@@ -62,5 +63,7 @@ class AsyncGenericFlightService : public ::grpc::CallbackGenericService {
   /// The server class's Handshake hook; empty when the server has none.
   HandshakeFn handshake_handler_;
 };
+
+#endif  // ARROW_FLIGHT_HAS_ASYNC_SERVER
 
 }  // namespace arrow::flight::transport::grpc

@@ -449,11 +449,20 @@ class GrpcServerTransport : public internal::ServerTransport {
   static arrow::Result<std::unique_ptr<internal::ServerTransport>> MakeAsync(
       AsyncGenericFlightServerBase* async_base,
       std::shared_ptr<MemoryManager> memory_manager) {
+#ifdef ARROW_FLIGHT_HAS_ASYNC_SERVER
     return std::unique_ptr<internal::ServerTransport>(
         new GrpcServerTransport(/*base=*/nullptr, std::move(memory_manager), async_base));
+#else
+    ARROW_UNUSED(async_base);
+    ARROW_UNUSED(memory_manager);
+    return Status::NotImplemented(
+        "The async Flight server requires gRPC's generic callback API "
+        "(arrow was built against gRPC < 1.65)");
+#endif
   }
 
   Status Init(const FlightServerOptions& options, const arrow::util::Uri& uri) override {
+#ifdef ARROW_FLIGHT_HAS_ASYNC_SERVER
     if (async_base_ != nullptr) {
       // The generic callback service runs middleware (through the shared helper)
       // but cannot run the blocking ServerAuthHandler: it is driven from
@@ -482,7 +491,9 @@ class GrpcServerTransport : public internal::ServerTransport {
           /*auth_handler=*/nullptr, options.middleware, std::move(validate_token));
       async_service_ = std::make_unique<AsyncGenericFlightService>(
           async_base_, async_helper_, std::move(handshake));
-    } else {
+    } else
+#endif
+    {
       grpc_service_.reset(
           new GrpcServiceHandler(options.auth_handler, options.middleware, this));
     }
@@ -491,9 +502,12 @@ class GrpcServerTransport : public internal::ServerTransport {
     int port = 0;
     RETURN_NOT_OK(AddServerListeningPort(options, uri, &builder, &location_, &port));
 
+#ifdef ARROW_FLIGHT_HAS_ASYNC_SERVER
     if (async_service_) {
       builder.RegisterCallbackGenericService(async_service_.get());
-    } else {
+    } else
+#endif
+    {
       builder.RegisterService(grpc_service_.get());
     }
     ConfigureServerBuilderOptions(options, &builder);
@@ -523,6 +537,7 @@ class GrpcServerTransport : public internal::ServerTransport {
   /// Set when the transport serves an AsyncGenericFlightServerBase (the server
   /// kind selects the mode); null for a plain FlightServerBase.
   AsyncGenericFlightServerBase* async_base_ = nullptr;
+#ifdef ARROW_FLIGHT_HAS_ASYNC_SERVER
   // Set in async mode; shared with the service (and, from task T11 on, with the
   // per-call auth hook). Declared before async_service_ so it outlives it.
   std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>>
@@ -530,6 +545,7 @@ class GrpcServerTransport : public internal::ServerTransport {
   // Set in async mode. Declared before grpc_server_ so it outlives it (the
   // server holds a pointer to it).
   std::unique_ptr<AsyncGenericFlightService> async_service_;
+#endif
   std::unique_ptr<::grpc::Server> grpc_server_;
   Location location_;
 };
@@ -542,8 +558,10 @@ void InitializeFlightGrpcServer() {
     auto* registry = flight::internal::GetDefaultTransportRegistry();
     for (const auto& transport : {"grpc", "grpc+tls", "grpc+tcp", "grpc+unix"}) {
       ARROW_CHECK_OK(registry->RegisterServer(transport, GrpcServerTransport::Make));
+#ifdef ARROW_FLIGHT_HAS_ASYNC_SERVER
       ARROW_CHECK_OK(
           registry->RegisterAsyncServer(transport, GrpcServerTransport::MakeAsync));
+#endif
     }
   });
 }

@@ -161,8 +161,11 @@ else()
   add_definitions(-DGRPC_NAMESPACE_FOR_TLS_CREDENTIALS_OPTIONS=grpc_impl::experimental)
 endif()
 
-# Was in a different namespace, or simply not supported, prior to this
-if(ARROW_GRPC_VERSION VERSION_GREATER_EQUAL "1.40")
+# gRPC's generic callback API, the async Flight server's foundation, exists from
+# 1.65 on (see transport/grpc/async_grpc_compat.h).
+# Older gRPC builds the sync transport only; the async sources below and the async client paths in
+# grpc_client.cc are gated on the same version.
+if(ARROW_GRPC_VERSION VERSION_GREATER_EQUAL "1.65")
   add_definitions(-DGRPC_ENABLE_ASYNC)
 endif()
 
@@ -190,13 +193,6 @@ set(ARROW_FLIGHT_SRCS
     transport_server.cc
     transport_server_internal.cc
     # Bundle the gRPC impl with libarrow_flight
-    transport/grpc/async_grpc_service.cc
-    transport/grpc/async_grpc_do_get.cc
-    transport/grpc/async_grpc_do_put.cc
-    transport/grpc/async_grpc_exchange.cc
-    transport/grpc/async_grpc_handshake.cc
-    transport/grpc/async_grpc_streaming.cc
-    transport/grpc/async_grpc_unary.cc
     transport/grpc/grpc_client.cc
     transport/grpc/grpc_server.cc
     transport/grpc/grpc_server_internal.cc
@@ -204,6 +200,18 @@ set(ARROW_FLIGHT_SRCS
     transport/grpc/protocol_grpc_internal.cc
     transport/grpc/util_internal.cc
     types.cc)
+
+# The async generic server needs gRPC's generic callback API (>= 1.65, like GRPC_ENABLE_ASYNC above). 
+if(ARROW_GRPC_VERSION VERSION_GREATER_EQUAL "1.65")
+  list(APPEND ARROW_FLIGHT_SRCS
+       transport/grpc/async_grpc_service.cc
+       transport/grpc/async_grpc_do_get.cc
+       transport/grpc/async_grpc_do_put.cc
+       transport/grpc/async_grpc_exchange.cc
+       transport/grpc/async_grpc_handshake.cc
+       transport/grpc/async_grpc_streaming.cc
+       transport/grpc/async_grpc_unary.cc)
+endif()
 
 # Handle Unity build header conflicts on Windows.
 if(CMAKE_UNITY_BUILD AND WIN32)
@@ -345,14 +353,18 @@ add_arrow_test(flight_test
                LABELS
                "arrow_flight")
 
-# Async Flight server over the gRPC generic callback API
-add_arrow_test(flight_async_grpc_test
-               SOURCES
-               transport/grpc/async_grpc_test.cc
-               STATIC_LINK_LIBS
-               ${ARROW_FLIGHT_TEST_LINK_LIBS}
-               LABELS
-               "arrow_flight")
+# Async Flight server over the gRPC generic callback API (>= 1.65, like the
+# sources it tests).
+if(ARROW_GRPC_VERSION VERSION_GREATER_EQUAL "1.65")
+  add_arrow_test(flight_async_grpc_test
+                 SOURCES
+                 transport/grpc/async_grpc_test.cc
+                 STATIC_LINK_LIBS
+                 ${ARROW_FLIGHT_TEST_LINK_LIBS}
+                 LABELS
+                 "arrow_flight")
+  set_tests_properties(arrow-flight-async-grpc-test PROPERTIES TIMEOUT 300)
+endif()
 
 # Build test server for unit tests or benchmarks
 if(ARROW_BUILD_TESTS OR ARROW_BUILD_BENCHMARKS)
