@@ -594,9 +594,8 @@ class MetadataReplyingListener final : public AsyncFlightDataListener {
       batches_.push_back(chunk.data);
       wrote_++;
     }
-    const Status status = writer()->WriteMetadata(
-        *arrow::Buffer::FromString("ack " + std::to_string(chunk.data->num_rows()) +
-                                   " rows"));
+    const Status status = writer()->WriteMetadata(*arrow::Buffer::FromString(
+        "ack " + std::to_string(chunk.data->num_rows()) + " rows"));
     std::lock_guard<std::mutex> lock(mutex_);
     last_write_ = status;
     return arrow::Future<>::MakeFinished();
@@ -1064,6 +1063,85 @@ TEST(AsyncGrpcTest, DoGetClientDeadlineWhilePreparingFinishes) {
       << "no stream was ever prepared, so there is nothing to Close";
   std::lock_guard<std::mutex> guard(trace->mutex);
   EXPECT_EQ(1, trace->call_completed);
+}
+
+/// A DoGet stream whose first payload is an error: the transport must fail the
+/// RPC and still tell the producer the RPC is over through Close().
+class ErrorPayloadDoGetStream final : public AsyncFlightDataStream {
+ public:
+  explicit ErrorPayloadDoGetStream(std::atomic<int>* close_count)
+      : close_count_(close_count) {}
+
+  std::shared_ptr<Schema> schema() override {
+    return arrow::schema({arrow::field("value", arrow::int64())});
+  }
+
+  arrow::Future<FlightPayload> GetSchemaPayloadAsync() override {
+    return resolved_->GetSchemaPayloadAsync();
+  }
+
+  arrow::Future<std::optional<FlightPayload>> NextAsync() override {
+    return arrow::Future<std::optional<FlightPayload>>::MakeFinished(
+        arrow::Status::IOError("the producer failed"));
+  }
+
+  Status Close() override {
+    close_count_->fetch_add(1);
+    return Status::OK();
+  }
+
+  std::shared_ptr<ResolvedStream> resolved_ = std::make_shared<ResolvedStream>(
+      arrow::RecordBatchReader::Make(
+          {}, arrow::schema({arrow::field("value", arrow::int64())}))
+          .ValueOrDie());
+
+ private:
+  std::atomic<int>* close_count_;
+};
+
+/// Serves ErrorPayloadDoGetStream and counts the Close() it was handed.
+class ErrorPayloadDoGetServer final : public AsyncGenericFlightServerBase {
+ public:
+  arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
+      const ServerCallContext&, const Ticket&) override {
+    return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+        std::make_shared<ErrorPayloadDoGetStream>(&stream_closes));
+  }
+
+  std::atomic<int> stream_closes{0};
+};
+
+TEST(AsyncGrpcTest, DoGetPumpErrorStillClosesTheStream) {
+  // The producer's first NextAsync() fails: the RPC ends with that status, and
+  // the producer must still be told the RPC is over through Close(), like the
+  // write-failure and cancel paths already do.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  ErrorPayloadDoGetServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  // DoGet returns once the schema payload is written; the error payload follows.
+  ASSERT_OK_AND_ASSIGN(auto reader, client->DoGet(Ticket{"error-payload"}));
+  while (true) {
+    auto chunk = reader->Next();
+    if (!chunk.ok()) {
+      EXPECT_EQ(chunk.status().code(), arrow::StatusCode::IOError) << chunk.status();
+      break;
+    }
+    if (!chunk->data) {
+      break;
+    }
+  }
+  reader.reset();
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  EXPECT_EQ(1, flight_server.stream_closes.load())
+      << "the producer was never told the RPC is over";
 }
 
 TEST(AsyncGrpcTest, EmptyDoPut) {
@@ -2239,8 +2317,8 @@ TEST(AsyncGrpcTest, DoPutWritesMetadataBackToTheClient) {
   ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
 
   auto schema = arrow::schema({arrow::field("a", arrow::int64())});
-  auto batch = arrow::RecordBatch::Make(
-      schema, 2, {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
 
   ASSERT_OK_AND_ASSIGN(auto put,
                        client->DoPut(FlightDescriptor::Path({"metadata"}), schema));

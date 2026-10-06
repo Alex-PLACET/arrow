@@ -121,6 +121,9 @@ class DoGetReactor : public AsyncReactorBase {
       if (!finished()) {
         if (!result.ok()) {
           FinishOnce(result.status());
+          ARROW_WARN_NOT_OK(
+              CloseStreamOnce(),
+              "DoGet: closing the data stream after a failed payload failed");
         } else {
           wrote_schema_ = true;
           std::optional<FlightPayload> payload = std::move(*result);
@@ -133,6 +136,9 @@ class DoGetReactor : public AsyncReactorBase {
             if (!grpc_status.ok()) {
               FinishOnce(MakeFlightError(FlightStatusCode::Internal,
                                          grpc_status.error_message()));
+              ARROW_WARN_NOT_OK(
+                  CloseStreamOnce(),
+                  "DoGet: closing the data stream after a failed serialization failed");
             } else {
               StartWrite(&write_buf_);
             }
