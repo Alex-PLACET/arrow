@@ -1,0 +1,3367 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+// End-to-end tests of the async generic gRPC Flight service: a server
+// implementing AsyncGenericFlightServerBase directly, driven by the regular
+// sync FlightClient.
+
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <gmock/gmock.h>
+#include <grpcpp/generic/generic_stub.h>
+#include <grpcpp/grpcpp.h>
+#include <gtest/gtest.h>
+
+#include "arrow/flight/client.h"
+#include "arrow/flight/server.h"
+#include "arrow/flight/server_async.h"
+#include "arrow/flight/server_middleware.h"
+#include "arrow/flight/test_auth_handlers.h"
+#include "arrow/flight/transport/grpc/async_grpc_service.h"
+#include "arrow/flight/transport/grpc/async_grpc_service_internal.h"
+#include "arrow/ipc/writer.h"
+#include "arrow/scalar.h"
+#include "arrow/testing/gtest_util.h"
+
+namespace arrow::flight::transport::grpc {
+
+namespace {
+
+// The ticket the test server answers with a stream that has a schema and no
+// batches at all; every other ticket gets the 3-batch stream.
+constexpr const char* kSchemaOnlyTicket = "schema-only-do-get-ticket";
+
+// One canned FlightInfo; `descriptor` names it for the assertions.
+arrow::Result<std::unique_ptr<FlightInfo>> MakeTestFlightInfo(
+    FlightDescriptor descriptor) {
+  ARROW_ASSIGN_OR_RAISE(
+      auto made, FlightInfo::Make(*arrow::schema({arrow::field("value", arrow::int64())}),
+                                  std::move(descriptor), std::vector<FlightEndpoint>{},
+                                  /*total_records=*/-1, /*total_bytes=*/-1));
+  return std::make_unique<FlightInfo>(std::move(made));
+}
+
+// An AsyncFlightDataStream over an in-memory RecordBatchReader: every payload is
+// already available, so each future is finished when it is created.
+class ResolvedStream : public AsyncFlightDataStream {
+ public:
+  explicit ResolvedStream(std::shared_ptr<RecordBatchReader> reader)
+      : reader_(std::move(reader)), mapper_(*reader_->schema()) {}
+
+  std::shared_ptr<Schema> schema() override { return reader_->schema(); }
+
+  arrow::Future<FlightPayload> GetSchemaPayloadAsync() override {
+    FlightPayload payload;
+    auto status =
+        ipc::GetSchemaPayload(*schema(), ipc_options_, mapper_, &payload.ipc_message);
+    if (!status.ok()) {
+      return arrow::Future<FlightPayload>::MakeFinished(status);
+    }
+    return arrow::Future<FlightPayload>::MakeFinished(std::move(payload));
+  }
+
+  arrow::Future<std::optional<FlightPayload>> NextAsync() override {
+    auto batch = reader_->Next();
+    if (!batch.ok()) {
+      return arrow::Future<std::optional<FlightPayload>>::MakeFinished(batch.status());
+    }
+    if (*batch == nullptr) {
+      // End of stream: the async interface reports it as a nullopt.
+      return arrow::Future<std::optional<FlightPayload>>::MakeFinished(std::nullopt);
+    }
+    FlightPayload payload;
+    auto status = ipc::GetRecordBatchPayload(**batch, ipc_options_, &payload.ipc_message);
+    if (!status.ok()) {
+      return arrow::Future<std::optional<FlightPayload>>::MakeFinished(status);
+    }
+    return arrow::Future<std::optional<FlightPayload>>::MakeFinished(std::move(payload));
+  }
+
+  Status Close() override { return reader_->Close(); }
+
+ private:
+  std::shared_ptr<RecordBatchReader> reader_;
+  ipc::DictionaryFieldMapper mapper_;
+  ipc::IpcWriteOptions ipc_options_ = ipc::IpcWriteOptions::Defaults();
+};
+
+// A vector-backed AsyncFlightListing: every NextAsync() resolves immediately.
+class SimpleListingAdapter final : public AsyncFlightListing {
+ public:
+  explicit SimpleListingAdapter(std::vector<FlightInfo> flights)
+      : flights_(std::move(flights)) {}
+
+  arrow::Future<std::shared_ptr<FlightInfo>> NextAsync() override {
+    if (next_ >= flights_.size()) {
+      return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+          std::shared_ptr<FlightInfo>{});
+    }
+    return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+        std::make_shared<FlightInfo>(std::move(flights_[next_++])));
+  }
+
+ private:
+  std::vector<FlightInfo> flights_;
+  size_t next_ = 0;
+};
+
+// A vector-backed AsyncResultStream: every NextAsync() resolves immediately.
+class VectorAsyncResultStream final : public AsyncResultStream {
+ public:
+  explicit VectorAsyncResultStream(std::vector<Result> results)
+      : results_(std::move(results)) {}
+
+  arrow::Future<std::shared_ptr<Result>> NextAsync() override {
+    if (next_ >= results_.size()) {
+      return arrow::Future<std::shared_ptr<Result>>::MakeFinished(
+          std::shared_ptr<Result>{});
+    }
+    return arrow::Future<std::shared_ptr<Result>>::MakeFinished(
+        std::make_shared<Result>(std::move(results_[next_++])));
+  }
+
+ private:
+  std::vector<Result> results_;
+  size_t next_ = 0;
+};
+
+// A DoAction result stream that yields one Result and then fails: the error
+// must become the RPC status, not truncate the stream into a success.
+class MidStreamErrorAsyncResultStream final : public AsyncResultStream {
+ public:
+  arrow::Future<std::shared_ptr<Result>> NextAsync() override {
+    if (served_) {
+      return arrow::Future<std::shared_ptr<Result>>::MakeFinished(
+          arrow::Status::IOError("mid-stream action failure"));
+    }
+    served_ = true;
+    return arrow::Future<std::shared_ptr<Result>>::MakeFinished(
+        std::make_shared<Result>(arrow::Buffer::FromString("first")));
+  }
+
+ private:
+  bool served_ = false;
+};
+
+// The same shape for ListFlights: one FlightInfo, then an error.
+class MidStreamErrorAsyncListing final : public AsyncFlightListing {
+ public:
+  arrow::Future<std::shared_ptr<FlightInfo>> NextAsync() override {
+    if (served_) {
+      return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+          arrow::Status::IOError("mid-stream listing failure"));
+    }
+    served_ = true;
+    auto info = MakeTestFlightInfo(FlightDescriptor::Path({"first-listing"}));
+    if (!info.ok()) {
+      return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(info.status());
+    }
+    return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+        std::shared_ptr<FlightInfo>(std::move(*info)));
+  }
+
+ private:
+  bool served_ = false;
+};
+
+// Serves the canned answers the async-transport tests drive: 3 batches of 5
+// rows for any ticket except kSchemaOnlyTicket, uploads through the listener the
+// test installs, and one canned answer per unary/streaming RPC.  The handlers
+// run on gRPC threads; the tests read the recordings only after the server has
+// shut down.
+class TestFlightServer final : public AsyncGenericFlightServerBase {
+ public:
+  // The listener the next DoPut RPC is handed; nullptr (the default) refuses
+  // uploads, which is the base class behavior.
+  std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
+      const ServerCallContext&) override {
+    return listener_;
+  }
+
+  void set_listener(std::shared_ptr<AsyncFlightDataListener> listener) {
+    listener_ = std::move(listener);
+  }
+
+  arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
+      const ServerCallContext&, const Ticket& request) override {
+    ticket_ = request.ticket;
+    auto schema = arrow::schema(
+        {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+    if (request.ticket == kSchemaOnlyTicket) {
+      // An empty reader still carries the schema; NextAsync() reports the end
+      // of stream right away.
+      auto reader = arrow::RecordBatchReader::Make({}, schema);
+      if (!reader.ok()) {
+        return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+            reader.status());
+      }
+      return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+          std::make_shared<ResolvedStream>(std::move(*reader)));
+    }
+    auto batch = arrow::RecordBatch::Make(
+        schema, 5,
+        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2, 3, 4, 5]"),
+         arrow::ArrayFromJSON(arrow::int64(), "[10, 20, 30, 40, 50]")});
+    auto reader = arrow::RecordBatchReader::Make({batch, batch, batch});
+    if (!reader.ok()) {
+      return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+          reader.status());
+    }
+    return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+        std::make_shared<ResolvedStream>(std::move(*reader)));
+  }
+
+  // The unary trio: canned responses.  `last_descriptor_` records the request
+  // of the last one served (it is written on a gRPC thread, so tests read it
+  // only after the server has shut down); Command("fail") is the sentinel that
+  // drives the error-path test.
+  arrow::Future<std::shared_ptr<FlightInfo>> GetFlightInfoAsync(
+      const ServerCallContext&, const FlightDescriptor& request) override {
+    last_descriptor_ = request;
+    if (request == FlightDescriptor::Command("fail")) {
+      return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+          arrow::Status::KeyError("no such flight"));
+    }
+    if (request == FlightDescriptor::Command("null-info")) {
+      // Answered with a null FlightInfo: the transport must answer what the
+      // sync transport does for that case (grpc_server.cc: "Flight not found").
+      return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+          std::shared_ptr<FlightInfo>{});
+    }
+    auto made =
+        FlightInfo::Make(*arrow::schema({arrow::field("value", arrow::int64())}),
+                         FlightDescriptor{}, std::vector<FlightEndpoint>{}, -1, -1);
+    if (!made.ok()) {
+      return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(made.status());
+    }
+    return arrow::Future<std::shared_ptr<FlightInfo>>::MakeFinished(
+        std::make_shared<FlightInfo>(std::move(*made)));
+  }
+
+  arrow::Future<std::shared_ptr<SchemaResult>> GetSchemaAsync(
+      const ServerCallContext&, const FlightDescriptor& request) override {
+    last_descriptor_ = request;
+    auto made =
+        SchemaResult::Make(*arrow::schema({arrow::field("value", arrow::int64())}));
+    if (!made.ok()) {
+      return arrow::Future<std::shared_ptr<SchemaResult>>::MakeFinished(made.status());
+    }
+    return arrow::Future<std::shared_ptr<SchemaResult>>::MakeFinished(
+        std::shared_ptr<SchemaResult>(std::move(*made)));
+  }
+
+  arrow::Future<std::shared_ptr<PollInfo>> PollFlightInfoAsync(
+      const ServerCallContext&, const FlightDescriptor& request) override {
+    last_descriptor_ = request;
+    auto poll_info = std::make_shared<PollInfo>();
+    poll_info->descriptor = FlightDescriptor::Command("poll-next");
+    poll_info->progress = 0.5;
+    return arrow::Future<std::shared_ptr<PollInfo>>::MakeFinished(std::move(poll_info));
+  }
+
+  // The streaming trio: ListActions (a vector), DoAction (an AsyncResultStream)
+  // and ListFlights (an AsyncFlightListing).  `last_criteria_` records the
+  // filter the client sent (read only after the server stopped); the
+  // "fail-mid-stream" sentinels drive the error-path tests.
+  arrow::Future<std::vector<ActionType>> ListActionsAsync(
+      const ServerCallContext&) override {
+    std::vector<ActionType> actions = {ActionType("echo", "echo back"),
+                                       ActionType("fail", "always fails")};
+    if (empty_actions_) {
+      actions.clear();
+    }
+    return arrow::Future<std::vector<ActionType>>::MakeFinished(std::move(actions));
+  }
+
+  arrow::Future<std::shared_ptr<AsyncResultStream>> DoActionAsync(
+      const ServerCallContext&, const Action& action) override {
+    last_action_type_ = action.type;
+    if (action.type == "fail-mid-stream") {
+      return arrow::Future<std::shared_ptr<AsyncResultStream>>::MakeFinished(
+          std::make_shared<MidStreamErrorAsyncResultStream>());
+    }
+    if (action.type == "null-result-stream") {
+      // Answered with a null stream: the transport answers CANCELLED for this
+      // case (grpc_server.cc:404-406), before writing anything.
+      return arrow::Future<std::shared_ptr<AsyncResultStream>>::MakeFinished(
+          std::shared_ptr<AsyncResultStream>{});
+    }
+    std::vector<Result> made;
+    made.emplace_back(arrow::Buffer::FromString("one"));
+    if (action.type == "multi") {
+      made.emplace_back(arrow::Buffer::FromString("two"));
+      made.emplace_back(arrow::Buffer::FromString("three"));
+    }
+    return arrow::Future<std::shared_ptr<AsyncResultStream>>::MakeFinished(
+        std::make_shared<VectorAsyncResultStream>(std::move(made)));
+  }
+
+  arrow::Future<std::shared_ptr<AsyncFlightListing>> ListFlightsAsync(
+      const ServerCallContext&, const Criteria* criteria) override {
+    if (criteria != nullptr) {
+      last_criteria_ = *criteria;
+    }
+    const std::string expression = criteria == nullptr ? "" : criteria->expression;
+    if (expression == "fail-mid-stream") {
+      return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(
+          std::make_shared<MidStreamErrorAsyncListing>());
+    }
+    if (expression.empty()) {
+      // No criteria: the sync handler passes an empty (never null) Criteria
+      // to the handler and the async reactor must do the same, so an empty
+      // expression is reachable here.
+      return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(
+          std::make_shared<SimpleListingAdapter>(std::vector<FlightInfo>{}));
+    }
+    std::vector<FlightInfo> flights;
+    for (const auto& name : {"first-listing", "second-listing"}) {
+      auto info = MakeTestFlightInfo(FlightDescriptor::Path({name}));
+      if (!info.ok()) {
+        return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(
+            info.status());
+      }
+      flights.push_back(std::move(**info));
+    }
+    return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(
+        std::make_shared<SimpleListingAdapter>(std::move(flights)));
+  }
+
+  void set_empty_actions() { empty_actions_ = true; }
+
+  const std::string& ticket() const { return ticket_; }
+  const FlightDescriptor& last_descriptor() const { return last_descriptor_; }
+  const std::string& last_action_type() const { return last_action_type_; }
+  const Criteria& last_criteria() const { return last_criteria_; }
+
+ private:
+  std::shared_ptr<AsyncFlightDataListener> listener_;
+  std::string ticket_;
+  FlightDescriptor last_descriptor_;
+  std::string last_action_type_;
+  Criteria last_criteria_;
+  bool empty_actions_ = false;
+};
+
+// Echoes every chunk of a DoExchange back, in order, on the async API: the
+// reader's demand drives the loop, each write is awaited, and the all-null
+// chunk ends the exchange.  `exchanges_in_flight` proves an abandoned
+// exchange still leaves the handler: the state object is freed when the last
+// continuation dies and decrements the counter on destruction.
+class EchoExchangeTestServer : public AsyncGenericFlightServerBase {
+ public:
+  arrow::Future<> DoExchangeAsync(
+      const ServerCallContext&, std::shared_ptr<AsyncFlightMessageReader> reader,
+      std::shared_ptr<AsyncFlightMessageWriter> writer) override {
+    exchange_count_.fetch_add(1);
+    exchanges_in_flight_.fetch_add(1);
+    auto state = std::make_shared<EchoState>();
+    state->reader = std::move(reader);
+    state->writer = std::move(writer);
+    state->in_flight = &exchanges_in_flight_;
+    return EchoNext(state);
+  }
+
+  int exchanges_in_flight() const { return exchanges_in_flight_.load(); }
+  int exchange_count() const { return exchange_count_.load(); }
+
+ private:
+  struct EchoState {
+    std::shared_ptr<AsyncFlightMessageReader> reader;
+    std::shared_ptr<AsyncFlightMessageWriter> writer;
+    std::atomic<int>* in_flight = nullptr;
+    bool begun = false;
+    ~EchoState() { in_flight->fetch_sub(1); }
+  };
+
+  arrow::Future<> EchoNext(const std::shared_ptr<EchoState>& state) {
+    // ponytail: the recursion depth follows the batch count of one exchange.
+    // Flatten into a loop if a single exchange ever carries thousands.
+    return state->reader->NextAsync().Then(
+        [this, state](const FlightStreamChunk& chunk) -> arrow::Future<> {
+          if (chunk.data == nullptr && chunk.app_metadata == nullptr) {
+            // End of the exchange.
+            return arrow::Future<>::MakeFinished();
+          }
+          arrow::Future<> written = arrow::Future<>::MakeFinished();
+          if (chunk.data != nullptr && !state->begun) {
+            state->begun = true;
+            written = state->writer->BeginAsync(chunk.data->schema());
+          }
+          if (chunk.data != nullptr && chunk.app_metadata != nullptr) {
+            written = written.Then([state, chunk]() {
+              return state->writer->WriteWithMetadataAsync(*chunk.data,
+                                                           chunk.app_metadata);
+            });
+          } else if (chunk.data != nullptr) {
+            written = written.Then([state, chunk]() {
+              return state->writer->WriteRecordBatchAsync(*chunk.data);
+            });
+          } else {
+            written = written.Then([state, chunk]() {
+              return state->writer->WriteMetadataAsync(chunk.app_metadata);
+            });
+          }
+          return written.Then([this, state]() { return EchoNext(state); });
+        });
+  }
+
+  std::atomic<int> exchanges_in_flight_{0};
+  std::atomic<int> exchange_count_{0};
+};
+
+// Records what the decoder hands to the application: the schema, every chunk,
+// and whether the consumer accepted it. OnNext returns whatever status the
+// test configured, so the upload's error path is reachable from here.
+class RecordingListener : public AsyncFlightDataListener {
+ public:
+  arrow::Status OnSchemaDecoded(std::shared_ptr<arrow::Schema> schema) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++schema_count_;
+    schema_ = std::move(schema);
+    return arrow::Status::OK();
+  }
+
+  arrow::Future<> OnNext(FlightStreamChunk chunk) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (chunk.data) {
+      batches_.push_back(std::move(chunk.data));
+    } else {
+      ++metadata_only_count_;
+      metadata_chunks_.push_back(std::move(chunk.app_metadata));
+    }
+    last_status_ = next_status_;
+    return arrow::Future<>::MakeFinished(next_status_);
+  }
+
+  // Records the upload's descriptor and reports whatever status the test
+  // configured, so the descriptor rejection path is reachable from here too.
+  arrow::Future<> OnDescriptor(const FlightDescriptor& descriptor) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    descriptors_.push_back(descriptor);
+    return arrow::Future<>::MakeFinished(descriptor_status_);
+  }
+
+  // Consumer-side rejection of the upload, as the decoder tests do.
+  void set_next_status(arrow::Status status) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    next_status_ = std::move(status);
+  }
+  // Rejection before any schema or data arrives.
+  void set_descriptor_status(arrow::Status status) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    descriptor_status_ = std::move(status);
+  }
+
+  int schema_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return schema_count_;
+  }
+  int descriptor_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<int>(descriptors_.size());
+  }
+  int metadata_only_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return metadata_only_count_;
+  }
+  std::shared_ptr<arrow::Schema> schema() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return schema_;
+  }
+  std::vector<FlightDescriptor> descriptors() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return descriptors_;
+  }
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return batches_;
+  }
+  std::vector<std::shared_ptr<arrow::Buffer>> metadata_chunks() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return metadata_chunks_;
+  }
+  arrow::Status last_status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_status_;
+  }
+
+ private:
+  /// The callbacks run on gRPC threads while the test thread reads the
+  /// accessors, so everything they share goes through this.
+  mutable std::mutex mutex_;
+  int schema_count_ = 0;
+  int metadata_only_count_ = 0;
+  std::shared_ptr<arrow::Schema> schema_;
+  std::vector<FlightDescriptor> descriptors_;
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches_;
+  std::vector<std::shared_ptr<arrow::Buffer>> metadata_chunks_;
+  arrow::Status descriptor_status_;
+  arrow::Status next_status_;
+  arrow::Status last_status_;
+};
+
+// A listener that records the terminal events on top of RecordingListener:
+// OnFinish (the upload ended, whichever way) and what Cancel() reported, so
+// the tests can assert on an upload cancelled from the server side.
+class FinishRecordingListener : public RecordingListener {
+ public:
+  arrow::Future<> OnFinish(Status status) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    finish_count_++;
+    finish_status_ = std::move(status);
+    return arrow::Future<>::MakeFinished(arrow::Status::OK());
+  }
+
+  /// Cancel from whatever thread the test drives; records what Cancel() said.
+  void CancelWith(Status status) {
+    const arrow::Status cancel_status = Cancel(std::move(status)).status();
+    std::lock_guard<std::mutex> lock(mutex_);
+    cancel_status_ = cancel_status;
+    ++cancel_count_;
+  }
+
+  int finish_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return finish_count_;
+  }
+  int cancel_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cancel_count_;
+  }
+  Status finish_status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return finish_status_;
+  }
+  Status cancel_status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cancel_status_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  int finish_count_ = 0;
+  int cancel_count_ = 0;
+  Status finish_status_;
+  Status cancel_status_;
+};
+
+// A server that accepts uploads: the transport asks the server for the per-RPC
+// listener through the CreateDoPutListener() virtual.  One fresh listener per
+// RPC, as overlapping uploads require; the test reads them only after the server
+// has stopped, or through WaitForListener (which is what a cancel test needs: it
+// acts while the upload is in flight).
+class TestUploadServer : public AsyncGenericFlightServerBase {
+ public:
+  std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
+      const ServerCallContext& context) override {
+    auto listener = std::make_shared<FinishRecordingListener>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    listeners_.push_back(listener);
+    return listener;
+  }
+
+  int calls() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<int>(listeners_.size());
+  }
+
+  std::shared_ptr<FinishRecordingListener> listener(int i) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return listeners_[i];
+  }
+
+  /// \brief Wait (bounded) for the listener of the i-th upload to exist.
+  /// The factory runs on a gRPC thread; a test that must act mid-upload waits
+  /// for it here instead of racing the read.
+  std::shared_ptr<FinishRecordingListener> WaitForListener(int i) const {
+    for (int attempt = 0; attempt < 500; attempt++) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (static_cast<int>(listeners_.size()) > i) return listeners_[i];
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return nullptr;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::shared_ptr<FinishRecordingListener>> listeners_;
+};
+
+/// A listener that acknowledges every batch it is handed with one application
+/// metadata message, the way an application reports per-chunk progress.
+class MetadataReplyingListener final : public AsyncFlightDataListener {
+ public:
+  arrow::Future<> OnNext(FlightStreamChunk chunk) override {
+    if (!chunk.data) {
+      return arrow::Future<>::MakeFinished();
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      batches_.push_back(chunk.data);
+      wrote_++;
+    }
+    const Status status = writer()->WriteMetadata(*arrow::Buffer::FromString(
+        "ack " + std::to_string(chunk.data->num_rows()) + " rows"));
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_write_ = status;
+    return arrow::Future<>::MakeFinished();
+  }
+
+  std::vector<std::shared_ptr<RecordBatch>> batches() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return batches_;
+  }
+  int wrote() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return wrote_;
+  }
+  Status last_write() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_write_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::shared_ptr<RecordBatch>> batches_;
+  int wrote_ = 0;
+  Status last_write_;
+};
+
+/// Hands out a MetadataReplyingListener for every upload.
+class MetadataReplyingUploadServer final : public AsyncGenericFlightServerBase {
+ public:
+  std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
+      const ServerCallContext&) override {
+    auto listener = std::make_shared<MetadataReplyingListener>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    listeners_.push_back(listener);
+    return listener;
+  }
+
+  std::shared_ptr<MetadataReplyingListener> WaitForListener() const {
+    for (int attempt = 0; attempt < 500; attempt++) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!listeners_.empty()) return listeners_[0];
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return nullptr;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::shared_ptr<MetadataReplyingListener>> listeners_;
+};
+
+// Middleware execution counts, shared between the factory, the middleware and
+// the test thread (all three touch it).
+struct MiddlewareTrace {
+  std::mutex mutex;
+  int start_call = 0;
+  int sending_headers = 0;
+  int call_completed = 0;
+};
+
+// Records middleware execution so a test can assert StartCall/CallCompleted
+// ran on the async path (the sync path is covered by TestMiddleware).
+class RecordingServerMiddleware : public ServerMiddleware {
+ public:
+  explicit RecordingServerMiddleware(std::shared_ptr<MiddlewareTrace> trace)
+      : trace_(std::move(trace)) {}
+
+  std::string name() const override { return "recording"; }
+  void SendingHeaders(AddCallHeaders* /*outgoing_headers*/) override {
+    std::lock_guard<std::mutex> guard(trace_->mutex);
+    trace_->sending_headers++;
+  }
+  void CallCompleted(const Status& /*status*/) override {
+    std::lock_guard<std::mutex> guard(trace_->mutex);
+    trace_->call_completed++;
+  }
+
+ private:
+  std::shared_ptr<MiddlewareTrace> trace_;
+};
+
+class RecordingServerMiddlewareFactory : public ServerMiddlewareFactory {
+ public:
+  explicit RecordingServerMiddlewareFactory(std::shared_ptr<MiddlewareTrace> trace)
+      : trace_(std::move(trace)) {}
+
+  Status StartCall(const CallInfo& /*info*/, const ServerCallContext& /*context*/,
+                   std::shared_ptr<ServerMiddleware>* middleware) override {
+    {
+      std::lock_guard<std::mutex> guard(trace_->mutex);
+      trace_->start_call++;
+    }
+    *middleware = std::make_shared<RecordingServerMiddleware>(trace_);
+    return Status::OK();
+  }
+
+ private:
+  std::shared_ptr<MiddlewareTrace> trace_;
+};
+
+class RejectingServerMiddlewareFactory : public ServerMiddlewareFactory {
+ public:
+  Status StartCall(const CallInfo&, const ServerCallContext&,
+                   std::shared_ptr<ServerMiddleware>*) override {
+    return Status::Invalid("rejected by middleware");
+  }
+};
+
+// The gRPC transport builds the generic service with the shared context
+// helper (which runs middleware and auth). Tests that register the service
+// on a hand-built grpc::ServerBuilder must pass it explicitly.
+std::shared_ptr<GrpcServerCallContextHelper<::grpc::CallbackServerContext>>
+MakeAsyncHelper() {
+  return std::make_shared<GrpcServerCallContextHelper<::grpc::CallbackServerContext>>(
+      /*auth_handler=*/nullptr, MiddlewareFactoryList{});
+}
+
+// The method name no FlightService stub knows: the transport must answer it
+// with the UNIMPLEMENTED fallback reactor rather than any typed path.  It is
+// called over a raw generic stub, because only a generic client can name a
+// method the service does not have.
+constexpr const char* kUnknownMethod =
+    "/arrow.flight.protocol.FlightService/NoSuchMethod";
+
+// Call `kUnknownMethod` on the server listening on `port` with the sync-style
+// generic stub API, and return the server's status.
+::grpc::Status CallUnknownMethod(int port) {
+  std::shared_ptr<::grpc::Channel> channel = ::grpc::CreateChannel(
+      "127.0.0.1:" + std::to_string(port), ::grpc::InsecureChannelCredentials());
+  ::grpc::GenericStub stub(channel);
+  ::grpc::ClientContext context;
+  ::grpc::ByteBuffer request;
+  ::grpc::ByteBuffer response;
+  ::grpc::CompletionQueue cq;
+  std::unique_ptr<::grpc::ClientAsyncResponseReader<::grpc::ByteBuffer>> call =
+      stub.PrepareUnaryCall(&context, kUnknownMethod, request, &cq);
+  call->StartCall();
+  ::grpc::Status status;
+  call->Finish(&response, &status, reinterpret_cast<void*>(1));
+  void* tag = nullptr;
+  bool ok = false;
+  cq.Next(&tag, &ok);
+  return status;
+}
+
+// Poll `predicate` until it holds or the timeout expires; the DoExchange tests
+// use it to bound server-side cleanup instead of sleeping a fixed time.
+template <typename Predicate>
+bool WaitFor(Predicate predicate,
+             std::chrono::milliseconds timeout = std::chrono::seconds(10)) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return predicate();
+}
+
+// Upload one batch and report whichever surface first reports an error: the
+// DoPut call, the write, or Close.
+std::pair<std::string, arrow::Status> UploadOneBatch(
+    FlightClient* client, const FlightDescriptor& descriptor,
+    const std::shared_ptr<arrow::Schema>& schema,
+    const std::shared_ptr<arrow::RecordBatch>& batch) {
+  auto result = client->DoPut(descriptor, schema);
+  if (!result.ok()) {
+    return {"DoPut", result.status()};
+  }
+  auto write_status = result->writer->WriteRecordBatch(*batch);
+  if (!write_status.ok()) {
+    return {"WriteRecordBatch", write_status};
+  }
+  return {"Close", result->writer->Close()};
+}
+
+TEST(AsyncGrpcTest, BasicDoGet) {
+  TestFlightServer flight_server;
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
+
+  int port = 0;
+  ::grpc::ServerBuilder builder;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(), &port);
+  builder.RegisterCallbackGenericService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+  ASSERT_NE(port, 0);
+
+  // Connect the existing arrow::flight::FlightClient implementation.
+  std::string uri = "grpc://localhost:" + std::to_string(port);
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(location));
+
+  // Call DoGet: the ticket must reach TestFlightServer::DoGetAsync.
+  Ticket ticket{"basic-do-get-ticket"};
+  ASSERT_OK_AND_ASSIGN(auto reader, client->DoGet(ticket));
+
+  // Read schema.
+  ASSERT_OK_AND_ASSIGN(auto schema, reader->GetSchema());
+  ASSERT_EQ(schema->num_fields(), 2);
+  ASSERT_EQ(schema->field(0)->name(), "a");
+  ASSERT_EQ(schema->field(1)->name(), "b");
+
+  // Read batches.
+  int batch_count = 0;
+  while (true) {
+    ASSERT_OK_AND_ASSIGN(auto chunk, reader->Next());
+    if (!chunk.data) break;
+    ASSERT_EQ(chunk.data->num_rows(), 5);
+    ASSERT_OK_AND_ASSIGN(auto value, chunk.data->column(0)->GetScalar(0));
+    ASSERT_TRUE(value->Equals(*arrow::MakeScalar(int64_t(1))));
+    batch_count++;
+  }
+  ASSERT_EQ(batch_count, 3);
+
+  // Cleanup. The ticket is asserted only after the server stopped, so the
+  // DoGet callback cannot race with the read.
+  ASSERT_OK(client->Close());
+  server->Shutdown();
+  server->Wait();
+
+  ASSERT_EQ(flight_server.ticket(), "basic-do-get-ticket");
+}
+
+TEST(AsyncGrpcTest, BasicDoPut) {
+  TestFlightServer flight_server;
+  // One listener for the whole test: shared with the service's factory and
+  // kept here so it can be asserted on after the RPC.
+  auto listener = std::make_shared<RecordingListener>();
+  flight_server.set_listener(listener);
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
+
+  int port = 0;
+  ::grpc::ServerBuilder builder;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(), &port);
+  builder.RegisterCallbackGenericService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+  ASSERT_NE(port, 0);
+
+  // Connect the existing arrow::flight::FlightClient implementation.
+  std::string uri = "grpc://localhost:" + std::to_string(port);
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(location));
+
+  auto schema = arrow::schema(
+      {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+  auto batch =
+      arrow::RecordBatch::Make(schema, 3,
+                               {arrow::ArrayFromJSON(arrow::int64(), "[1, 2, 3]"),
+                                arrow::ArrayFromJSON(arrow::int64(), "[10, 20, 30]")});
+
+  // Call DoPut and upload the same batch twice. Close() returns the server's
+  // final status, i.e. it only succeeds once the acknowledgement written on
+  // end of stream has been read.
+  FlightDescriptor descriptor = FlightDescriptor::Path({"test"});
+  ASSERT_OK_AND_ASSIGN(auto result, client->DoPut(descriptor, schema));
+  ASSERT_OK(result.writer->WriteRecordBatch(*batch));
+  ASSERT_OK(result.writer->WriteRecordBatch(*batch));
+  ASSERT_OK(result.writer->Close());
+
+  // Cleanup. The listener is asserted only after the server stopped, so the
+  // DoPut callback cannot race with the reads.
+  ASSERT_OK(client->Close());
+  server->Shutdown();
+  server->Wait();
+
+  // The listener saw the schema once and both batches, in order.
+  ASSERT_EQ(listener->schema_count(), 1);
+  ASSERT_EQ(listener->schema()->num_fields(), 2);
+  ASSERT_EQ(listener->schema()->field(0)->name(), "a");
+  ASSERT_EQ(listener->schema()->field(1)->name(), "b");
+  ASSERT_EQ(listener->batches().size(), 2);
+  for (const auto& chunk : listener->batches()) {
+    ASSERT_EQ(chunk->num_rows(), 3);
+    ASSERT_EQ(chunk->num_columns(), 2);
+    ASSERT_OK_AND_ASSIGN(auto value, chunk->column(0)->GetScalar(0));
+    ASSERT_TRUE(value->Equals(*arrow::MakeScalar(int64_t(1))));
+  }
+  // No metadata-only (error/app-metadata) chunks, and nothing the consumer
+  // rejected: a non-OK OnNext status would have failed DoPut with no ack.
+  ASSERT_EQ(listener->metadata_only_count(), 0);
+  ASSERT_OK(listener->last_status());
+}
+
+TEST(AsyncGrpcTest, SchemaOnlyDoGet) {
+  TestFlightServer flight_server;
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
+
+  int port = 0;
+  ::grpc::ServerBuilder builder;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(), &port);
+  builder.RegisterCallbackGenericService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+  ASSERT_NE(port, 0);
+
+  std::string uri = "grpc://localhost:" + std::to_string(port);
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(location));
+
+  // This ticket is served as a stream with no batches at all.
+  Ticket ticket{kSchemaOnlyTicket};
+  ASSERT_OK_AND_ASSIGN(auto reader, client->DoGet(ticket));
+
+  // The schema is served...
+  ASSERT_OK_AND_ASSIGN(auto schema, reader->GetSchema());
+  ASSERT_EQ(schema->num_fields(), 2);
+  ASSERT_EQ(schema->field(0)->name(), "a");
+  ASSERT_EQ(schema->field(1)->name(), "b");
+
+  // ...and the very first read reports the end of stream instead of failing.
+  ASSERT_OK_AND_ASSIGN(auto chunk, reader->Next());
+  ASSERT_EQ(chunk.data, nullptr);
+
+  // Cleanup. The ticket is asserted only after the server stopped, so the
+  // DoGet callback cannot race with the read.
+  ASSERT_OK(client->Close());
+  server->Shutdown();
+  server->Wait();
+
+  ASSERT_EQ(flight_server.ticket(), kSchemaOnlyTicket);
+}
+
+// A DoGet stream whose first payload never arrives: the producer is parked
+// forever, so only a client cancel can ever end the RPC.  `close_count` and
+// `next_awaits` let the test observe, from the test thread, that the payload
+// demand is live and that Close() was delivered exactly once.
+class HangingDoGetStream final : public AsyncFlightDataStream {
+ public:
+  HangingDoGetStream(std::shared_ptr<ResolvedStream> resolved,
+                     std::atomic<int>* next_awaits, std::atomic<int>* close_count)
+      : resolved_(std::move(resolved)),
+        next_awaits_(next_awaits),
+        close_count_(close_count) {}
+
+  std::shared_ptr<Schema> schema() override { return resolved_->schema(); }
+
+  arrow::Future<FlightPayload> GetSchemaPayloadAsync() override {
+    return resolved_->GetSchemaPayloadAsync();
+  }
+
+  arrow::Future<std::optional<FlightPayload>> NextAsync() override {
+    next_awaits_->fetch_add(1);
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_ = arrow::Future<std::optional<FlightPayload>>::Make();
+    return pending_;
+  }
+
+  // The transport's stop signal: resolve the pending payload so the producer
+  // does not park forever (mirrors the example's TimedAsyncStream::Close).
+  Status Close() override {
+    close_count_->fetch_add(1);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_.is_valid() && !pending_.is_finished()) {
+      pending_.MarkFinished(arrow::Status::Cancelled());
+    }
+    return resolved_->Close();
+  }
+
+ private:
+  std::shared_ptr<ResolvedStream> resolved_;
+  std::atomic<int>* next_awaits_;
+  std::atomic<int>* close_count_;
+  std::mutex mutex_;
+  arrow::Future<std::optional<FlightPayload>> pending_;
+};
+
+// DoGet server with a configurable hang: kPrepare leaves DoGetAsync() pending
+// (no stream ever exists); kStream resolves the stream but leaves the first
+// payload pending.
+class HangingDoGetServer final : public AsyncGenericFlightServerBase {
+ public:
+  enum class HangAt { kPrepare, kStream };
+  explicit HangingDoGetServer(HangAt hang) : hang_(hang) {}
+
+  arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
+      const ServerCallContext&, const Ticket&) override {
+    if (hang_ == HangAt::kPrepare) {
+      return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::Make();
+    }
+    auto reader = arrow::RecordBatchReader::Make(
+                      {}, arrow::schema({arrow::field("value", arrow::int64())}))
+                      .ValueOrDie();
+    return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+        std::make_shared<HangingDoGetStream>(
+            std::make_shared<ResolvedStream>(std::move(reader)), &next_awaits,
+            &stream_closes));
+  }
+
+  std::atomic<int> next_awaits{0};
+  std::atomic<int> stream_closes{0};
+
+ private:
+  HangAt hang_;
+};
+
+TEST(AsyncGrpcTest, DoGetClientCancelWithPendingPayloadFinishes) {
+  // The client gives up while the producer's NextAsync() is pending: the
+  // transport must finish the RPC itself and deliver Close() to the producer,
+  // instead of waiting for a payload that will not come.  Without the fix the
+  // Shutdown()/Wait() below never return (gRPC keeps the call alive until
+  // Finish() runs), which is why this test runs under a shell timeout.
+  const int64_t before = detail::AsyncReactorBase::live_reactors();
+  auto trace = std::make_shared<MiddlewareTrace>();
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingDoGetServer flight_server(HangingDoGetServer::HangAt::kStream);
+  FlightServerOptions options(location);
+  options.middleware = {
+      {"recording", std::make_shared<RecordingServerMiddlewareFactory>(trace)}};
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  // DoGet returns once the schema payload is written; the payload after it is
+  // the one that never comes.  Wait until the server has actually asked for
+  // it, so the cancel lands on a live demand (not a race with the schema
+  // write).
+  ASSERT_OK_AND_ASSIGN(auto reader, client->DoGet(Ticket{"hang"}));
+  ASSERT_TRUE(WaitFor([&flight_server] { return flight_server.next_awaits.load() >= 1; }))
+      << "the server never asked for its first payload";
+
+  reader->Cancel();
+  reader.reset();
+  ASSERT_OK(client->Close());
+
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // The producer was told to stop, exactly once.
+  EXPECT_EQ(1, flight_server.stream_closes.load());
+  // And the reactor is gone even though its payload future never completed.
+  EXPECT_TRUE(WaitFor([&] {
+    return detail::AsyncReactorBase::live_reactors() == before;
+  })) << "a reactor leaked: still alive after the server stopped (before="
+      << before << ", now=" << detail::AsyncReactorBase::live_reactors() << ")";
+  // And the call reported completion exactly once (the CAS in FinishOnce).
+  std::lock_guard<std::mutex> guard(trace->mutex);
+  EXPECT_EQ(1, trace->call_completed);
+}
+
+TEST(AsyncGrpcTest, DoGetClientDeadlineWhilePreparingFinishes) {
+  // DoGetAsync() never resolves and the client's deadline expires: the RPC
+  // must end anyway.  Without the fix the Shutdown()/Wait() below never
+  // return.  No stream exists here, so Close() has nothing to deliver and the
+  // producer notices through ServerCallContext::is_cancelled().
+  auto trace = std::make_shared<MiddlewareTrace>();
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingDoGetServer flight_server(HangingDoGetServer::HangAt::kPrepare);
+  FlightServerOptions options(location);
+  options.middleware = {
+      {"recording", std::make_shared<RecordingServerMiddlewareFactory>(trace)}};
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(500);
+  auto reader = client->DoGet(impatient, Ticket{"hang"});
+  EXPECT_FALSE(reader.ok()) << "the deadline must expire while the server prepares";
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  EXPECT_EQ(0, flight_server.stream_closes.load())
+      << "no stream was ever prepared, so there is nothing to Close";
+  std::lock_guard<std::mutex> guard(trace->mutex);
+  EXPECT_EQ(1, trace->call_completed);
+}
+
+/// A DoGet stream whose first payload is an error: the transport must fail the
+/// RPC and still tell the producer the RPC is over through Close().
+class ErrorPayloadDoGetStream final : public AsyncFlightDataStream {
+ public:
+  explicit ErrorPayloadDoGetStream(std::atomic<int>* close_count)
+      : close_count_(close_count) {}
+
+  std::shared_ptr<Schema> schema() override {
+    return arrow::schema({arrow::field("value", arrow::int64())});
+  }
+
+  arrow::Future<FlightPayload> GetSchemaPayloadAsync() override {
+    return resolved_->GetSchemaPayloadAsync();
+  }
+
+  arrow::Future<std::optional<FlightPayload>> NextAsync() override {
+    return arrow::Future<std::optional<FlightPayload>>::MakeFinished(
+        arrow::Status::IOError("the producer failed"));
+  }
+
+  Status Close() override {
+    close_count_->fetch_add(1);
+    return Status::OK();
+  }
+
+  std::shared_ptr<ResolvedStream> resolved_ = std::make_shared<ResolvedStream>(
+      arrow::RecordBatchReader::Make(
+          {}, arrow::schema({arrow::field("value", arrow::int64())}))
+          .ValueOrDie());
+
+ private:
+  std::atomic<int>* close_count_;
+};
+
+/// Serves ErrorPayloadDoGetStream and counts the Close() it was handed.
+class ErrorPayloadDoGetServer final : public AsyncGenericFlightServerBase {
+ public:
+  arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
+      const ServerCallContext&, const Ticket&) override {
+    return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+        std::make_shared<ErrorPayloadDoGetStream>(&stream_closes));
+  }
+
+  std::atomic<int> stream_closes{0};
+};
+
+TEST(AsyncGrpcTest, DoGetPumpErrorStillClosesTheStream) {
+  // The producer's first NextAsync() fails: the RPC ends with that status, and
+  // the producer must still be told the RPC is over through Close(), like the
+  // write-failure and cancel paths already do.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  ErrorPayloadDoGetServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  // DoGet returns once the schema payload is written; the error payload follows.
+  ASSERT_OK_AND_ASSIGN(auto reader, client->DoGet(Ticket{"error-payload"}));
+  while (true) {
+    auto chunk = reader->Next();
+    if (!chunk.ok()) {
+      EXPECT_EQ(chunk.status().code(), arrow::StatusCode::IOError) << chunk.status();
+      break;
+    }
+    if (!chunk->data) {
+      break;
+    }
+  }
+  reader.reset();
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  EXPECT_EQ(1, flight_server.stream_closes.load())
+      << "the producer was never told the RPC is over";
+}
+
+TEST(AsyncGrpcTest, EmptyDoPut) {
+  TestFlightServer flight_server;
+  auto listener = std::make_shared<RecordingListener>();
+  flight_server.set_listener(listener);
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
+
+  int port = 0;
+  ::grpc::ServerBuilder builder;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(), &port);
+  builder.RegisterCallbackGenericService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+  ASSERT_NE(port, 0);
+
+  std::string uri = "grpc://localhost:" + std::to_string(port);
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(location));
+
+  auto schema = arrow::schema(
+      {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+
+  // Upload nothing at all: the acknowledgement the server writes back on the
+  // client's half-close is what makes Close() return.
+  FlightDescriptor descriptor = FlightDescriptor::Path({"empty-put"});
+  ASSERT_OK_AND_ASSIGN(auto result, client->DoPut(descriptor, schema));
+  ASSERT_OK(result.writer->Close());
+
+  // Cleanup before looking at the listener, so the DoPut callback cannot race
+  // with the reads.
+  ASSERT_OK(client->Close());
+  server->Shutdown();
+  server->Wait();
+
+  // No data of any kind reached the listener.
+  ASSERT_EQ(listener->batches().size(), 0);
+  ASSERT_EQ(listener->metadata_only_count(), 0);
+  ASSERT_OK(listener->last_status());
+  // The sync client sends the schema payload eagerly, even when no batch
+  // follows, so the listener does see the schema here. Deliberately not
+  // asserted: that is the client's business, not the transport's.
+}
+
+TEST(AsyncGrpcTest, MetadataOnlyPutChunk) {
+  TestFlightServer flight_server;
+  auto listener = std::make_shared<RecordingListener>();
+  flight_server.set_listener(listener);
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
+
+  int port = 0;
+  ::grpc::ServerBuilder builder;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(), &port);
+  builder.RegisterCallbackGenericService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+  ASSERT_NE(port, 0);
+
+  std::string uri = "grpc://localhost:" + std::to_string(port);
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(location));
+
+  auto schema = arrow::schema(
+      {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+
+  // RFC 3.2: a message carrying application metadata and no data is a valid
+  // chunk of the upload.
+  FlightDescriptor descriptor = FlightDescriptor::Path({"metadata-only-put"});
+  ASSERT_OK_AND_ASSIGN(auto result, client->DoPut(descriptor, schema));
+  auto app_metadata = arrow::Buffer::FromString("metadata-only-upload");
+  ASSERT_OK(result.writer->WriteMetadata(app_metadata));
+  ASSERT_OK(result.writer->Close());
+
+  ASSERT_OK(client->Close());
+  server->Shutdown();
+  server->Wait();
+
+  // Exactly one chunk reached the listener: no data, that exact metadata.
+  ASSERT_EQ(listener->batches().size(), 0);
+  ASSERT_EQ(listener->metadata_only_count(), 1);
+  ASSERT_EQ(listener->metadata_chunks().size(), 1);
+  ASSERT_NE(listener->metadata_chunks()[0], nullptr);
+  ASSERT_EQ(listener->metadata_chunks()[0]->ToString(), "metadata-only-upload");
+}
+
+TEST(AsyncGrpcTest, DoPutRejectedByListener) {
+  TestFlightServer flight_server;
+  auto listener = std::make_shared<FinishRecordingListener>();
+  // The consumer rejects the upload.
+  listener->set_next_status(arrow::Status::Invalid("listener rejected this upload"));
+  flight_server.set_listener(listener);
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
+
+  int port = 0;
+  ::grpc::ServerBuilder builder;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(), &port);
+  builder.RegisterCallbackGenericService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+  ASSERT_NE(port, 0);
+
+  std::string uri = "grpc://localhost:" + std::to_string(port);
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(location));
+
+  auto schema = arrow::schema(
+      {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+  auto batch =
+      arrow::RecordBatch::Make(schema, 3,
+                               {arrow::ArrayFromJSON(arrow::int64(), "[1, 2, 3]"),
+                                arrow::ArrayFromJSON(arrow::int64(), "[10, 20, 30]")});
+
+  // The rejection must reach the client as the upload's status, whichever of
+  // the three surfaces reports it first (observed: the writer's Close()).
+  FlightDescriptor descriptor = FlightDescriptor::Path({"rejected-put"});
+  auto [surface, status] = UploadOneBatch(client.get(), descriptor, schema, batch);
+  ASSERT_FALSE(status.ok())
+      << "the listener's rejection never reached the client, surfaced on " << surface;
+  ASSERT_EQ(status.code(), arrow::StatusCode::Invalid);
+  ASSERT_NE(status.message().find("listener rejected this upload"), std::string::npos)
+      << "unexpected status: " << status;
+  // The rejection must also be what OnFinish reports.
+  ASSERT_EQ(listener->finish_status().code(), arrow::StatusCode::Invalid)
+      << "OnFinish got: " << listener->finish_status();
+
+  ASSERT_OK(client->Close());
+  server->Shutdown();
+  server->Wait();
+}
+
+TEST(AsyncGrpcTest, DoPutWithoutFactoryIsUnimplemented) {
+  TestFlightServer flight_server;
+  // No listener factory: there is nothing to hand an upload to, so DoPut is
+  // answered like any other method the service does not serve.
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
+
+  int port = 0;
+  ::grpc::ServerBuilder builder;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(), &port);
+  builder.RegisterCallbackGenericService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+  ASSERT_NE(port, 0);
+
+  std::string uri = "grpc://localhost:" + std::to_string(port);
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(location));
+
+  auto schema = arrow::schema(
+      {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+  auto batch =
+      arrow::RecordBatch::Make(schema, 3,
+                               {arrow::ArrayFromJSON(arrow::int64(), "[1, 2, 3]"),
+                                arrow::ArrayFromJSON(arrow::int64(), "[10, 20, 30]")});
+
+  FlightDescriptor descriptor = FlightDescriptor::Path({"factory-less-put"});
+  auto [surface, status] = UploadOneBatch(client.get(), descriptor, schema, batch);
+  ASSERT_FALSE(status.ok())
+      << "DoPut without a listener factory must be refused, surfaced on " << surface;
+  // The gRPC UNIMPLEMENTED fallback replies with an empty message, so only the
+  // code is asserted here (observed: the writer's Close()).
+  ASSERT_EQ(status.code(), arrow::StatusCode::NotImplemented);
+
+  ASSERT_OK(client->Close());
+  server->Shutdown();
+  server->Wait();
+}
+
+TEST(AsyncGrpcTest, MiddlewareCallCompletedRunsOnUnknownMethod) {
+  // Middleware that started for a call must also see CallCompleted when the
+  // call is answered by the UNIMPLEMENTED fallback reactor: otherwise tracing
+  // middleware leaks a span per unknown/unimplemented RPC.
+  auto trace = std::make_shared<MiddlewareTrace>();
+  TestFlightServer flight_server;
+  auto helper =
+      std::make_shared<GrpcServerCallContextHelper<::grpc::CallbackServerContext>>(
+          /*auth_handler=*/nullptr,
+          MiddlewareFactoryList{
+              {"recording", std::make_shared<RecordingServerMiddlewareFactory>(trace)}});
+  AsyncGenericFlightService service(&flight_server, helper);
+
+  int port = 0;
+  ::grpc::ServerBuilder builder;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(), &port);
+  builder.RegisterCallbackGenericService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+  ASSERT_NE(port, 0);
+
+  const ::grpc::Status status = CallUnknownMethod(port);
+  ASSERT_EQ(::grpc::StatusCode::UNIMPLEMENTED, status.error_code())
+      << status.error_message();
+
+  server->Shutdown();
+  server->Wait();
+
+  std::lock_guard<std::mutex> guard(trace->mutex);
+  EXPECT_EQ(1, trace->start_call) << "the middleware must have started for the call";
+  EXPECT_EQ(1, trace->call_completed)
+      << "CallCompleted must run for an UNIMPLEMENTED reply too";
+}
+
+TEST(AsyncGrpcTest, OtherMethodsAreUnimplemented) {
+  TestFlightServer flight_server;
+  auto listener = std::make_shared<RecordingListener>();
+  flight_server.set_listener(listener);
+  AsyncGenericFlightService service(&flight_server, MakeAsyncHelper());
+
+  int port = 0;
+  ::grpc::ServerBuilder builder;
+  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(), &port);
+  builder.RegisterCallbackGenericService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_NE(server, nullptr);
+  ASSERT_NE(port, 0);
+
+  std::string uri = "grpc://localhost:" + std::to_string(port);
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(location));
+
+  // Every typed FlightService method is served now; the fallback reactor is
+  // still reachable through a method name no stub knows (which maps to
+  // FlightMethod::Invalid in MethodFromName), and that is the only pin left
+  // that an unknown method cannot be answered by a typed path.
+  const ::grpc::Status status = CallUnknownMethod(port);
+  ASSERT_FALSE(status.ok()) << "an unknown method must not be served";
+  ASSERT_EQ(::grpc::StatusCode::UNIMPLEMENTED, status.error_code())
+      << status.error_message();
+
+  ASSERT_OK(client->Close());
+  server->Shutdown();
+  server->Wait();
+}
+
+// ---------------------------------------------------------------------------
+// The unary trio: GetFlightInfo, GetSchema and PollFlightInfo share the
+// UnaryReactor (one request in, one response out), so the trio has one
+// happy-path test each plus one error-path test that pins the base class.
+// ---------------------------------------------------------------------------
+
+TEST(AsyncGrpcTest, GetFlightInfoIsServedAsync) {
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto info,
+                       client->GetFlightInfo(FlightDescriptor::Command("ping")));
+  ipc::DictionaryMemo dict_memo;
+  ASSERT_OK_AND_ASSIGN(auto schema, info->GetSchema(&dict_memo));
+  ASSERT_EQ(1, schema->num_fields());
+  ASSERT_EQ("value", schema->field(0)->name());
+
+  // Cleanup before looking at the recording: it was written on a gRPC thread.
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  ASSERT_EQ("ping", flight_server.last_descriptor().cmd);
+}
+
+TEST(AsyncGrpcTest, GetFlightInfoWithNullResponseIsNotFound) {
+  // A handler that answers OK without setting the response: the sync transport
+  // answers NOT_FOUND with "Flight not found" (grpc_server.cc:282-286), and the
+  // async reactor must answer the same, not INTERNAL.
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  const auto status =
+      client->GetFlightInfo(FlightDescriptor::Command("null-info")).status();
+  ASSERT_RAISES(KeyError, status);
+  ASSERT_THAT(status.message(), ::testing::HasSubstr("Flight not found"));
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, GetSchemaIsServedAsync) {
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto schema_result,
+                       client->GetSchema(FlightDescriptor::Command("ping")));
+  ipc::DictionaryMemo dict_memo;
+  ASSERT_OK_AND_ASSIGN(auto schema, schema_result->GetSchema(&dict_memo));
+  ASSERT_EQ(1, schema->num_fields());
+  ASSERT_EQ("value", schema->field(0)->name());
+
+  // Cleanup before looking at the recording: it was written on a gRPC thread.
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  ASSERT_EQ("ping", flight_server.last_descriptor().cmd);
+}
+
+TEST(AsyncGrpcTest, PollFlightInfoIsServedAsync) {
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto poll_info,
+                       client->PollFlightInfo(FlightDescriptor::Command("ping")));
+  ASSERT_TRUE(poll_info->progress.has_value());
+  ASSERT_DOUBLE_EQ(0.5, *poll_info->progress);
+  ASSERT_TRUE(poll_info->descriptor.has_value());
+  ASSERT_EQ("poll-next", poll_info->descriptor->cmd);
+
+  // Cleanup before looking at the recording: it was written on a gRPC thread.
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  ASSERT_EQ("ping", flight_server.last_descriptor().cmd);
+}
+
+// A GetFlightInfo handler whose future never resolves: the deadline is the
+// only thing that can end the RPC.
+class HangingUnaryServer final : public AsyncGenericFlightServerBase {
+ public:
+  arrow::Future<std::shared_ptr<FlightInfo>> GetFlightInfoAsync(
+      const ServerCallContext&, const FlightDescriptor&) override {
+    return arrow::Future<std::shared_ptr<FlightInfo>>::Make();
+  }
+};
+
+TEST(AsyncGrpcTest, GetFlightInfoDeadlineWithPendingHandlerFinishes) {
+  // Without the fix, Shutdown() below never returns.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingUnaryServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(500);
+  auto status =
+      client->GetFlightInfo(impatient, FlightDescriptor::Command("hang")).status();
+  EXPECT_FALSE(status.ok()) << "the deadline must expire while the handler hangs";
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, HangingHandlerDoesNotLeakItsReactor) {
+  const int64_t before = detail::AsyncReactorBase::live_reactors();
+
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingUnaryServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(500);
+  auto status =
+      client->GetFlightInfo(impatient, FlightDescriptor::Command("hang")).status();
+  EXPECT_FALSE(status.ok()) << "the deadline must expire while the handler hangs";
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  EXPECT_TRUE(WaitFor([&] {
+    return detail::AsyncReactorBase::live_reactors() == before;
+  })) << "a reactor leaked: still alive after the server stopped (before="
+      << before << ", now=" << detail::AsyncReactorBase::live_reactors() << ")";
+}
+
+TEST(AsyncGrpcTest, UnaryReactorPropagatesServerError) {
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  // The server's KeyError must reach the client as a status failure carrying
+  // the server's message, not as a successful (empty) response. The message is
+  // matched by substring because this build defines ARROW_EXTRA_ERROR_CONTEXT,
+  // which appends the call-site trail to the server's message.
+  auto status = client->GetFlightInfo(FlightDescriptor::Command("fail")).status();
+  ASSERT_FALSE(status.ok());
+  ASSERT_EQ(arrow::StatusCode::KeyError, status.code());
+  ASSERT_THAT(status.message(), ::testing::HasSubstr("no such flight"));
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, GetFlightInfoAsyncCompletesOnAnotherThread) {
+  // The handler completes its future from a helper thread after the dispatch
+  // has returned: the answer must arrive on the client anyway, which is the
+  // whole point of the async handler.
+  class DeferredInfoServer : public AsyncGenericFlightServerBase {
+   public:
+    arrow::Future<std::shared_ptr<FlightInfo>> GetFlightInfoAsync(
+        const ServerCallContext&, const FlightDescriptor& request) override {
+      auto out = arrow::Future<std::shared_ptr<FlightInfo>>::Make();
+      std::thread([out, request]() mutable {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        auto info =
+            FlightInfo::Make(*arrow::schema({arrow::field("value", arrow::int64())}),
+                             request, std::vector<FlightEndpoint>{}, -1, -1);
+        if (!info.ok()) {
+          out.MarkFinished(info.status());
+          return;
+        }
+        out.MarkFinished(std::make_shared<FlightInfo>(std::move(*info)));
+      }).detach();
+      return out;
+    }
+  };
+
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  DeferredInfoServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto info,
+                       client->GetFlightInfo(FlightDescriptor::Command("deferred")));
+  ipc::DictionaryMemo dict_memo;
+  ASSERT_OK_AND_ASSIGN(auto schema, info->GetSchema(&dict_memo));
+  ASSERT_EQ(1, schema->num_fields());
+  ASSERT_EQ("value", schema->field(0)->name());
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+// ---------------------------------------------------------------------------
+// The streaming trio: ListActions (a vector), DoAction (an AsyncResultStream)
+// and ListFlights (an AsyncFlightListing) share StreamingReactor (one request
+// in, N responses out, driven by OnWriteDone -> WriteNext).  Each RPC has a
+// happy-path test; the reactor never writing a message must still finish the
+// RPC (the empty tests, run under a shell timeout); the two iterator-backed
+// ones pin the mid-stream error rule.
+// ---------------------------------------------------------------------------
+
+TEST(AsyncGrpcTest, ListActionsIsServedAsync) {
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto actions, client->ListActions());
+  ASSERT_EQ(actions.size(), 2);
+  ASSERT_EQ(actions[0].type, "echo");
+  ASSERT_EQ(actions[0].description, "echo back");
+  ASSERT_EQ(actions[1].type, "fail");
+  ASSERT_EQ(actions[1].description, "always fails");
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, ListActionsEmptyFinishesCleanly) {
+  // Zero response messages: WriteNext() finds the vector exhausted before it
+  // ever calls StartWrite(), so the RPC must be finished with OK rather than
+  // left waiting for a write completion that will never arrive.
+  TestFlightServer flight_server;
+  flight_server.set_empty_actions();
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto actions, client->ListActions());
+  ASSERT_TRUE(actions.empty());
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, DoActionIsServedAsync) {
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  const Action action{"ping", Buffer::FromString("request-body")};
+  ASSERT_OK_AND_ASSIGN(auto results, client->DoAction(action));
+  ASSERT_OK_AND_ASSIGN(auto result, results->Next());
+  ASSERT_NE(result, nullptr);
+  ASSERT_EQ(result->body->ToString(), "one");
+  // The stream ends with a null Result, not with an error.
+  ASSERT_OK_AND_ASSIGN(auto end, results->Next());
+  ASSERT_EQ(end, nullptr);
+
+  // Cleanup before looking at the recording: it was written on a gRPC thread.
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  ASSERT_EQ("ping", flight_server.last_action_type());
+}
+
+TEST(AsyncGrpcTest, DoActionStreamsMultipleResults) {
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  const Action action{"multi", Buffer::FromString("")};
+  ASSERT_OK_AND_ASSIGN(auto results, client->DoAction(action));
+
+  std::vector<std::string> bodies;
+  while (true) {
+    ASSERT_OK_AND_ASSIGN(auto result, results->Next());
+    if (result == nullptr) break;
+    bodies.push_back(result->body->ToString());
+  }
+  ASSERT_EQ(bodies, (std::vector<std::string>{"one", "two", "three"}));
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, DoActionMidStreamErrorFinishesTheRpc) {
+  // The stream yields one Result and then fails.  The error must become the
+  // RPC status -- the client must not see a truncated success.
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  const Action action{"fail-mid-stream", Buffer::FromString("")};
+  ASSERT_OK_AND_ASSIGN(auto results, client->DoAction(action));
+  ASSERT_OK_AND_ASSIGN(auto first, results->Next());
+  ASSERT_NE(first, nullptr);
+  ASSERT_EQ(first->body->ToString(), "first");
+
+  auto second = results->Next();
+  ASSERT_FALSE(second.ok()) << "the mid-stream error must reach the client";
+  ASSERT_EQ(second.status().code(), arrow::StatusCode::IOError);
+  ASSERT_THAT(second.status().message(),
+              ::testing::HasSubstr("mid-stream action failure"));
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, DoActionWithNullResultStreamIsCancelled) {
+  // A handler that answers OK without a ResultStream answers CANCELLED on the
+  // sync transport (grpc_server.cc:404-406), before any message is written; the
+  // async reactor must answer the same.  The client may see it on DoAction() or
+  // on the first Next(), so both surfaces are accepted.
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  const Action action{"null-result-stream", Buffer::FromString("")};
+  auto results = client->DoAction(action);
+  if (results.ok()) {
+    // The stream was handed out before the status arrived: CANCELLED is then
+    // reported by the first read.
+    ASSERT_RAISES(Cancelled, (*results)->Next());
+  } else {
+    ASSERT_RAISES(Cancelled, results.status());
+  }
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, ListFlightsIsServedAsync) {
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  const Criteria criteria("filter-me");
+  ASSERT_OK_AND_ASSIGN(auto listing, client->ListFlights({}, criteria));
+
+  std::vector<std::vector<std::string>> paths;
+  while (true) {
+    ASSERT_OK_AND_ASSIGN(auto info, listing->Next());
+    if (info == nullptr) break;
+    paths.push_back(info->descriptor().path);
+  }
+  ASSERT_EQ(paths, (std::vector<std::vector<std::string>>{{"first-listing"},
+                                                          {"second-listing"}}));
+
+  // Cleanup before looking at the recording: it was written on a gRPC thread.
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  ASSERT_EQ("filter-me", flight_server.last_criteria().expression);
+}
+
+TEST(AsyncGrpcTest, ListFlightsEmptyFinishesCleanly) {
+  // A listing with no flights: the server answers OK with zero messages, and
+  // the client sees an exhausted listing rather than a hang.
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto listing, client->ListFlights({}, Criteria("")));
+  ASSERT_OK_AND_ASSIGN(auto info, listing->Next());
+  ASSERT_EQ(info, nullptr);
+  // The client sent no criteria; the server must still have received the
+  // (empty) Criteria, exactly as the sync handler does.
+  ASSERT_EQ("", flight_server.last_criteria().expression);
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, ListFlightsMidStreamErrorFinishesTheRpc) {
+  // A listing that fails on its second Next(): the error must become the RPC
+  // status, not a silently truncated success.
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto listing = client->ListFlights({}, Criteria("fail-mid-stream"));
+  ASSERT_FALSE(listing.ok()) << "the mid-stream error must reach the client";
+  ASSERT_EQ(listing.status().code(), arrow::StatusCode::IOError);
+  ASSERT_THAT(listing.status().message(),
+              ::testing::HasSubstr("mid-stream listing failure"));
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, ListFlightsAsyncCompletesOnAnotherThread) {
+  // The listing object itself arrives on a helper thread: the transport must
+  // serve the response from wherever the future resolves.
+  class DeferredListingServer : public AsyncGenericFlightServerBase {
+   public:
+    arrow::Future<std::shared_ptr<AsyncFlightListing>> ListFlightsAsync(
+        const ServerCallContext&, const Criteria*) override {
+      auto out = arrow::Future<std::shared_ptr<AsyncFlightListing>>::Make();
+      std::thread([out]() mutable {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::vector<FlightInfo> flights;
+        auto info = MakeTestFlightInfo(FlightDescriptor::Path({"deferred"}));
+        if (!info.ok()) {
+          out.MarkFinished(info.status());
+          return;
+        }
+        flights.push_back(std::move(**info));
+        out.MarkFinished(std::make_shared<SimpleListingAdapter>(std::move(flights)));
+      }).detach();
+      return out;
+    }
+  };
+
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  DeferredListingServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto listing, client->ListFlights());
+  int seen = 0;
+  while (true) {
+    ASSERT_OK_AND_ASSIGN(auto info, listing->Next());
+    if (info == nullptr) break;
+    ++seen;
+  }
+  ASSERT_EQ(1, seen);
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+// ---------------------------------------------------------------------------
+// DoExchange: the bidirectional RPC.  Its handler is DoExchangeAsync, which
+// awaits the reader's demand and each write before the next one, so reads and
+// writes are interleaved without blocking the callback thread.
+// ---------------------------------------------------------------------------
+
+TEST(AsyncGrpcTest, DoExchangeEchoesBatches) {
+  // Two batches up, two batches back, in order: this is the case that needs a
+  // read and a write outstanding at the same time.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  EchoExchangeTestServer flight_server;
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto exchange,
+                       client->DoExchange(FlightDescriptor::Command("echo")));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  std::vector<std::shared_ptr<RecordBatch>> sent = {
+      arrow::RecordBatch::Make(schema, 2,
+                               {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")}),
+      arrow::RecordBatch::Make(schema, 3,
+                               {arrow::ArrayFromJSON(arrow::int64(), "[3, 4, 5]")})};
+  ASSERT_OK(exchange.writer->Begin(schema));
+  for (const auto& batch : sent) {
+    ASSERT_OK(exchange.writer->WriteRecordBatch(*batch));
+  }
+  ASSERT_OK(exchange.writer->DoneWriting());
+
+  ASSERT_OK_AND_ASSIGN(auto server_schema, exchange.reader->GetSchema());
+  AssertSchemaEqual(*schema, *server_schema);
+  for (const auto& batch : sent) {
+    ASSERT_OK_AND_ASSIGN(auto chunk, exchange.reader->Next());
+    ASSERT_NE(nullptr, chunk.data);
+    ASSERT_BATCHES_EQUAL(*batch, *chunk.data);
+  }
+  ASSERT_OK_AND_ASSIGN(auto end, exchange.reader->Next());
+  ASSERT_EQ(nullptr, end.data);
+  ASSERT_OK(exchange.writer->Close());
+
+  // Cleanup before looking at the recording: it was written on a gRPC thread.
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  ASSERT_EQ(1, flight_server.exchange_count());
+  ASSERT_EQ(0, flight_server.exchanges_in_flight());
+}
+
+TEST(AsyncGrpcTest, DoExchangeMetadataOnlyDoesNotHang) {
+  // A client that writes metadata and nothing else, then reads: the server's
+  // handler must see the end of the exchange and reply, not wait for a schema
+  // message that will never come (the case DataTest::TestDoExchangeNoData
+  // exists for).  A hang here is the failure mode this test exists for, which
+  // is why it runs under a shell timeout.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  EchoExchangeTestServer flight_server;
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto exchange,
+                       client->DoExchange(FlightDescriptor::Command("echo")));
+
+  ASSERT_OK(exchange.writer->WriteMetadata(arrow::Buffer::FromString("only-metadata")));
+  ASSERT_OK(exchange.writer->DoneWriting());
+
+  // The echo server reflects the metadata chunk back with no data.
+  ASSERT_OK_AND_ASSIGN(auto chunk, exchange.reader->Next());
+  ASSERT_EQ(nullptr, chunk.data);
+  ASSERT_NE(nullptr, chunk.app_metadata);
+  ASSERT_EQ("only-metadata", chunk.app_metadata->ToString());
+  ASSERT_OK_AND_ASSIGN(auto end, exchange.reader->Next());
+  ASSERT_EQ(nullptr, end.data);
+  ASSERT_OK(exchange.writer->Close());
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  ASSERT_EQ(1, flight_server.exchange_count());
+  ASSERT_EQ(0, flight_server.exchanges_in_flight());
+}
+
+TEST(AsyncGrpcTest, DoExchangeClientDisconnectFinishes) {
+  // A client that vanishes mid-exchange: the server's read fails, the reactor
+  // must let the handler unwind and finish the RPC, and the exchange counter
+  // added to the test server must come back to zero -- a hang or a leaked
+  // handler leaves it above zero.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  EchoExchangeTestServer flight_server;
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(
+      auto client_location,
+      Location::Parse("grpc://localhost:" + std::to_string(flight_server.port())));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto exchange,
+                       client->DoExchange(FlightDescriptor::Command("echo")));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  ASSERT_OK(exchange.writer->Begin(schema));
+  ASSERT_OK(exchange.writer->WriteRecordBatch(*arrow::RecordBatch::Make(
+      schema, 2, {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")})));
+  // The server has entered its handler by now (it answered the schema); the
+  // exchange is live.
+  ASSERT_TRUE(WaitFor([&flight_server] { return flight_server.exchange_count() == 1; }));
+
+  // Walk away without finishing: no DoneWriting, no Close, no reader drain.
+  // The client's destructor closes the channel, which cancels the RPC.
+  exchange.reader->Cancel();
+  exchange.writer.reset();
+  exchange.reader.reset();
+  ASSERT_OK(client->Close());
+
+  // The handler must leave, whichever status path it takes.
+  const bool drained =
+      WaitFor([&flight_server] { return flight_server.exchanges_in_flight() == 0; });
+  ASSERT_TRUE(drained) << "the exchange handler never left (in flight: "
+                       << flight_server.exchanges_in_flight() << ")";
+
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+// A ListFlights handler whose future never resolves.
+class HangingListingServer final : public AsyncGenericFlightServerBase {
+ public:
+  arrow::Future<std::shared_ptr<AsyncFlightListing>> ListFlightsAsync(
+      const ServerCallContext&, const Criteria*) override {
+    return arrow::Future<std::shared_ptr<AsyncFlightListing>>::Make();
+  }
+};
+
+TEST(AsyncGrpcTest, ListFlightsDeadlineWithPendingHandlerFinishes) {
+  // The handler's future never resolves and the client's deadline ends the RPC:
+  // the reactor must be released even though the handler never completes.
+  const int64_t before = detail::AsyncReactorBase::live_reactors();
+
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingListingServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(500);
+  auto listing = client->ListFlights(impatient, Criteria("hang"));
+  EXPECT_FALSE(listing.ok()) << "the deadline must expire while the handler hangs";
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  EXPECT_TRUE(WaitFor([&] {
+    return detail::AsyncReactorBase::live_reactors() == before;
+  })) << "a reactor leaked: still alive after the server stopped (before="
+      << before << ", now=" << detail::AsyncReactorBase::live_reactors() << ")";
+}
+
+// A DoExchange handler whose future never resolves.
+class HangingExchangeServer final : public AsyncGenericFlightServerBase {
+ public:
+  arrow::Future<> DoExchangeAsync(const ServerCallContext&,
+                                  std::shared_ptr<AsyncFlightMessageReader>,
+                                  std::shared_ptr<AsyncFlightMessageWriter>) override {
+    handler_started.fetch_add(1);
+    return arrow::Future<>::Make();  // never resolved
+  }
+
+  std::atomic<int> handler_started{0};
+};
+
+TEST(AsyncGrpcTest, DoExchangeClientCancelWithPendingHandlerFinishes) {
+  // The client walks away with the handler still parked: the transport must
+  // finish the RPC (and unwind reader/writer), not wait for the handler.
+  const int64_t before = detail::AsyncReactorBase::live_reactors();
+
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingExchangeServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  ASSERT_OK_AND_ASSIGN(auto exchange,
+                       client->DoExchange(FlightDescriptor::Command("hang")));
+  // Wait until the handler is in (the descriptor reached it), so the cancel
+  // lands on a live handler rather than a race with dispatch.
+  ASSERT_TRUE(WaitFor([&flight_server] {
+    return flight_server.handler_started.load() >= 1;
+  })) << "the exchange handler never started";
+
+  exchange.reader->Cancel();
+  exchange.writer.reset();
+  exchange.reader.reset();
+  ASSERT_OK(client->Close());
+
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  EXPECT_TRUE(WaitFor([&] {
+    return detail::AsyncReactorBase::live_reactors() == before;
+  })) << "a reactor leaked: still alive after the server stopped (before="
+      << before << ", now=" << detail::AsyncReactorBase::live_reactors() << ")";
+}
+
+TEST(AsyncGrpcTest, UseAsyncGrpcFlag) {
+  ASSERT_OK_AND_ASSIGN(auto default_location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions default_options(default_location);
+
+  // Same adapter as the tests above, but now started through the async
+  // server's own Init instead of a hand-built grpc::ServerBuilder.
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_GT(flight_server.port(), 0);
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  // (i) DoGet went through the generic reactor: the ticket reached
+  // TestFlightServer::DoGetAsync and the whole stream came back.
+  Ticket ticket{"flag-path-do-get-ticket"};
+  ASSERT_OK_AND_ASSIGN(auto reader, client->DoGet(ticket));
+  ASSERT_OK_AND_ASSIGN(auto schema, reader->GetSchema());
+  ASSERT_EQ(schema->num_fields(), 2);
+  ASSERT_EQ(schema->field(0)->name(), "a");
+  ASSERT_EQ(schema->field(1)->name(), "b");
+  int batch_count = 0;
+  while (true) {
+    ASSERT_OK_AND_ASSIGN(auto chunk, reader->Next());
+    if (!chunk.data) break;
+    ASSERT_EQ(chunk.data->num_rows(), 5);
+    ASSERT_OK_AND_ASSIGN(auto value, chunk.data->column(0)->GetScalar(0));
+    ASSERT_TRUE(value->Equals(*arrow::MakeScalar(int64_t(1))));
+    batch_count++;
+  }
+  ASSERT_EQ(batch_count, 3);
+
+  // (ii) Every typed method is served on this path too; the fallback reactor
+  // still answers a method name no stub knows, which is what pins "the typed
+  // sync service is NOT registered alongside the generic one".
+  const ::grpc::Status unknown_status = CallUnknownMethod(flight_server.port());
+  ASSERT_FALSE(unknown_status.ok()) << "an unknown method must not be served";
+  ASSERT_EQ(::grpc::StatusCode::UNIMPLEMENTED, unknown_status.error_code())
+      << unknown_status.error_message();
+
+  // (iii) The async server takes no listener factory here, so uploads are
+  // refused the same way.
+  FlightDescriptor descriptor = FlightDescriptor::Path({"not-served"});
+  auto put_schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(put_schema, 1,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1]")});
+  auto [surface, status] = UploadOneBatch(client.get(), descriptor, put_schema, batch);
+  ASSERT_FALSE(status.ok()) << "DoPut must be refused, surfaced on " << surface;
+  ASSERT_EQ(status.code(), arrow::StatusCode::NotImplemented);
+
+  // Cleanup. The ticket is asserted only after the server stopped, so the
+  // DoGet callback cannot race with the read.
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  ASSERT_EQ(flight_server.ticket(), "flag-path-do-get-ticket");
+}
+
+TEST(AsyncGrpcTest, UseAsyncGrpcFlagServesDoPut) {
+  // The async server serves uploads because the server class hands out the
+  // per-RPC listener through CreateDoPutListener(), instead of the RPC falling
+  // through to UNIMPLEMENTED.
+  TestFlightServer flight_server;
+  auto listener = std::make_shared<RecordingListener>();
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  flight_server.set_listener(listener);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_GT(flight_server.port(), 0);
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema(
+      {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+  auto batch =
+      arrow::RecordBatch::Make(schema, 3,
+                               {arrow::ArrayFromJSON(arrow::int64(), "[1, 2, 3]"),
+                                arrow::ArrayFromJSON(arrow::int64(), "[10, 20, 30]")});
+
+  const FlightDescriptor descriptor = FlightDescriptor::Path({"wave", "h2"});
+  auto [surface, status] = UploadOneBatch(client.get(), descriptor, schema, batch);
+  ASSERT_TRUE(status.ok()) << "upload failed on " << surface << ": " << status;
+
+  // Cleanup before looking at the listener: its callbacks run on a gRPC
+  // thread, and nothing may read the recordings while that thread writes.
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // The listener saw the descriptor the client sent, the schema, and the batch.
+  ASSERT_EQ(listener->descriptor_count(), 1);
+  ASSERT_EQ(listener->descriptors()[0], descriptor);
+  ASSERT_EQ(listener->schema_count(), 1);
+  ASSERT_EQ(listener->schema()->num_fields(), 2);
+  ASSERT_EQ(listener->schema()->field(0)->name(), "a");
+  ASSERT_EQ(listener->schema()->field(1)->name(), "b");
+  ASSERT_EQ(listener->batches().size(), 1);
+  const std::shared_ptr<arrow::RecordBatch> chunk = listener->batches()[0];
+  ASSERT_EQ(chunk->num_rows(), 3);
+  ASSERT_EQ(chunk->num_columns(), 2);
+  ASSERT_OK_AND_ASSIGN(auto value, chunk->column(0)->GetScalar(0));
+  ASSERT_TRUE(value->Equals(*arrow::MakeScalar(int64_t(1))));
+}
+
+TEST(AsyncGrpcTest, CreateDoPutListenerServesUpload) {
+  // The upload half of the server class API: CreateDoPutListener() hands out
+  // the per-RPC listener, with no options-level factory.
+  TestUploadServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_GT(flight_server.port(), 0);
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema(
+      {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+  auto batch =
+      arrow::RecordBatch::Make(schema, 3,
+                               {arrow::ArrayFromJSON(arrow::int64(), "[1, 2, 3]"),
+                                arrow::ArrayFromJSON(arrow::int64(), "[10, 20, 30]")});
+
+  const FlightDescriptor descriptor = FlightDescriptor::Path({"virtual", "h2"});
+  auto [surface, status] = UploadOneBatch(client.get(), descriptor, schema, batch);
+  ASSERT_TRUE(status.ok()) << "upload failed on " << surface << ": " << status;
+
+  // Cleanup before reading the recordings: the listener's callbacks run on a
+  // gRPC thread.
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // The virtual was consulted exactly once, and its listener saw the upload.
+  ASSERT_EQ(flight_server.calls(), 1);
+  const auto& listener = flight_server.listener(0);
+  ASSERT_EQ(listener->descriptor_count(), 1);
+  ASSERT_EQ(listener->descriptors()[0], descriptor);
+  ASSERT_EQ(listener->schema_count(), 1);
+  ASSERT_EQ(listener->batches().size(), 1);
+  ASSERT_EQ(listener->batches()[0]->num_rows(), 3);
+}
+
+TEST(AsyncGrpcTest, DoPutWithoutListenerIsUnimplemented) {
+  // A server class that does not hand out a listener (CreateDoPutListener()
+  // returns nullptr, the base default) does not accept uploads: the RPC is
+  // answered UNIMPLEMENTED.  There is no options-level fallback.
+  TestFlightServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[7, 8]")});
+  auto [surface, status] = UploadOneBatch(
+      client.get(), FlightDescriptor::Path({"no-listener"}), schema, batch);
+  ASSERT_FALSE(status.ok()) << "the upload succeeded on " << surface
+                            << " with no listener to serve it";
+  ASSERT_EQ(status.code(), arrow::StatusCode::NotImplemented) << status;
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, DoPutListenerSeesCleanFinish) {
+  // A client that ends the upload normally (DoneWriting + Close) makes the
+  // listener's OnFinish fire once, with OK: that is how a consumer knows the
+  // upload ended and it can commit what it accumulated.
+  TestUploadServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+  auto [surface, status] =
+      UploadOneBatch(client.get(), FlightDescriptor::Path({"finish"}), schema, batch);
+  ASSERT_TRUE(status.ok()) << "upload failed on " << surface << ": " << status;
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // OnFinish ran exactly once, and said the upload ended cleanly.
+  ASSERT_EQ(flight_server.listener(0)->finish_count(), 1);
+  ASSERT_TRUE(flight_server.listener(0)->finish_status().ok())
+      << "unexpected finish status: " << flight_server.listener(0)->finish_status();
+}
+
+TEST(AsyncGrpcTest, DoPutWritesMetadataBackToTheClient) {
+  // The listener's writer() sends PutResult messages during the upload, the way
+  // the sync FlightMetadataWriter does: the client reads them back with
+  // ReadMetadata() between writes.
+  MetadataReplyingUploadServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+
+  ASSERT_OK_AND_ASSIGN(auto put,
+                       client->DoPut(FlightDescriptor::Path({"metadata"}), schema));
+  auto& writer = *put.writer;
+  auto& reader = *put.reader;
+
+  // Write one batch, then read the acknowledgement the server sent for it.
+  ASSERT_OK(writer.WriteRecordBatch(*batch));
+  std::shared_ptr<Buffer> metadata;
+  ASSERT_OK(reader.ReadMetadata(&metadata));
+  ASSERT_NE(nullptr, metadata) << "the server's metadata never reached the client";
+  ASSERT_EQ("ack 2 rows", metadata->ToString());
+
+  // A second batch and its acknowledgement prove the channel survives a round.
+  ASSERT_OK(writer.WriteRecordBatch(*batch));
+  ASSERT_OK(reader.ReadMetadata(&metadata));
+  ASSERT_NE(nullptr, metadata);
+  ASSERT_EQ("ack 2 rows", metadata->ToString());
+
+  ASSERT_OK(writer.Close());
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  auto listener = flight_server.WaitForListener();
+  ASSERT_NE(listener, nullptr) << "the server never handed out a DoPut listener";
+  ASSERT_EQ(2, listener->wrote()) << "every batch must have been acknowledged";
+  ASSERT_OK(listener->last_write()) << listener->last_write();
+}
+
+TEST(AsyncGrpcTest, DoPutCancelFromServerSideFinishesTheUpload) {
+  // The server aborts the upload without waiting for the client: Cancel()
+  // finishes the RPC with the given status, the client's write or Close
+  // reports it, and the listener hears it as its OnFinish status.
+  TestUploadServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[3, 4]")});
+
+  // Open the upload and write one batch, but do not end it.
+  auto put = client->DoPut(FlightDescriptor::Path({"cancel"}), schema);
+  ASSERT_TRUE(put.ok()) << put.status();
+  auto& writer = *put->writer;
+  ASSERT_OK(writer.WriteRecordBatch(*batch));
+
+  // Wait for the listener the virtual handed out, then cancel it from this
+  // (non-gRPC) thread: that is the mid-upload server-side abort.
+  auto listener = flight_server.WaitForListener(0);
+  ASSERT_NE(listener, nullptr) << "the server never handed out a DoPut listener";
+  listener->CancelWith(arrow::Status::Cancelled("server said stop"));
+
+  // The client sees the cancellation on the surface that observes the RPC.
+  const Status close_status = writer.Close();
+  ASSERT_FALSE(close_status.ok()) << "the server-side cancel never reached the client";
+  ASSERT_EQ(close_status.code(), arrow::StatusCode::Cancelled);
+  ASSERT_NE(close_status.message().find("server said stop"), std::string::npos)
+      << "unexpected status: " << close_status;
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // Cancel() reached the transport, and the listener was told the upload ended
+  // with that status exactly once.
+  ASSERT_EQ(listener->cancel_count(), 1);
+  ASSERT_OK(listener->cancel_status()) << listener->cancel_status();
+  ASSERT_EQ(listener->finish_count(), 1);
+  // OnFinish must carry the ending that caused it, not a generic status.
+  ASSERT_EQ(listener->finish_status().code(), arrow::StatusCode::Cancelled)
+      << "OnFinish got: " << listener->finish_status();
+
+  // After the upload, Cancel() has nothing to cancel.
+  listener->CancelWith(arrow::Status::Cancelled("too late"));
+  ASSERT_EQ(listener->cancel_status().code(), arrow::StatusCode::Invalid);
+}
+
+/// A listener stuck inside OnNext(): the upload is parked in the application
+/// while the RPC underneath it dies.
+class HangingDoPutListener final : public FinishRecordingListener {
+ public:
+  arrow::Future<> OnNext(FlightStreamChunk) override {
+    next_awaits_.fetch_add(1);
+    return arrow::Future<>::Make();
+  }
+
+  std::atomic<int> next_awaits_{0};
+};
+
+/// A DoPut server that hands out a hanging listener; one per upload, like the
+/// production seam.
+class HangingDoPutServer final : public AsyncGenericFlightServerBase {
+ public:
+  std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
+      const ServerCallContext&) override {
+    auto listener = std::make_shared<HangingDoPutListener>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    listeners_.push_back(listener);
+    return listener;
+  }
+
+  bool listener_ready() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !listeners_.empty();
+  }
+
+  std::shared_ptr<HangingDoPutListener> listener(int i) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return listeners_[i];
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::shared_ptr<HangingDoPutListener>> listeners_;
+};
+
+TEST(AsyncGrpcTest, DoPutClientDeadlineWithPendingHandlerFinishes) {
+  // The client's deadline expires while the listener is still processing a
+  // chunk (its OnNext() future never resolves): the transport must finish the
+  // RPC itself instead of waiting for the listener.  Without the fix the
+  // Shutdown()/Wait() below never return (gRPC keeps the call alive until
+  // Finish() runs), which is why this test runs under a shell timeout.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingDoPutServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(1000);
+  auto put = client->DoPut(impatient, FlightDescriptor::Path({"hang"}), schema);
+  ASSERT_TRUE(put.ok()) << put.status();
+  (void)put->writer->WriteRecordBatch(*batch);
+
+  // From here the listener is inside OnNext() and the deadline does the rest.
+  ASSERT_TRUE(WaitFor([&flight_server] {
+    return flight_server.listener_ready() &&
+           flight_server.listener(0)->next_awaits_.load() >= 1;
+  })) << "the listener never saw a chunk";
+
+  ARROW_UNUSED(put->writer->Close());
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // The upload ended anyway, and the listener heard about it exactly once.
+  ASSERT_EQ(1, flight_server.listener(0)->finish_count());
+}
+
+TEST(AsyncGrpcTest, DoPutClientDeadlineWhileIdleIsNotACleanFinish) {
+  // The deadline expires while the server is idle (the batch was consumed and
+  // a read is armed): the upload was cut short by the client, so OnFinish()
+  // must not report it as a clean end -- only the acknowledgement write
+  // completing cleanly may say OK.
+  TestUploadServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(600);
+  auto put = client->DoPut(impatient, FlightDescriptor::Path({"idle"}), schema);
+  ASSERT_TRUE(put.ok()) << put.status();
+  ASSERT_OK(put->writer->WriteRecordBatch(*batch));
+
+  auto listener = flight_server.WaitForListener(0);
+  ASSERT_NE(listener, nullptr) << "the server never handed out a DoPut listener";
+  ASSERT_TRUE(WaitFor([&listener] { return listener->batches().size() >= 1; }))
+      << "the server never consumed the batch";
+
+  // Wait for the deadline to end the upload instead of sleeping out its
+  // duration: the listener's OnFinish runs on the transport thread that ends
+  // the RPC, so the wait is on the observable event, not on wall-clock time.
+  // DoPut writes the schema eagerly, so the client's DoPut() above already
+  // showed the channel was alive when its deadline was armed.
+  ASSERT_TRUE(WaitFor([&listener] { return listener->finish_count() >= 1; }))
+      << "the deadline never fired; inconclusive";
+
+  const auto close_status = put->writer->Close();
+  ASSERT_FALSE(close_status.ok()) << "the deadline never fired; inconclusive";
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  ASSERT_EQ(1, listener->finish_count());
+  EXPECT_FALSE(listener->finish_status().ok())
+      << "a deadline-cancelled upload was reported as a clean finish: "
+      << listener->finish_status();
+}
+
+/// A listener whose OnNext() future the test resolves on demand: the upload
+/// parks in the application until the late-continuation test releases it.
+class DeferredDoPutListener final : public FinishRecordingListener {
+ public:
+  arrow::Future<> OnNext(FlightStreamChunk) override {
+    next_awaits_.fetch_add(1);
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_ = arrow::Future<>::Make();
+    return pending_;
+  }
+
+  /// Resolve the parked OnNext; OK releases the decode continuation.
+  void ResolvePending() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_.is_valid() && !pending_.is_finished()) {
+      pending_.MarkFinished(arrow::Status::OK());
+    }
+  }
+
+  std::atomic<int> next_awaits_{0};
+
+ private:
+  std::mutex mutex_;
+  arrow::Future<> pending_;
+};
+
+class DeferredDoPutServer final : public AsyncGenericFlightServerBase {
+ public:
+  std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
+      const ServerCallContext&) override {
+    auto listener = std::make_shared<DeferredDoPutListener>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    listener_ = listener;
+    return listener;
+  }
+
+  std::shared_ptr<DeferredDoPutListener> listener() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return listener_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::shared_ptr<DeferredDoPutListener> listener_;
+};
+
+TEST(AsyncGrpcTest, DoPutClientCancelWhileListenerParkedStaysSafe) {
+  // The listener's OnNext() resolves AFTER the deadline already finished the
+  // RPC: the parked decode continuation must stand down (release its hold,
+  // never touch the dead call) instead of use-after-freeing the reactor.
+  // The test resolves the parked future from its own thread; the server keeps
+  // its shared_ptr alive, so the resolution lands on the real listener.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  DeferredDoPutServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+
+  // The deadline is what ends this RPC (the listener stays parked, so only the
+  // deadline can finish it), and DoPut writes the schema eagerly, so it must be
+  // long enough to survive the setup on a slow machine -- under valgrind the
+  // setup alone runs many seconds, and a tight deadline would fail in Begin()
+  // instead of reaching the case under test.  It is only ever waited out when
+  // the setup was fast, so the usual cost stays low.
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(10000);
+  auto put = client->DoPut(impatient, FlightDescriptor::Path({"late"}), schema);
+  ASSERT_TRUE(put.ok()) << put.status();
+  ASSERT_OK(put->writer->WriteRecordBatch(*batch));
+
+  auto listener = flight_server.listener();
+  ASSERT_TRUE(WaitFor([&] {
+    listener = flight_server.listener();
+    return listener != nullptr && listener->next_awaits_.load() >= 1;
+  })) << "the listener never saw a chunk";
+
+  // Walk away: the client stops reading, so the server's write has nowhere to
+  // go and the RPC ends while the listener is still parked.  Wait for that to
+  // have happened rather than sleeping blindly, and fail clearly instead of
+  // reporting a vacuous pass if it did not.
+  ASSERT_OK(client->Close());
+  ASSERT_TRUE(WaitFor([&listener] { return listener->finish_count() >= 1; }))
+      << "the RPC never ended; the listener is not the parked one from this upload";
+
+  // Now resolve the parked listener: the continuation runs on a finished RPC.
+  // If the guard/hold were wrong, this is where the UAF lands.
+  listener->ResolvePending();
+
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // The upload had ended once, and the late resolution did not add a second
+  // report or crash the reactor.
+  ASSERT_EQ(1, listener->finish_count());
+
+  // Closing the writer after the RPC is gone must report a failure, not a
+  // silent success.
+  ASSERT_FALSE(put->writer->Close().ok());
+}
+
+TEST(AsyncGrpcTest, DoPutWithoutDescriptorOnFirstMessageIsRejected) {
+  // A client that starts an upload without a descriptor must be refused with
+  // the same status as the sync transport ("Descriptor missing on first
+  // message"): the listener must not hear a descriptor, and the upload must not
+  // be acknowledged as well formed.
+  TestFlightServer flight_server;
+  auto listener = std::make_shared<RecordingListener>();
+  flight_server.set_listener(listener);
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_GT(flight_server.port(), 0);
+
+  // Hand-build the first FlightData of a DoPut: the schema IPC message with no
+  // descriptor field at all.
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+  auto reader = arrow::RecordBatchReader::Make({batch}, schema).ValueOrDie();
+  RecordBatchStream stream(std::move(reader));
+  ASSERT_OK_AND_ASSIGN(auto schema_payload, stream.GetSchemaPayload());
+  schema_payload.descriptor = nullptr;
+
+  ::grpc::ByteBuffer request;
+  bool own_buffer = false;
+  ASSERT_TRUE(FlightDataSerialize(schema_payload, &request, &own_buffer).ok());
+
+  // Drive the bidi call through the raw generic stub: the regular FlightClient
+  // always sets the descriptor, which is exactly what this case lacks.
+  std::shared_ptr<::grpc::Channel> channel =
+      ::grpc::CreateChannel("127.0.0.1:" + std::to_string(flight_server.port()),
+                            ::grpc::InsecureChannelCredentials());
+  ::grpc::GenericStub stub(channel);
+  ::grpc::ClientContext context;
+  // Bound the call: were the descriptor ever accepted, the client would wait
+  // forever for an acknowledgement, turning a logic error into a hung suite.
+  context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+  ::grpc::CompletionQueue cq;
+  void* tag = nullptr;
+  bool ok = false;
+
+  auto call = stub.Call(&context, "/arrow.flight.protocol.FlightService/DoPut", &cq,
+                        reinterpret_cast<void*>(1));
+  ASSERT_NE(call, nullptr);
+  ASSERT_TRUE(cq.Next(&tag, &ok)) << "the call never started";
+
+  call->Write(request, reinterpret_cast<void*>(2));
+  ASSERT_TRUE(cq.Next(&tag, &ok)) << "the message was never written";
+
+  call->WritesDone(reinterpret_cast<void*>(3));
+  ASSERT_TRUE(cq.Next(&tag, &ok)) << "WritesDone never completed";
+
+  ::grpc::Status status;
+  call->Finish(&status, reinterpret_cast<void*>(4));
+  ASSERT_TRUE(cq.Next(&tag, &ok)) << "the call never finished";
+
+  EXPECT_FALSE(status.ok()) << "an upload without a descriptor must be refused";
+  EXPECT_THAT(status.error_message(), ::testing::HasSubstr("Descriptor missing"));
+
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // The listener never saw a descriptor, and never saw the message as valid.
+  EXPECT_EQ(0, listener->descriptor_count());
+  EXPECT_EQ(0, listener->batches().size());
+}
+
+TEST(AsyncGrpcTest, UseAsyncGrpcFlagUploadRejectedOnDescriptor) {
+  // A handler that rejects the descriptor rejects the whole upload through
+  // the same surface as an OnNext rejection: the writer's status.
+  TestFlightServer flight_server;
+  auto listener = std::make_shared<RecordingListener>();
+  listener->set_descriptor_status(
+      arrow::Status::Invalid("listener rejected this descriptor"));
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  flight_server.set_listener(listener);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_GT(flight_server.port(), 0);
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema(
+      {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+  auto batch =
+      arrow::RecordBatch::Make(schema, 3,
+                               {arrow::ArrayFromJSON(arrow::int64(), "[1, 2, 3]"),
+                                arrow::ArrayFromJSON(arrow::int64(), "[10, 20, 30]")});
+
+  const FlightDescriptor descriptor = FlightDescriptor::Path({"rejected-h2"});
+  auto [surface, status] = UploadOneBatch(client.get(), descriptor, schema, batch);
+  ASSERT_FALSE(status.ok())
+      << "the descriptor rejection never reached the client, surfaced on " << surface;
+  ASSERT_EQ(status.code(), arrow::StatusCode::Invalid);
+  ASSERT_NE(status.message().find("listener rejected this descriptor"), std::string::npos)
+      << "unexpected status: " << status;
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // The upload was rejected on its descriptor: the handler saw it, and no
+  // schema or data followed it.
+  ASSERT_EQ(listener->descriptor_count(), 1);
+  ASSERT_EQ(listener->descriptors()[0], descriptor);
+  ASSERT_EQ(listener->schema_count(), 0);
+  ASSERT_EQ(listener->batches().size(), 0);
+}
+
+TEST(AsyncGrpcTest, UseAsyncGrpcFlagRefusesBlockingAuthHandler) {
+  // The callback path cannot run the blocking ServerAuthHandler (it would run
+  // on callback threads), so a server configured with one must refuse to start
+  // instead of silently serving unauthenticated requests.  Middleware *is*
+  // supported now - see UseAsyncGrpcFlagAllowsMiddleware.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+
+  TestFlightServer auth_server;
+  FlightServerOptions with_auth(location);
+  with_auth.auth_handler = std::make_shared<TestServerAuthHandler>("user", "pass");
+  auto auth_status = auth_server.Init(with_auth);
+  ASSERT_FALSE(auth_status.ok()) << "an auth handler must not be silently skipped";
+  ASSERT_EQ(auth_status.code(), arrow::StatusCode::NotImplemented);
+  ASSERT_NE(auth_status.message().find("AsyncGenericFlightServerBase"), std::string::npos)
+      << auth_status;
+}
+
+TEST(AsyncGrpcTest, UseAsyncGrpcFlagAllowsMiddleware) {
+  // Middleware configured through FlightServerOptions must run on the async
+  // path: StartCall at call creation, SendingHeaders and CallCompleted at the
+  // end - success or failure alike.
+  auto trace = std::make_shared<MiddlewareTrace>();
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+
+  TestFlightServer flight_server;
+  FlightServerOptions options(location);
+  options.middleware = {
+      {"recording", std::make_shared<RecordingServerMiddlewareFactory>(trace)}};
+  ASSERT_OK(flight_server.Init(options));
+
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+  ASSERT_OK_AND_ASSIGN(auto reader, client->DoGet(Ticket{"middleware-ticket"}));
+  while (true) {
+    ASSERT_OK_AND_ASSIGN(auto chunk, reader->Next());
+    if (!chunk.data) break;
+  }
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  std::lock_guard<std::mutex> guard(trace->mutex);
+  EXPECT_EQ(1, trace->start_call);
+  EXPECT_EQ(1, trace->sending_headers);
+  EXPECT_EQ(1, trace->call_completed);
+}
+
+TEST(AsyncGrpcTest, UseAsyncGrpcFlagMiddlewareCanRejectCall) {
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  TestFlightServer flight_server;
+  FlightServerOptions options(location);
+  options.middleware = {
+      {"rejecting", std::make_shared<RejectingServerMiddlewareFactory>()}};
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto status = client->DoGet(Ticket{"rejected"}).status();
+  EXPECT_FALSE(status.ok());
+  EXPECT_THAT(status.ToString(), ::testing::HasSubstr("rejected by middleware"));
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+// ---------------------------------------------------------------------------
+// Handshake + per-RPC token auth on the async generic service.
+// ---------------------------------------------------------------------------
+
+// Counters shared between the server callbacks and the test thread.
+struct AsyncAuthState {
+  std::mutex mutex;
+  int handshakes = 0;
+  int validations = 0;
+  std::string peer_identity;
+};
+
+// Async-transport twin of TestServerAuthHandler: the handshake answers the
+// client's password with the username; later RPCs must carry that password as
+// the token, which is what TestClientAuthHandler::GetToken() puts in the
+// `auth-token-bin` header (the sync twin validates it the same way in
+// TestServerAuthHandler::IsValid).  It is a server class: the two hooks below
+// are the only configuration the transport needs.
+class AsyncAuthTestServer : public AsyncGenericFlightServerBase {
+ public:
+  AsyncAuthTestServer(std::string username, std::string password, std::string ticket,
+                      std::shared_ptr<AsyncAuthState> state = nullptr)
+      : username_(std::move(username)),
+        password_(std::move(password)),
+        ticket_(std::move(ticket)),
+        state_(state ? std::move(state) : std::make_shared<AsyncAuthState>()) {}
+
+  const std::shared_ptr<AsyncAuthState>& state() const { return state_; }
+
+  arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
+      const ServerCallContext& context, const Ticket& request) override {
+    {
+      std::lock_guard<std::mutex> guard(state_->mutex);
+      state_->peer_identity = context.peer_identity();
+    }
+    if (request.ticket != ticket_) {
+      return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+          Status::KeyError("No such ticket: ", request.ticket));
+    }
+    auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+    auto batch = arrow::RecordBatch::Make(
+        schema, 2, {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+    ARROW_ASSIGN_OR_RAISE(auto reader, arrow::RecordBatchReader::Make({batch}));
+    return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+        std::make_shared<ResolvedStream>(std::move(reader)));
+  }
+
+  // The hook: the transport read the client's password; answer with the
+  // username, or reject the RPC the way the sync twin does.
+  Status Handshake(const ServerCallContext& /*context*/, const std::string& password,
+                   std::string* response) override {
+    {
+      std::lock_guard<std::mutex> guard(state_->mutex);
+      state_->handshakes++;
+    }
+    if (password != password_) {
+      return MakeFlightError(FlightStatusCode::Unauthenticated, "Invalid token");
+    }
+    *response = username_;
+    return Status::OK();
+  }
+
+  Status ValidateToken(const ServerCallContext& /*context*/, const std::string& token,
+                       std::string* peer_identity) override {
+    std::lock_guard<std::mutex> guard(state_->mutex);
+    state_->validations++;
+    if (token != password_) {
+      return MakeFlightError(FlightStatusCode::Unauthenticated, "Invalid token");
+    }
+    *peer_identity = username_;
+    return Status::OK();
+  }
+
+ private:
+  std::string username_;
+  std::string password_;
+  std::string ticket_;
+  std::shared_ptr<AsyncAuthState> state_;
+};
+
+// A server with the async auth hooks installed, and a client connected to it.
+// `status` carries the setup result; construction never fails a test.
+struct AuthenticatedHarness {
+  AsyncAuthTestServer server{"user", "p4ssw0rd", "auth-ticket"};
+  std::unique_ptr<FlightClient> client;
+  Status status;
+
+  AuthenticatedHarness() : status(Start()) {}
+
+  ~AuthenticatedHarness() {
+    if (client) {
+      ARROW_WARN_NOT_OK(client->Close(), "Close()");
+    }
+    ARROW_WARN_NOT_OK(server.Shutdown(), "Shutdown()");
+  }
+
+ private:
+  Status Start() {
+    ARROW_ASSIGN_OR_RAISE(auto location, Location::Parse("grpc://localhost:0"));
+    // The server class alone selects the async transport: deriving from it and
+    // overriding its virtuals are the whole configuration.
+    FlightServerOptions options(location);
+    RETURN_NOT_OK(server.Init(options));
+    ARROW_ASSIGN_OR_RAISE(auto client_location,
+                          Location::ForScheme("grpc", "127.0.0.1", server.port()));
+    ARROW_ASSIGN_OR_RAISE(client, FlightClient::Connect(client_location));
+    return Status::OK();
+  }
+};
+
+// A minimal server that mixes in the async hooks: the server class alone
+// selects the async generic transport.
+class AsyncGenericTestServer : public AsyncGenericFlightServerBase {};
+
+TEST(AsyncGrpcTest, HandshakeWithoutHookIsUnimplemented) {
+  // A bare async server: Handshake is answered by the class's default virtual
+  // with UNIMPLEMENTED, and the client's Authenticate() surfaces it.
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  AsyncGenericTestServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto status = client->Authenticate(
+      {}, std::make_unique<TestClientAuthHandler>("user", "p4ssw0rd"));
+  ASSERT_FALSE(status.ok()) << "handshake must not succeed without a hook";
+  EXPECT_THAT(status.ToString(), ::testing::HasSubstr("authentication mechanism"));
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, AsyncGenericFlightServerBaseImpliesAsyncTransport) {
+  // Deriving from the async class is enough: no hooks and no option to set,
+  // yet the RPC is served by the generic callback service.  DoPut is the
+  // discriminator: an async server with no listener factory answers with its own
+  // message rather than "NYI".
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  AsyncGenericTestServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  // DoPut is the discriminator: an async server with no listener factory
+  // answers with its own message rather than "NYI".  The refusal can surface on
+  // either call: FlightClient::DoPut
+  // writes the schema payload eagerly, so when the server's UNIMPLEMENTED
+  // arrives first the DoPut call itself fails; otherwise the writer's Close()
+  // reports it.
+  auto put = client->DoPut(FlightDescriptor::Path({"x"}), arrow::schema({}));
+  auto status = put.status();
+  if (status.ok()) {
+    status = put->writer->Close();
+  }
+  EXPECT_FALSE(status.ok());
+  EXPECT_THAT(status.ToString(), ::testing::HasSubstr("no listener available"))
+      << "the async generic service must have served this call, not the sync path";
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, HandshakeAuthenticatesAndTokenIsRequired) {
+  AuthenticatedHarness harness;
+  ASSERT_OK(harness.status);
+
+  // 1. Without a handshake the data call is rejected before it is served.
+  ASSERT_OK_AND_ASSIGN(auto unauthenticated_location,
+                       Location::ForScheme("grpc", "127.0.0.1", harness.server.port()));
+  ASSERT_OK_AND_ASSIGN(auto unauthenticated_client,
+                       FlightClient::Connect(unauthenticated_location));
+  auto status = unauthenticated_client->DoGet(Ticket{"auth-ticket"}).status();
+  EXPECT_FALSE(status.ok());
+  EXPECT_THAT(status.ToString(), ::testing::HasSubstr("Invalid token"));
+  ASSERT_OK(unauthenticated_client->Close());
+
+  // 2. After the handshake the same call succeeds and the server sees the
+  //    validated identity.
+  ASSERT_OK(harness.client->Authenticate(
+      {}, std::make_unique<TestClientAuthHandler>("user", "p4ssw0rd")));
+  ASSERT_OK_AND_ASSIGN(auto reader, harness.client->DoGet(Ticket{"auth-ticket"}));
+  int batches = 0;
+  while (true) {
+    ASSERT_OK_AND_ASSIGN(auto chunk, reader->Next());
+    if (!chunk.data) break;
+    batches++;
+  }
+  EXPECT_EQ(1, batches);
+  {
+    std::lock_guard<std::mutex> guard(harness.server.state()->mutex);
+    EXPECT_EQ(1, harness.server.state()->handshakes);
+    EXPECT_EQ("user", harness.server.state()->peer_identity);
+    EXPECT_GE(harness.server.state()->validations, 1);
+  }
+}
+
+TEST(AsyncGrpcTest, BadPasswordIsRejectedAtHandshake) {
+  AuthenticatedHarness harness;
+  ASSERT_OK(harness.status);
+  auto status = harness.client->Authenticate(
+      {}, std::make_unique<TestClientAuthHandler>("user", "wrong"));
+  ASSERT_FALSE(status.ok());
+  EXPECT_THAT(status.ToString(), ::testing::HasSubstr("Invalid token"));
+}
+
+TEST(AsyncGrpcTest, UnauthenticatedUnknownMethodIsRejectedBeforeUnimplemented) {
+  AuthenticatedHarness harness;
+  ASSERT_OK(harness.status);
+  // GetFlightInfo is not served by the async generic service, but auth runs
+  // first: the client must see the auth failure, not UNIMPLEMENTED.
+  auto status = harness.client->GetFlightInfo(FlightDescriptor::Path({"x"})).status();
+  ASSERT_FALSE(status.ok());
+  EXPECT_THAT(status.ToString(), ::testing::HasSubstr("Invalid token"));
+  EXPECT_EQ(arrow::StatusCode::IOError, status.code());
+}
+
+// ---------------------------------------------------------------------------
+// The synchronous request/response Handshake hook: payload fidelity, edge
+// cases, and reactor cleanup (the reactor finishes on the strength of "one
+// terminal path per direction", so the concurrency test is its real check).
+// ---------------------------------------------------------------------------
+
+// Send `password`, require the server to echo `expect` back.
+class EchoClientAuthHandler : public ClientAuthHandler {
+ public:
+  EchoClientAuthHandler(std::string password, std::string expect)
+      : password_(std::move(password)), expect_(std::move(expect)) {}
+
+  Status Authenticate(ClientAuthSender* outgoing, ClientAuthReader* incoming) override {
+    ARROW_RETURN_NOT_OK(outgoing->Write(password_));
+    ARROW_RETURN_NOT_OK(incoming->Read(&response_));
+    if (response_ != expect_) {
+      return MakeFlightError(FlightStatusCode::Unauthenticated,
+                             "unexpected handshake response");
+    }
+    return Status::OK();
+  }
+
+  Status GetToken(std::string* token) override {
+    *token = password_;
+    return Status::OK();
+  }
+
+  const std::string& response() const { return response_; }
+
+ private:
+  std::string password_;
+  std::string expect_;
+  std::string response_;
+};
+
+TEST(AsyncGrpcTest, HandshakePayloadIsBinarySafe) {
+  // The hook's request is a std::string taken from the protobuf and its
+  // response is echoed back through the client's reader: an embedded NUL and
+  // non-ASCII bytes must survive both directions unchanged.
+  const std::string binary("p4ss\0w0rd\xC3\xA9", 11);
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  AsyncAuthTestServer server(binary, binary, "bin-ticket");
+  FlightServerOptions options(location);
+  ASSERT_OK(server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto handler = std::make_unique<EchoClientAuthHandler>(binary, binary);
+  const auto* observed = handler.get();
+  ASSERT_OK(client->Authenticate({}, std::move(handler)));
+  EXPECT_EQ(binary, observed->response());
+
+  // The token is the password, so an authenticated call must also work.
+  ASSERT_OK_AND_ASSIGN(auto reader, client->DoGet(Ticket{"bin-ticket"}));
+  ASSERT_OK_AND_ASSIGN(auto chunk, reader->Next());
+  EXPECT_NE(nullptr, chunk.data);
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(server.Shutdown());
+  ASSERT_OK(server.Wait());
+}
+
+TEST(AsyncGrpcTest, EmptyHandshakeRequestIsRejectedNotHung) {
+  // An empty HandshakeRequest is a valid protobuf message: the read succeeds,
+  // the hook sees an empty string, and its rejection must reach the client.
+  class SilentClientAuthHandler : public ClientAuthHandler {
+   public:
+    Status Authenticate(ClientAuthSender* outgoing, ClientAuthReader*) override {
+      return outgoing->Write("");
+    }
+    Status GetToken(std::string*) override { return Status::OK(); }
+  };
+
+  AuthenticatedHarness harness;
+  ASSERT_OK(harness.status);
+  auto status =
+      harness.client->Authenticate({}, std::make_unique<SilentClientAuthHandler>());
+  ASSERT_FALSE(status.ok());
+  EXPECT_THAT(status.ToString(), ::testing::HasSubstr("Invalid token"));
+  std::lock_guard<std::mutex> guard(harness.server.state()->mutex);
+  EXPECT_EQ(1, harness.server.state()->handshakes)
+      << "the hook must run on an empty request, not fail the read";
+}
+
+TEST(AsyncGrpcTest, AbandonedHandshakeLeavesServerUsable) {
+  // A client that never sends a message: the server's read completes with
+  // ok=false, the reactor must still finish, and the server must keep serving.
+  class AbandoningClientAuthHandler : public ClientAuthHandler {
+   public:
+    Status Authenticate(ClientAuthSender*, ClientAuthReader*) override {
+      return Status::Invalid("client never speaks");
+    }
+    Status GetToken(std::string*) override { return Status::OK(); }
+  };
+
+  AuthenticatedHarness harness;
+  ASSERT_OK(harness.status);
+  EXPECT_FALSE(
+      harness.client->Authenticate({}, std::make_unique<AbandoningClientAuthHandler>())
+          .ok());
+
+  ASSERT_OK_AND_ASSIGN(auto location,
+                       Location::ForScheme("grpc", "127.0.0.1", harness.server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(location));
+  ASSERT_OK(client->Authenticate(
+      {}, std::make_unique<TestClientAuthHandler>("user", "p4ssw0rd")));
+  ASSERT_OK_AND_ASSIGN(auto reader, client->DoGet(Ticket{"auth-ticket"}));
+  ASSERT_OK_AND_ASSIGN(auto chunk, reader->Next());
+  EXPECT_NE(nullptr, chunk.data);
+  ASSERT_OK(client->Close());
+
+  std::lock_guard<std::mutex> guard(harness.server.state()->mutex);
+  EXPECT_EQ(1, harness.server.state()->handshakes)
+      << "the abandoned call must never have reached the hook";
+}
+
+TEST(AsyncGrpcTest, ConcurrentHandshakesAllComplete) {
+  constexpr int kClients = 32;
+  AuthenticatedHarness harness;
+  ASSERT_OK(harness.status);
+
+  std::vector<std::thread> threads;
+  std::vector<Status> statuses(kClients);
+  for (int i = 0; i < kClients; i++) {
+    threads.emplace_back([&harness, &statuses, i] {
+      auto location = Location::ForScheme("grpc", "127.0.0.1", harness.server.port());
+      if (!location.ok()) {
+        statuses[i] = location.status();
+        return;
+      }
+      auto client = FlightClient::Connect(*location);
+      if (!client.ok()) {
+        statuses[i] = client.status();
+        return;
+      }
+      auto authenticated = (*client)->Authenticate(
+          {}, std::make_unique<TestClientAuthHandler>("user", "p4ssw0rd"));
+      if (!authenticated.ok()) {
+        statuses[i] = authenticated;
+        return;
+      }
+      auto reader = (*client)->DoGet(Ticket{"auth-ticket"});
+      if (!reader.ok()) {
+        statuses[i] = reader.status();
+        return;
+      }
+      auto chunk = (*reader)->Next();
+      if (!chunk.ok()) {
+        statuses[i] = chunk.status();
+        return;
+      }
+      statuses[i] = (*client)->Close();
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  for (int i = 0; i < kClients; i++) {
+    EXPECT_TRUE(statuses[i].ok()) << "client " << i << ": " << statuses[i];
+  }
+
+  std::lock_guard<std::mutex> guard(harness.server.state()->mutex);
+  EXPECT_EQ(kClients, harness.server.state()->handshakes);
+}
+
+TEST(AsyncGrpcTest, RepeatedHandshakesOnFreshChannels) {
+  constexpr int kRounds = 50;
+  AuthenticatedHarness harness;
+  ASSERT_OK(harness.status);
+  for (int i = 0; i < kRounds; i++) {
+    ASSERT_OK_AND_ASSIGN(auto location,
+                         Location::ForScheme("grpc", "127.0.0.1", harness.server.port()));
+    ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(location));
+    ASSERT_OK(client->Authenticate(
+        {}, std::make_unique<TestClientAuthHandler>("user", "p4ssw0rd")));
+    ASSERT_OK(client->Close());
+  }
+  std::lock_guard<std::mutex> guard(harness.server.state()->mutex);
+  EXPECT_EQ(kRounds, harness.server.state()->handshakes);
+}
+
+TEST(AsyncGrpcTest, LateHandshakeResponseLeavesServerUsable) {
+  // The client gives up while the hook is still running, so the server's write
+  // fails: the reactor's write-side terminal path must still Finish, and the
+  // server must keep serving.
+  class SlowAnsweringServer : public AsyncGenericFlightServerBase {
+   public:
+    Status Handshake(const ServerCallContext&, const std::string&,
+                     std::string* response) override {
+      handshakes.fetch_add(1);
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      *response = "user";
+      return Status::OK();
+    }
+    std::atomic<int> handshakes{0};
+  };
+
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  SlowAnsweringServer server;
+  FlightServerOptions options(location);
+  ASSERT_OK(server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(50);
+  auto status = client->Authenticate(
+      impatient, std::make_unique<TestClientAuthHandler>("user", "p4ssw0rd"));
+  EXPECT_FALSE(status.ok()) << "the client's deadline must expire during the hook";
+  EXPECT_NE(std::string::npos, status.ToString().find("Deadline"))
+      << "expected a deadline error, got: " << status.ToString();
+  EXPECT_EQ(1, server.handshakes.load())
+      << "the first call must have reached the hook, so its write had to finish";
+
+  ASSERT_OK_AND_ASSIGN(auto second_location,
+                       Location::ForScheme("grpc", "127.0.0.1", server.port()));
+  ASSERT_OK_AND_ASSIGN(auto second_client, FlightClient::Connect(second_location));
+  ASSERT_OK(second_client->Authenticate(
+      {}, std::make_unique<TestClientAuthHandler>("user", "p4ssw0rd")));
+
+  ASSERT_OK(second_client->Close());
+  ASSERT_OK(client->Close());
+  ASSERT_OK(server.Shutdown());
+  ASSERT_OK(server.Wait());
+}
+
+TEST(AsyncGrpcTest, EmptyHandshakeResponseIsDelivered) {
+  // A hook that answers nothing still produces exactly one (empty) response
+  // message: the client's Read must return an empty string rather than hang.
+  class NoResponseServer : public AsyncGenericFlightServerBase {
+   public:
+    Status Handshake(const ServerCallContext&, const std::string&,
+                     std::string*) override {
+      return Status::OK();
+    }
+  };
+
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  NoResponseServer server;
+  FlightServerOptions options(location);
+  ASSERT_OK(server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto handler = std::make_unique<EchoClientAuthHandler>("anything", std::string());
+  const auto* observed = handler.get();
+  ASSERT_OK(client->Authenticate({}, std::move(handler)));
+  EXPECT_EQ(std::string(), observed->response());
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(server.Shutdown());
+  ASSERT_OK(server.Wait());
+}
+
+TEST(AsyncGrpcTest, RehandshakeOnTheSameChannelWorks) {
+  // The Handshake RPC is per-call, so authenticating twice on one channel must
+  // work: the second handshake reaches the hook and the channel keeps serving.
+  AuthenticatedHarness harness;
+  ASSERT_OK(harness.status);
+  ASSERT_OK(harness.client->Authenticate(
+      {}, std::make_unique<TestClientAuthHandler>("user", "p4ssw0rd")));
+  ASSERT_OK(harness.client->Authenticate(
+      {}, std::make_unique<TestClientAuthHandler>("user", "p4ssw0rd")));
+  ASSERT_OK_AND_ASSIGN(auto reader, harness.client->DoGet(Ticket{"auth-ticket"}));
+  ASSERT_OK_AND_ASSIGN(auto chunk, reader->Next());
+  EXPECT_NE(nullptr, chunk.data);
+
+  std::lock_guard<std::mutex> guard(harness.server.state()->mutex);
+  EXPECT_EQ(2, harness.server.state()->handshakes);
+}
+
+}  // namespace
+
+}  // namespace arrow::flight::transport::grpc

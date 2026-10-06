@@ -3487,7 +3487,7 @@ if(ARROW_WITH_GRPC)
     message(FATAL_ERROR "Can't use gRPC with ARROW_ENABLE_THREADING=OFF")
   endif()
 
-  set(ARROW_GRPC_REQUIRED_VERSION "1.30.0")
+  set(ARROW_GRPC_REQUIRED_VERSION "1.65.0")
   if(absl_SOURCE STREQUAL "BUNDLED" AND NOT gRPC_SOURCE STREQUAL "BUNDLED")
     # System gRPC can't be used with bundled Abseil
     message(STATUS "Forcing gRPC_SOURCE to BUNDLED because absl_SOURCE is BUNDLED")

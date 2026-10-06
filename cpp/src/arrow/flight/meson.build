@@ -23,11 +23,13 @@ install_headers(
         'client.h',
         'client_middleware.h',
         'client_tracing_middleware.h',
+        'flight_data_decoder.h',
         'middleware.h',
         'otel_logging.h',
         'platform.h',
         'server_auth.h',
         'server.h',
+        'server_async.h',
         'server_middleware.h',
         'server_tracing_middleware.h',
         'test_auth_handlers.h',
@@ -44,7 +46,14 @@ install_headers(
     subdir: 'arrow/flight',
 )
 
-grpc_dep = dependency('grpc++')
+# 1.65 is the first release with the generic callback API the async Flight
+# server is built on; see transport/grpc/async_grpc_compat.h, which does the C++
+# version check.
+# The dependency floor here and ARROW_GRPC_REQUIRED_VERSION in
+# cpp/cmake_modules/ThirdpartyToolchain.cmake make the requirement explicit.
+grpc_dep = dependency('grpc++', version: '>=1.65.0')
+grpc_enable_async_args = ['-DGRPC_ENABLE_ASYNC']
+has_async_server = grpc_dep.version().version_compare('>=1.65.0')
 abseil_sync_dep = dependency('absl_synchronization')
 
 fs = import('fs')
@@ -81,9 +90,11 @@ arrow_flight_srcs = [
     'client_cookie_middleware.cc',
     'client_tracing_middleware.cc',
     'cookie_internal.cc',
+    'flight_data_decoder.cc',
     'middleware.cc',
     'serialization_internal.cc',
     'server.cc',
+    'server_async.cc',
     'server_auth.cc',
     'server_tracing_middleware.cc',
     'transport.cc',
@@ -97,6 +108,22 @@ arrow_flight_srcs = [
     'transport/grpc/util_internal.cc',
     'types.cc',
 ]
+
+# The async generic server needs gRPC's generic callback API; see
+# async_grpc_compat.h and the CMake equivalent.
+if has_async_server
+    arrow_flight_srcs += [
+        'transport/grpc/async_grpc_service.cc',
+        'transport/grpc/async_grpc_do_get.cc',
+        'transport/grpc/async_grpc_do_put.cc',
+        'transport/grpc/async_grpc_exchange.cc',
+        'transport/grpc/async_grpc_handshake.cc',
+        'transport/grpc/async_grpc_streaming.cc',
+        'transport/grpc/async_grpc_unary.cc',
+    ]
+endif
+
+
 
 thread_dep = dependency('threads')
 
@@ -117,8 +144,8 @@ arrow_flight = library(
         abseil_sync_dep,
         thread_dep,
     ],
-    cpp_shared_args: ['-DARROW_FLIGHT_EXPORTING'],
-    cpp_static_args: ['-DARROW_FLIGHT_STATIC'],
+    cpp_shared_args: ['-DARROW_FLIGHT_EXPORTING'] + grpc_enable_async_args,
+    cpp_static_args: ['-DARROW_FLIGHT_STATIC'] + grpc_enable_async_args,
     gnu_symbol_visibility: 'inlineshidden',
 )
 
@@ -165,6 +192,23 @@ foreach flight_test : flight_tests
     )
     test(test_name, exc)
 endforeach
+
+if has_async_server
+    async_grpc_test = executable(
+        'flight-async-grpc-test',
+        sources: [
+            'transport/grpc/async_grpc_test.cc',
+            # async_grpc_test.cc transitively includes Flight.grpc.pb.h
+            # so we must declare that here to avoid a race condition
+            flight_proto_grpc_files[1],
+        ],
+        cpp_args: grpc_enable_async_args,
+        dependencies: [arrow_test_dep, arrow_flight_test_dep],
+    )
+    # The timeout bounds the tests that would otherwise hang the suite instead
+    # of failing when a cancel/finish path regresses.
+    test('flight-async-grpc-test', async_grpc_test, timeout: 300)
+endif
 
 flight_test_dep_no_main = [
     arrow_dep,
