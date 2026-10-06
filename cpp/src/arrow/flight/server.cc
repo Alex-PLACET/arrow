@@ -36,7 +36,6 @@
 #include "arrow/flight/types.h"
 #include "arrow/status.h"
 #include "arrow/type.h"
-#include "arrow/util/future.h"
 
 namespace arrow {
 namespace flight {

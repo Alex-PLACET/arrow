@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <csignal>
 #include <unistd.h>
+#include <csignal>
 #if defined(__linux__)
 #  include <sys/prctl.h>
 #endif
@@ -105,6 +105,7 @@ class BatchReader : public arrow::RecordBatchReader {
 /// not touch the stream object after that.  Everything it needs lives here.
 struct WorkerState {
   std::unique_ptr<flight::FlightDataStream> stream;
+  std::shared_ptr<arrow::Schema> schema;
   int32_t delay_ms = 0;
   std::mutex mutex;
   std::condition_variable ready;
@@ -112,6 +113,8 @@ struct WorkerState {
   /// The payload the transport is waiting for, if one was requested.
   arrow::Future<std::optional<flight::FlightPayload>> pending;
   bool has_pending = false;
+  /// Whether the wrapped stream has been closed, so Close() closes it once.
+  bool stream_closed = false;
   std::thread thread;
 };
 
@@ -128,6 +131,9 @@ void RunWorker(std::shared_ptr<WorkerState> state) {
   prctl(PR_SET_NAME, "doget_worker", 0, 0, 0);
 #endif
   std::unique_lock<std::mutex> lock(state->mutex);
+  // Read the schema on this thread: it is the only one allowed to touch the
+  // wrapped stream, and the transport asks for the schema first.
+  state->schema = state->stream->schema();
   while (!state->closed) {
     state->ready.wait(lock, [&] { return state->has_pending || state->closed; });
     if (state->closed) {
@@ -158,6 +164,7 @@ void RunWorker(std::shared_ptr<WorkerState> state) {
     }
     lock.lock();
   }
+  state->ready.notify_all();
 }
 
 /// \brief The stream the async transport pulls from, with a sleep per batch.
@@ -194,10 +201,11 @@ class DelayedAsyncStream : public flight::AsyncFlightDataStream {
     }
   }
 
-  std::shared_ptr<arrow::Schema> schema() override { return state_->stream->schema(); }
+  std::shared_ptr<arrow::Schema> schema() override { return state_->schema; }
 
   arrow::Future<flight::FlightPayload> GetSchemaPayloadAsync() override {
-    // The schema is ready now: no delay, no worker.
+    // The schema is ready now: no delay, no worker.  This runs before the first
+    // NextAsync(), so it cannot overlap the worker's use of the stream.
     return arrow::Future<flight::FlightPayload>::MakeFinished(
         state_->stream->GetSchemaPayload());
   }
@@ -220,6 +228,13 @@ class DelayedAsyncStream : public flight::AsyncFlightDataStream {
 
   arrow::Status Close() override {
     Stop();
+    {
+      std::lock_guard<std::mutex> lock(state_->mutex);
+      if (state_->stream_closed) {
+        return arrow::Status::OK();
+      }
+      state_->stream_closed = true;
+    }
     return state_->stream->Close();
   }
 

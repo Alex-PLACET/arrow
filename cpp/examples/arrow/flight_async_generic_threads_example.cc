@@ -105,7 +105,7 @@ std::vector<std::pair<std::string, int>> ReadThreadNames(int pid) {
   return sorted;
 }
 
-/// \brief One line like `event_engine=56 doget_stream_worker=40 lifeguard=1`.
+/// \brief One line like `event_engine=56 doget_worker=40 lifeguard=1`.
 std::string FormatThreadNames(int pid) {
   std::string out;
   for (const auto& [name, count] : ReadThreadNames(pid)) {
