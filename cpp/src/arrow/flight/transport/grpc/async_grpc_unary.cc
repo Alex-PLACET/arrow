@@ -47,16 +47,15 @@ class UnaryReactor final : public AsyncReactorBase {
       FinishOnce(descriptor.status());
       return;
     }
-    Hold();
     arrow::Future<std::shared_ptr<T>> future = handler_(flight_context(), *descriptor);
     future.AddCallback(
-        [this, future](const arrow::Result<std::shared_ptr<T>>& result) mutable {
+        [this, token = hold()](const arrow::Result<std::shared_ptr<T>>& result) mutable {
           if (!finished()) {
             if (!result.ok()) {
               FinishOnce(result.status());
             } else {
               PbT response;
-              const auto status = SerializeOrNotFound(*future.MoveResult(), &response);
+              const auto status = SerializeOrNotFound(*result, &response);
               if (!status.ok()) {
                 FinishOnce(status);
               } else {
@@ -65,7 +64,6 @@ class UnaryReactor final : public AsyncReactorBase {
               }
             }
           }
-          ReleaseHold();
         });
   }
 

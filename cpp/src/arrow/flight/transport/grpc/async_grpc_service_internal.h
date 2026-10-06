@@ -18,10 +18,12 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 
-#include <grpcpp/generic/callback_generic_service.h>
 #include <grpcpp/support/byte_buffer.h>
 #include <grpcpp/support/slice.h>
 
@@ -89,7 +91,21 @@ arrow::Status SerializeOrNotFound(const std::shared_ptr<T>& value, PbT* out) {
 class AsyncReactorBase : public ::grpc::ServerGenericBidiReactor {
  public:
   explicit AsyncReactorBase(AsyncCallContext flight_context)
-      : flight_context_(std::move(flight_context)) {}
+      : flight_context_(std::move(flight_context)) {
+    live_reactors_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  ~AsyncReactorBase() override { live_reactors_.fetch_sub(1, std::memory_order_relaxed); }
+
+  /// \brief How many reactors are alive right now.
+  ///
+  /// A reactor is deleted by the last ReleaseHold(), so this returns to its
+  /// starting value once every RPC (including the ones whose handler abandoned
+  /// its future) has been torn down.
+  /// Tests use it to catch a leak that would otherwise be invisible.
+  static int64_t live_reactors() {
+    return live_reactors_.load(std::memory_order_relaxed);
+  }
 
   /// The default cancellation: report the RPC as cancelled and finish it.
   /// Reactors with their own teardown override this and call it first.
@@ -125,10 +141,47 @@ class AsyncReactorBase : public ::grpc::ServerGenericBidiReactor {
     }
   }
 
+  /// \brief A reference the reactor owns, to be handed to a callback.
+  class HoldToken {
+   public:
+    HoldToken() = default;
+    explicit HoldToken(AsyncReactorBase* reactor) : reactor_(reactor) {
+      reactor_->Hold();
+    }
+    HoldToken(const HoldToken&) = delete;
+    HoldToken& operator=(const HoldToken&) = delete;
+    HoldToken(HoldToken&& other) noexcept
+        : reactor_(std::exchange(other.reactor_, nullptr)) {}
+    HoldToken& operator=(HoldToken&& other) noexcept {
+      if (this != &other) {
+        Release();
+        reactor_ = std::exchange(other.reactor_, nullptr);
+      }
+      return *this;
+    }
+    ~HoldToken() { Release(); }
+
+    /// \brief The reference, to be captured by the callback and moved out of.
+    HoldToken&& release() { return std::move(*this); }
+
+   private:
+    void Release() {
+      if (reactor_ != nullptr) {
+        reactor_->ReleaseHold();
+        reactor_ = nullptr;
+      }
+    }
+    AsyncReactorBase* reactor_ = nullptr;
+  };
+
+  /// \brief Take a reference and return the token that holds it.
+  HoldToken hold() { return HoldToken(this); }
+
  private:
   AsyncCallContext flight_context_;
   std::atomic<bool> finished_{false};
   std::atomic<int> refs_{1};
+  inline static std::atomic<int64_t> live_reactors_{0};
 };
 
 ::grpc::ServerGenericBidiReactor* MakeHandshakeReactor(AsyncCallContext flight_context,

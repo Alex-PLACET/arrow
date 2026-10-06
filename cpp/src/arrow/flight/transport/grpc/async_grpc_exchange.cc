@@ -347,14 +347,12 @@ class ExchangeReactor final : public AsyncReactorBase {
       }
       reader_->SetDescriptor(*read_data_.descriptor);
       reader_->OfferFirstRead(std::move(read_data_));
-      Hold();
       arrow::Future<> exchange =
           base_->DoExchangeAsync(flight_context(), reader_, writer_);
-      exchange.AddCallback([this](const arrow::Status& status) {
+      exchange.AddCallback([this, token = hold()](const arrow::Status& status) {
         if (!finished()) {
           FinishOnce(status);
         }
-        ReleaseHold();
       });
       return;
     }

@@ -46,17 +46,16 @@ class DoGetReactor : public AsyncReactorBase {
       return;
     }
 
-    Hold();
     arrow::Future<std::shared_ptr<AsyncFlightDataStream>> future =
         base_->DoGetAsync(flight_context(), *ticket);
     future.AddCallback(
-        [this, future](
-            const arrow::Result<std::shared_ptr<AsyncFlightDataStream>>& result) mutable {
+        [this, token = hold()](
+            const arrow::Result<std::shared_ptr<AsyncFlightDataStream>>& result) {
           if (!finished()) {
             if (!result.ok()) {
               FinishOnce(result.status());
             } else {
-              async_data_stream_ = *future.MoveResult();
+              async_data_stream_ = result.ValueOrDie();
               if (async_data_stream_ == nullptr) {
                 FinishOnce(arrow::Status::KeyError("No data in this flight"));
               } else {
@@ -64,7 +63,6 @@ class DoGetReactor : public AsyncReactorBase {
               }
             }
           }
-          ReleaseHold();
         });
   }
 
@@ -107,7 +105,7 @@ class DoGetReactor : public AsyncReactorBase {
     if (finished()) {
       return;
     }
-    Hold();
+    HoldToken token = hold();
 
     arrow::Future<std::optional<FlightPayload>> next;
     if (!wrote_schema_) {
@@ -118,7 +116,8 @@ class DoGetReactor : public AsyncReactorBase {
     } else {
       next = async_data_stream_->NextAsync();
     }
-    next.AddCallback([this](arrow::Result<std::optional<FlightPayload>> result) {
+    next.AddCallback([this, token = token.release()](
+                         arrow::Result<std::optional<FlightPayload>> result) {
       if (!finished()) {
         if (!result.ok()) {
           FinishOnce(result.status());
@@ -140,7 +139,6 @@ class DoGetReactor : public AsyncReactorBase {
           }
         }
       }
-      ReleaseHold();
     });
   }
 

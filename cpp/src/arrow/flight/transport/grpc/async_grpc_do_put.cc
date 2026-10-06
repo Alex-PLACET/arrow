@@ -66,8 +66,7 @@ class DoPutReactor : public AsyncReactorBase,
     }
 
     Future<> decode_status = decoder_.Consume(std::move(arrow_buf));
-    Hold();
-    decode_status.AddCallback([this](arrow::Status status) {
+    decode_status.AddCallback([this, token = hold()](arrow::Status status) {
       if (finished()) {
         // The RPC is over (cancelled while the listener was working): the
         // message is abandoned.
@@ -78,7 +77,6 @@ class DoPutReactor : public AsyncReactorBase,
           StartRead(&request_buf_);
         }
       }
-      ReleaseHold();
     });
   }
 

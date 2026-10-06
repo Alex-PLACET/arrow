@@ -40,6 +40,7 @@
 #include "arrow/flight/server_middleware.h"
 #include "arrow/flight/test_auth_handlers.h"
 #include "arrow/flight/transport/grpc/async_grpc_service.h"
+#include "arrow/flight/transport/grpc/async_grpc_service_internal.h"
 #include "arrow/ipc/writer.h"
 #include "arrow/scalar.h"
 #include "arrow/testing/gtest_util.h"
@@ -1362,6 +1363,33 @@ TEST(AsyncGrpcTest, GetFlightInfoDeadlineWithPendingHandlerFinishes) {
   ASSERT_OK(client->Close());
   ASSERT_OK(flight_server.Shutdown());
   ASSERT_OK(flight_server.Wait());
+}
+
+TEST(AsyncGrpcTest, HangingHandlerDoesNotLeakItsReactor) {
+  const int64_t before = detail::AsyncReactorBase::live_reactors();
+
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  HangingUnaryServer flight_server;
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_OK_AND_ASSIGN(auto client_location,
+                       Location::ForScheme("grpc", "127.0.0.1", flight_server.port()));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  FlightCallOptions impatient;
+  impatient.timeout = std::chrono::milliseconds(500);
+  auto status =
+      client->GetFlightInfo(impatient, FlightDescriptor::Command("hang")).status();
+  EXPECT_FALSE(status.ok()) << "the deadline must expire while the handler hangs";
+
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  EXPECT_TRUE(WaitFor([&] {
+    return detail::AsyncReactorBase::live_reactors() == before;
+  })) << "a reactor leaked: still alive after the server stopped (before="
+      << before << ", now=" << detail::AsyncReactorBase::live_reactors() << ")";
 }
 
 TEST(AsyncGrpcTest, UnaryReactorPropagatesServerError) {

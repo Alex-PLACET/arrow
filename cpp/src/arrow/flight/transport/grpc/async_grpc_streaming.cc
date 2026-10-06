@@ -38,8 +38,7 @@ class StreamingReactor : public AsyncReactorBase {
       FinishOnce(MakeFlightError(FlightStatusCode::Internal, "Failed to read request"));
       return;
     }
-    Hold();
-    Start().AddCallback([this](const arrow::Status& status) {
+    Start().AddCallback([this, token = hold()](const arrow::Status& status) {
       if (!finished()) {
         if (!status.ok()) {
           FinishOnce(status);
@@ -47,7 +46,6 @@ class StreamingReactor : public AsyncReactorBase {
           WriteNextMessage();
         }
       }
-      ReleaseHold();
     });
   }
 
@@ -70,19 +68,18 @@ class StreamingReactor : public AsyncReactorBase {
     if (finished()) {
       return;
     }
-    Hold();
-    NextMessage().AddCallback([this](const arrow::Result<bool>& has_next) {
-      if (!finished()) {
-        if (!has_next.ok()) {
-          FinishOnce(has_next.status());
-        } else if (!*has_next) {
-          FinishOnce(arrow::Status::OK());
-        } else {
-          StartWrite(&write_buf_);
-        }
-      }
-      ReleaseHold();
-    });
+    NextMessage().AddCallback(
+        [this, token = hold()](const arrow::Result<bool>& has_next) {
+          if (!finished()) {
+            if (!has_next.ok()) {
+              FinishOnce(has_next.status());
+            } else if (!*has_next) {
+              FinishOnce(arrow::Status::OK());
+            } else {
+              StartWrite(&write_buf_);
+            }
+          }
+        });
   }
 
   AsyncGenericFlightServerBase* base_;
