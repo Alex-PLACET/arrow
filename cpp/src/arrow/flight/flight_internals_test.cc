@@ -1033,6 +1033,45 @@ TEST(AsyncFlightMessageDecoder, ListenerErrorIsPropagated) {
   EXPECT_EQ(meta_status.code(), StatusCode::Invalid);
 }
 
+TEST(AsyncFlightMessageDecoder, FailedOpenLeavesTheDecoderUsable) {
+  // A first IPC message that is not a schema makes RecordBatchStreamReader::Open
+  // fail.
+  // The decoder must survive that: it used to hand its message reader over
+  // to Open, which destroys it on failure, leaving the decoder's cached pointer
+  // dangling for the next Consume().
+  auto schema = arrow::schema({arrow::field("a", arrow::int32())});
+  auto batch = RecordBatch::Make(schema, 1, {ArrayFromJSON(arrow::int32(), "[1]")});
+  auto reader = RecordBatchReader::Make({batch}).ValueOrDie();
+  RecordBatchStream stream(std::move(reader));
+
+  auto listener = std::make_shared<DecoderTestListener>();
+  AsyncFlightMessageDecoder decoder(listener);
+
+  // A record batch as the first message: not a schema, so Open() fails.
+  ASSERT_OK_AND_ASSIGN(auto batch_payload, stream.Next());
+  ASSERT_OK_AND_ASSIGN(auto batch_wire, DecoderTestWireBuffer(batch_payload));
+  auto failed = decoder.Consume(batch_wire).status();
+  EXPECT_FALSE(failed.ok()) << "a first message that is not a schema must be rejected";
+  EXPECT_TRUE(listener->events.empty())
+      << "nothing may be surfaced for a rejected stream";
+
+  // The decoder must still work: consume a well-formed stream and watch the
+  // schema and the batch come through.
+  auto good_reader = RecordBatchReader::Make({batch}).ValueOrDie();
+  RecordBatchStream good_stream(std::move(good_reader));
+  ASSERT_OK_AND_ASSIGN(auto schema_payload, good_stream.GetSchemaPayload());
+  ASSERT_OK_AND_ASSIGN(auto schema_wire, DecoderTestWireBuffer(schema_payload));
+  ASSERT_OK(decoder.Consume(schema_wire).status());
+  ASSERT_OK_AND_ASSIGN(auto good_batch, good_stream.Next());
+  ASSERT_OK_AND_ASSIGN(auto good_wire, DecoderTestWireBuffer(good_batch));
+  ASSERT_OK(decoder.Consume(good_wire).status());
+
+  EXPECT_THAT(listener->events, ::testing::ElementsAre("OnSchemaDecoded", "OnNext"));
+  ASSERT_EQ(listener->chunks.size(), 1);
+  ASSERT_NE(listener->chunks[0].data, nullptr);
+  EXPECT_TRUE(listener->chunks[0].data->Equals(*batch));
+}
+
 TEST(AsyncFlightMessageDecoder, DictionaryStream) {
   // A dictionary-encoded stream arrives as: schema -> dictionary message -> batch.
   // Tthe IPC reader reads through the dictionary message while

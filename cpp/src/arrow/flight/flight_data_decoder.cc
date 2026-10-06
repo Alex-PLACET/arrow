@@ -97,6 +97,25 @@ class FlightDataMessageReader : public ipc::MessageReader {
   std::shared_ptr<Buffer> app_metadata_;
 };
 
+// FlightDataMessageReader is owned by the decoder, not by the
+// RecordBatchStreamReader that reads through it: Open() takes a unique_ptr and
+// adopts it, so handing over the decoder's reader would free it on any failure
+// path (a malformed first message, a first message that is not a schema),
+// leaving the decoder with a dangling pointer. 
+// This forwards to the decoder's reader and stays owned by it.
+class FlightDataMessageReaderRef final : public ipc::MessageReader {
+ public:
+  explicit FlightDataMessageReaderRef(FlightDataMessageReader* reader)
+      : reader_(reader) {}
+
+  arrow::Result<std::unique_ptr<ipc::Message>> ReadNextMessage() override {
+    return reader_->ReadNextMessage();
+  }
+
+ private:
+  FlightDataMessageReader* reader_;
+};
+
 }  // namespace
 
 class AsyncFlightMessageDecoder::AsyncFlightMessageDecoderImpl {
@@ -105,7 +124,7 @@ class AsyncFlightMessageDecoder::AsyncFlightMessageDecoderImpl {
                                 ipc::IpcReadOptions options)
       : listener_(std::move(listener)),
         options_(std::move(options)),
-        message_reader_(new FlightDataMessageReader()) {}
+        message_reader_(std::make_unique<FlightDataMessageReader>()) {}
 
   /// \brief Consume a chunk of Flight data.
   /// \param data The Flight data to consume.
@@ -160,7 +179,8 @@ class AsyncFlightMessageDecoder::AsyncFlightMessageDecoderImpl {
       ARROW_ASSIGN_OR_RAISE(
           batch_reader_,
           ipc::RecordBatchStreamReader::Open(
-              std::unique_ptr<ipc::MessageReader>(message_reader_), options_));
+              std::make_unique<FlightDataMessageReaderRef>(message_reader_.get()),
+              options_));
       return listener_->OnSchemaDecoded(batch_reader_->schema());
     }
 
@@ -195,9 +215,10 @@ class AsyncFlightMessageDecoder::AsyncFlightMessageDecoderImpl {
 
   std::shared_ptr<AsyncFlightDataListener> listener_;
   ipc::IpcReadOptions options_;
-  // This is owned by the RecordBatchStreamReader once it's passed to it.
-  // We want to keep a reference to it so we can extract the app_metadata.
-  FlightDataMessageReader* message_reader_;
+  // Kept here, not transferred to the RecordBatchStreamReader: the decoder
+  // reads the app metadata back out of it, and a failed Open() must leave it
+  // usable.
+  std::unique_ptr<FlightDataMessageReader> message_reader_;
   std::shared_ptr<ipc::RecordBatchStreamReader> batch_reader_;
 };
 
