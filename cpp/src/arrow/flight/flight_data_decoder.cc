@@ -101,8 +101,8 @@ class FlightDataMessageReader : public ipc::MessageReader {
 // RecordBatchStreamReader that reads through it: Open() takes a unique_ptr and
 // adopts it, so handing over the decoder's reader would free it on any failure
 // path (a malformed first message, a first message that is not a schema),
-// leaving the decoder with a dangling pointer. 
-// This forwards to the decoder's reader and stays owned by it.
+// leaving the decoder with a dangling pointer.  This forwards to the decoder's
+// reader and stays owned by it.
 class FlightDataMessageReaderRef final : public ipc::MessageReader {
  public:
   explicit FlightDataMessageReaderRef(FlightDataMessageReader* reader)
@@ -246,6 +246,16 @@ std::shared_ptr<Schema> AsyncFlightMessageDecoder::schema() const {
 
 AsyncFlightDataListener::AsyncFlightDataListener() = default;
 AsyncFlightDataListener::~AsyncFlightDataListener() = default;
+AsyncFlightDataWriter::~AsyncFlightDataWriter() = default;
+
+Status AsyncFlightDataWriter::WriteMetadata(const Buffer& app_metadata) {
+  if (transport_ == nullptr) {
+    return Status::Invalid(
+        "no upload in flight to write metadata to: the writer is only usable "
+        "while the upload's RPC is running");
+  }
+  return transport_->WriteMetadata(app_metadata);
+}
 
 namespace internal {
 
@@ -259,6 +269,10 @@ void FlightDataListenerTransport::Install(
   }
   std::lock_guard<std::mutex> lock(listener->transport_mutex_);
   listener->transport_ = transport;
+  if (listener->writer_ != nullptr) {
+    std::lock_guard<std::mutex> writer_lock(listener->writer_->writer_mutex_);
+    listener->writer_->transport_ = transport;
+  }
 }
 
 void FlightDataListenerTransport::Clear(
@@ -268,6 +282,10 @@ void FlightDataListenerTransport::Clear(
   }
   std::lock_guard<std::mutex> lock(listener->transport_mutex_);
   listener->transport_ = nullptr;
+  if (listener->writer_ != nullptr) {
+    std::lock_guard<std::mutex> writer_lock(listener->writer_->writer_mutex_);
+    listener->writer_->transport_ = nullptr;
+  }
 }
 
 Status FlightDataListenerTransport::ReportFinish(

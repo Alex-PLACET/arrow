@@ -51,6 +51,12 @@ class ARROW_FLIGHT_EXPORT FlightDataListenerTransport {
   /// \param status The status to finish the upload with.
   virtual void CancelUpload(Status status) = 0;
 
+  /// \brief Send one application metadata message to the client, from any thread.
+  /// \param app_metadata The metadata to attach to the next PutResult message.
+  /// \return OK when the message was handed to the transport, or a non-OK status
+  /// when the upload is already over.
+  virtual Status WriteMetadata(const Buffer& app_metadata) = 0;
+
   /// \brief Install `transport` on `listener` for the life of the RPC.
   /// \param listener The listener to install the transport on.
   /// \param transport The transport to install.
@@ -69,6 +75,37 @@ class ARROW_FLIGHT_EXPORT FlightDataListenerTransport {
 };
 
 }  // namespace internal
+
+/// \brief Sends application-specific metadata back to the client during an upload.
+///
+/// The async counterpart of FlightMetadataWriter: the transport hands one to the
+/// AsyncFlightDataListener at the start of an upload (AsyncFlightDataListener::writer) and
+/// it stays valid for as long as the upload's RPC runs.  Every call sends one
+/// PutResult message immediately; the client reads them with ReadMetadata() on
+/// its DoPutResult.
+class ARROW_FLIGHT_EXPORT AsyncFlightDataWriter {
+ public:
+  virtual ~AsyncFlightDataWriter();
+
+  /// \brief Send a metadata message to the client.
+  ///
+  /// Safe to call from any thread while the upload is in flight.  Once the
+  /// upload has ended the call reports the ending (Cancelled or FailedPrecondition)
+  /// instead of writing to a finished RPC.
+  /// \param app_metadata The application metadata to send.
+  /// \return Status indicating success or failure.
+  Status WriteMetadata(const Buffer& app_metadata);
+
+ private:
+  friend class internal::FlightDataListenerTransport;
+
+  /// The transport's RPC state; set and cleared through
+  /// FlightDataListenerTransport::Install/Clear, like AsyncFlightDataListener::transport_.
+  internal::FlightDataListenerTransport* transport_ = nullptr;
+  /// Guards transport_, since WriteMetadata may be called from any thread while
+  /// the transport installs or clears the pointer.
+  mutable std::mutex writer_mutex_;
+};
 
 /// \brief A general listener class to receive events from FlightMessageDecoder
 ///
@@ -103,6 +140,12 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
   /// \return A future that completes when the finish has been processed.
   virtual Future<> OnFinish(Status status) { return Future<>::MakeFinished(); }
 
+  /// \brief The writer for application metadata sent back to the client.
+  ///
+  /// Valid for as long as the upload's RPC is live (until OnFinish is reported).
+  /// Never null; calls after the upload ended report the ending instead of writing.
+  const std::shared_ptr<AsyncFlightDataWriter>& writer() const { return writer_; }
+
   /// \brief Cancel the upload with `status`, from any thread.
   ///
   /// Finishes the RPC with that status without waiting for the client to end
@@ -124,6 +167,9 @@ class ARROW_FLIGHT_EXPORT AsyncFlightDataListener : public ipc::Listener {
 
   /// Whether OnFinish was already reported.
   std::atomic<bool> finished_{false};
+
+  /// Never null: the listener may use it without waiting for OnDescriptor.
+  std::shared_ptr<AsyncFlightDataWriter> writer_ = std::make_shared<AsyncFlightDataWriter>();
 
   mutable std::mutex transport_mutex_;
   /// Not owned: the transport's own RPC state, valid until Clear().

@@ -581,6 +581,74 @@ class TestUploadServer : public AsyncGenericFlightServerBase {
   std::vector<std::shared_ptr<FinishRecordingListener>> listeners_;
 };
 
+/// A listener that acknowledges every batch it is handed with one application
+/// metadata message, the way an application reports per-chunk progress.
+class MetadataReplyingListener final : public AsyncFlightDataListener {
+ public:
+  arrow::Future<> OnNext(FlightStreamChunk chunk) override {
+    if (!chunk.data) {
+      return arrow::Future<>::MakeFinished();
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      batches_.push_back(chunk.data);
+      wrote_++;
+    }
+    const Status status = writer()->WriteMetadata(
+        *arrow::Buffer::FromString("ack " + std::to_string(chunk.data->num_rows()) +
+                                   " rows"));
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_write_ = status;
+    return arrow::Future<>::MakeFinished();
+  }
+
+  std::vector<std::shared_ptr<RecordBatch>> batches() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return batches_;
+  }
+  int wrote() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return wrote_;
+  }
+  Status last_write() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_write_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::shared_ptr<RecordBatch>> batches_;
+  int wrote_ = 0;
+  Status last_write_;
+};
+
+/// Hands out a MetadataReplyingListener for every upload.
+class MetadataReplyingUploadServer final : public AsyncGenericFlightServerBase {
+ public:
+  std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
+      const ServerCallContext&) override {
+    auto listener = std::make_shared<MetadataReplyingListener>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    listeners_.push_back(listener);
+    return listener;
+  }
+
+  std::shared_ptr<MetadataReplyingListener> WaitForListener() const {
+    for (int attempt = 0; attempt < 500; attempt++) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!listeners_.empty()) return listeners_[0];
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return nullptr;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::shared_ptr<MetadataReplyingListener>> listeners_;
+};
+
 // Middleware execution counts, shared between the factory, the middleware and
 // the test thread (all three touch it).
 struct MiddlewareTrace {
@@ -2157,6 +2225,52 @@ TEST(AsyncGrpcTest, DoPutListenerSeesCleanFinish) {
       << "unexpected finish status: " << flight_server.listener(0)->finish_status();
 }
 
+TEST(AsyncGrpcTest, DoPutWritesMetadataBackToTheClient) {
+  // The listener's writer() sends PutResult messages during the upload, the way
+  // the sync FlightMetadataWriter does: the client reads them back with
+  // ReadMetadata() between writes.
+  MetadataReplyingUploadServer flight_server;
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+
+  std::string uri = "grpc://localhost:" + std::to_string(flight_server.port());
+  ASSERT_OK_AND_ASSIGN(auto client_location, Location::Parse(uri));
+  ASSERT_OK_AND_ASSIGN(auto client, FlightClient::Connect(client_location));
+
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(
+      schema, 2, {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+
+  ASSERT_OK_AND_ASSIGN(auto put,
+                       client->DoPut(FlightDescriptor::Path({"metadata"}), schema));
+  auto& writer = *put.writer;
+  auto& reader = *put.reader;
+
+  // Write one batch, then read the acknowledgement the server sent for it.
+  ASSERT_OK(writer.WriteRecordBatch(*batch));
+  std::shared_ptr<Buffer> metadata;
+  ASSERT_OK(reader.ReadMetadata(&metadata));
+  ASSERT_NE(nullptr, metadata) << "the server's metadata never reached the client";
+  ASSERT_EQ("ack 2 rows", metadata->ToString());
+
+  // A second batch and its acknowledgement prove the channel survives a round.
+  ASSERT_OK(writer.WriteRecordBatch(*batch));
+  ASSERT_OK(reader.ReadMetadata(&metadata));
+  ASSERT_NE(nullptr, metadata);
+  ASSERT_EQ("ack 2 rows", metadata->ToString());
+
+  ASSERT_OK(writer.Close());
+  ASSERT_OK(client->Close());
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  auto listener = flight_server.WaitForListener();
+  ASSERT_NE(listener, nullptr) << "the server never handed out a DoPut listener";
+  ASSERT_EQ(2, listener->wrote()) << "every batch must have been acknowledged";
+  ASSERT_OK(listener->last_write()) << listener->last_write();
+}
+
 TEST(AsyncGrpcTest, DoPutCancelFromServerSideFinishesTheUpload) {
   // The server aborts the upload without waiting for the client: Cancel()
   // finishes the RPC with the given status, the client's write or Close
@@ -2405,8 +2519,14 @@ TEST(AsyncGrpcTest, DoPutClientCancelWhileListenerParkedStaysSafe) {
   auto batch = arrow::RecordBatch::Make(schema, 2,
                                         {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
 
+  // The deadline is what ends this RPC (the listener stays parked, so only the
+  // deadline can finish it), and DoPut writes the schema eagerly, so it must be
+  // long enough to survive the setup on a slow machine -- under valgrind the
+  // setup alone runs many seconds, and a tight deadline would fail in Begin()
+  // instead of reaching the case under test.  It is only ever waited out when
+  // the setup was fast, so the usual cost stays low.
   FlightCallOptions impatient;
-  impatient.timeout = std::chrono::milliseconds(600);
+  impatient.timeout = std::chrono::milliseconds(10000);
   auto put = client->DoPut(impatient, FlightDescriptor::Path({"late"}), schema);
   ASSERT_TRUE(put.ok()) << put.status();
   ASSERT_OK(put->writer->WriteRecordBatch(*batch));
@@ -2417,14 +2537,16 @@ TEST(AsyncGrpcTest, DoPutClientCancelWhileListenerParkedStaysSafe) {
     return listener != nullptr && listener->next_awaits_.load() >= 1;
   })) << "the listener never saw a chunk";
 
-  // Let the deadline finish the RPC while the listener is parked.
-  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
-  ARROW_UNUSED(put->writer->Close());
+  // Walk away: the client stops reading, so the server's write has nowhere to
+  // go and the RPC ends while the listener is still parked.  Wait for that to
+  // have happened rather than sleeping blindly, and fail clearly instead of
+  // reporting a vacuous pass if it did not.
   ASSERT_OK(client->Close());
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  ASSERT_TRUE(WaitFor([&listener] { return listener->finish_count() >= 1; }))
+      << "the RPC never ended; the listener is not the parked one from this upload";
 
-  // Now resolve the parked listener: the continuation runs on the finished
-  // RPC.  If the guard/hold were wrong, this is where the UAF lands.
+  // Now resolve the parked listener: the continuation runs on a finished RPC.
+  // If the guard/hold were wrong, this is where the UAF lands.
   listener->ResolvePending();
 
   ASSERT_OK(flight_server.Shutdown());
@@ -2433,6 +2555,77 @@ TEST(AsyncGrpcTest, DoPutClientCancelWhileListenerParkedStaysSafe) {
   // The upload had ended once, and the late resolution did not add a second
   // report or crash the reactor.
   ASSERT_EQ(1, listener->finish_count());
+
+  // Closing the writer after the RPC is gone must report a failure, not a
+  // silent success.
+  ASSERT_FALSE(put->writer->Close().ok());
+}
+
+TEST(AsyncGrpcTest, DoPutWithoutDescriptorOnFirstMessageIsRejected) {
+  // A client that starts an upload without a descriptor must be refused with
+  // the same status as the sync transport ("Descriptor missing on first
+  // message"): the listener must not hear a descriptor, and the upload must not
+  // be acknowledged as well formed.
+  TestFlightServer flight_server;
+  auto listener = std::make_shared<RecordingListener>();
+  flight_server.set_listener(listener);
+  ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
+  FlightServerOptions options(location);
+  ASSERT_OK(flight_server.Init(options));
+  ASSERT_GT(flight_server.port(), 0);
+
+  // Hand-build the first FlightData of a DoPut: the schema IPC message with no
+  // descriptor field at all.
+  auto schema = arrow::schema({arrow::field("a", arrow::int64())});
+  auto batch = arrow::RecordBatch::Make(schema, 2,
+                                        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2]")});
+  auto reader = arrow::RecordBatchReader::Make({batch}, schema).ValueOrDie();
+  RecordBatchStream stream(std::move(reader));
+  ASSERT_OK_AND_ASSIGN(auto schema_payload, stream.GetSchemaPayload());
+  schema_payload.descriptor = nullptr;
+
+  ::grpc::ByteBuffer request;
+  bool own_buffer = false;
+  ASSERT_TRUE(FlightDataSerialize(schema_payload, &request, &own_buffer).ok());
+
+  // Drive the bidi call through the raw generic stub: the regular FlightClient
+  // always sets the descriptor, which is exactly what this case lacks.
+  std::shared_ptr<::grpc::Channel> channel =
+      ::grpc::CreateChannel("127.0.0.1:" + std::to_string(flight_server.port()),
+                            ::grpc::InsecureChannelCredentials());
+  ::grpc::GenericStub stub(channel);
+  ::grpc::ClientContext context;
+  // Bound the call: were the descriptor ever accepted, the client would wait
+  // forever for an acknowledgement, turning a logic error into a hung suite.
+  context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+  ::grpc::CompletionQueue cq;
+  void* tag = nullptr;
+  bool ok = false;
+
+  auto call = stub.Call(&context, "/arrow.flight.protocol.FlightService/DoPut", &cq,
+                        reinterpret_cast<void*>(1));
+  ASSERT_NE(call, nullptr);
+  ASSERT_TRUE(cq.Next(&tag, &ok)) << "the call never started";
+
+  call->Write(request, reinterpret_cast<void*>(2));
+  ASSERT_TRUE(cq.Next(&tag, &ok)) << "the message was never written";
+
+  call->WritesDone(reinterpret_cast<void*>(3));
+  ASSERT_TRUE(cq.Next(&tag, &ok)) << "WritesDone never completed";
+
+  ::grpc::Status status;
+  call->Finish(&status, reinterpret_cast<void*>(4));
+  ASSERT_TRUE(cq.Next(&tag, &ok)) << "the call never finished";
+
+  EXPECT_FALSE(status.ok()) << "an upload without a descriptor must be refused";
+  EXPECT_THAT(status.error_message(), ::testing::HasSubstr("Descriptor missing"));
+
+  ASSERT_OK(flight_server.Shutdown());
+  ASSERT_OK(flight_server.Wait());
+
+  // The listener never saw a descriptor, and never saw the message as valid.
+  EXPECT_EQ(0, listener->descriptor_count());
+  EXPECT_EQ(0, listener->batches().size());
 }
 
 TEST(AsyncGrpcTest, UseAsyncGrpcFlagUploadRejectedOnDescriptor) {

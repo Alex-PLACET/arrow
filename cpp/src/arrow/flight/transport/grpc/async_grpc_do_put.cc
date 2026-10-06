@@ -17,6 +17,8 @@
 
 #include "arrow/flight/transport/grpc/async_grpc_service_internal.h"
 
+#include "arrow/flight/transport/grpc/customize_grpc.h"
+
 #include <memory>
 #include <utility>
 
@@ -46,11 +48,35 @@ class DoPutReactor : public AsyncReactorBase,
     ReleaseHold();
   }
 
+  Status WriteMetadata(const Buffer& app_metadata) override {
+    if (finished()) {
+      return Status::Invalid(
+          "the upload is over: WriteMetadata() is only usable while the "
+          "upload's RPC is running");
+    }
+    if (!ack_in_flight_) {
+      // One message in flight at a time: OnWriteDone serializes the PutResults.
+      return Status::Invalid(
+          "a PutResult message is already in flight: await it before writing "
+          "another metadata message");
+    }
+    ack_in_flight_ = false;
+    pb::PutResult pb_result;
+    if (app_metadata.size() > 0) {
+      pb_result.set_app_metadata(app_metadata.data(), app_metadata.size());
+    }
+    write_buf_ = MakeWriteBuffer(pb_result);
+    StartWrite(&write_buf_);
+    return Status::OK();
+  }
+
   void OnReadDone(bool ok) override {
     if (!ok) {
       if (finished()) {
         return;
       }
+      // The client half-closed: this ack ends the upload.
+      ending_ = true;
       pb::PutResult pb_result;
       write_buf_ = MakeWriteBuffer(pb_result);
       StartWrite(&write_buf_);
@@ -63,6 +89,25 @@ class DoPutReactor : public AsyncReactorBase,
           MakeFlightError(FlightStatusCode::Internal,
                           "Failed to wrap gRPC buffer: " + wrap_status.message()));
       return;
+    }
+
+    if (!read_descriptor_) {
+      // The first message must carry the descriptor of the upload, exactly as
+      // the sync transport requires ("Descriptor missing on first message").
+      // Without this the listener never hears OnDescriptor and the upload is
+      // acknowledged as if it were well formed.
+      read_descriptor_ = true;
+      internal::FlightData data;
+      const ::grpc::Status deserialized = FlightDataDeserialize(&request_buf_, &data);
+      if (!deserialized.ok()) {
+        FinishUpload(
+            MakeFlightError(FlightStatusCode::Internal, deserialized.error_message()));
+        return;
+      }
+      if (!data.descriptor) {
+        FinishUpload(Status::IOError("Descriptor missing on first message"));
+        return;
+      }
     }
 
     Future<> decode_status = decoder_.Consume(std::move(arrow_buf));
@@ -88,7 +133,11 @@ class DoPutReactor : public AsyncReactorBase,
       FinishUpload(MakeFlightError(FlightStatusCode::Internal, "Write failed"));
       return;
     }
-    FinishUpload(arrow::Status::OK());
+    if (ending_) {
+      FinishUpload(arrow::Status::OK());
+      return;
+    }
+    ack_in_flight_ = true;
   }
 
   void OnCancel() override {
@@ -114,6 +163,15 @@ class DoPutReactor : public AsyncReactorBase,
 
   std::shared_ptr<AsyncFlightDataListener> listener_;
   AsyncFlightMessageDecoder decoder_;
+  /// Whether the descriptor of the first message has been checked.
+  bool read_descriptor_ = false;
+  /// Whether a PutResult is on the wire.  At the start it is the empty ack the
+  /// transport owes the client; a mid-upload WriteMetadata claims it and
+  /// OnWriteDone releases it.
+  bool ack_in_flight_ = true;
+  /// Whether the write in flight is the ending ack (sent after the client
+  /// half-closed) rather than a mid-upload metadata message.
+  bool ending_ = false;
   ::grpc::ByteBuffer request_buf_;
   ::grpc::ByteBuffer write_buf_;
 };
