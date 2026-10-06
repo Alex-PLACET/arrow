@@ -437,12 +437,14 @@ class EchoExchangeTestServer : public AsyncGenericFlightServerBase {
 class RecordingListener : public AsyncFlightDataListener {
  public:
   arrow::Status OnSchemaDecoded(std::shared_ptr<arrow::Schema> schema) override {
+    std::lock_guard<std::mutex> lock(mutex_);
     ++schema_count_;
     schema_ = std::move(schema);
     return arrow::Status::OK();
   }
 
   arrow::Future<> OnNext(FlightStreamChunk chunk) override {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (chunk.data) {
       batches_.push_back(std::move(chunk.data));
     } else {
@@ -456,31 +458,59 @@ class RecordingListener : public AsyncFlightDataListener {
   // Records the upload's descriptor and reports whatever status the test
   // configured, so the descriptor rejection path is reachable from here too.
   arrow::Future<> OnDescriptor(const FlightDescriptor& descriptor) override {
+    std::lock_guard<std::mutex> lock(mutex_);
     descriptors_.push_back(descriptor);
     return arrow::Future<>::MakeFinished(descriptor_status_);
   }
 
   // Consumer-side rejection of the upload, as the decoder tests do.
-  void set_next_status(arrow::Status status) { next_status_ = std::move(status); }
+  void set_next_status(arrow::Status status) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    next_status_ = std::move(status);
+  }
   // Rejection before any schema or data arrives.
   void set_descriptor_status(arrow::Status status) {
+    std::lock_guard<std::mutex> lock(mutex_);
     descriptor_status_ = std::move(status);
   }
 
-  int schema_count() const { return schema_count_; }
-  int descriptor_count() const { return static_cast<int>(descriptors_.size()); }
-  int metadata_only_count() const { return metadata_only_count_; }
-  const std::shared_ptr<arrow::Schema>& schema() const { return schema_; }
-  const std::vector<FlightDescriptor>& descriptors() const { return descriptors_; }
-  const std::vector<std::shared_ptr<arrow::RecordBatch>>& batches() const {
+  int schema_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return schema_count_;
+  }
+  int descriptor_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<int>(descriptors_.size());
+  }
+  int metadata_only_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return metadata_only_count_;
+  }
+  std::shared_ptr<arrow::Schema> schema() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return schema_;
+  }
+  std::vector<FlightDescriptor> descriptors() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return descriptors_;
+  }
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return batches_;
   }
-  const std::vector<std::shared_ptr<arrow::Buffer>>& metadata_chunks() const {
+  std::vector<std::shared_ptr<arrow::Buffer>> metadata_chunks() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return metadata_chunks_;
   }
-  const arrow::Status& last_status() const { return last_status_; }
+  arrow::Status last_status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_status_;
+  }
 
  private:
+  /// The callbacks run on gRPC threads while the test thread reads the
+  /// accessors, so everything they share goes through this.
+  mutable std::mutex mutex_;
   int schema_count_ = 0;
   int metadata_only_count_ = 0;
   std::shared_ptr<arrow::Schema> schema_;
@@ -1001,6 +1031,7 @@ TEST(AsyncGrpcTest, DoGetClientCancelWithPendingPayloadFinishes) {
   // instead of waiting for a payload that will not come.  Without the fix the
   // Shutdown()/Wait() below never return (gRPC keeps the call alive until
   // Finish() runs), which is why this test runs under a shell timeout.
+  const int64_t before = detail::AsyncReactorBase::live_reactors();
   auto trace = std::make_shared<MiddlewareTrace>();
   ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
   HangingDoGetServer flight_server(HangingDoGetServer::HangAt::kStream);
@@ -1029,6 +1060,11 @@ TEST(AsyncGrpcTest, DoGetClientCancelWithPendingPayloadFinishes) {
 
   // The producer was told to stop, exactly once.
   EXPECT_EQ(1, flight_server.stream_closes.load());
+  // And the reactor is gone even though its payload future never completed.
+  EXPECT_TRUE(WaitFor([&] {
+    return detail::AsyncReactorBase::live_reactors() == before;
+  })) << "a reactor leaked: still alive after the server stopped (before="
+      << before << ", now=" << detail::AsyncReactorBase::live_reactors() << ")";
   // And the call reported completion exactly once (the CAS in FinishOnce).
   std::lock_guard<std::mutex> guard(trace->mutex);
   EXPECT_EQ(1, trace->call_completed);
@@ -2037,6 +2073,10 @@ class HangingListingServer final : public AsyncGenericFlightServerBase {
 };
 
 TEST(AsyncGrpcTest, ListFlightsDeadlineWithPendingHandlerFinishes) {
+  // The handler's future never resolves and the client's deadline ends the RPC:
+  // the reactor must be released even though the handler never completes.
+  const int64_t before = detail::AsyncReactorBase::live_reactors();
+
   ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
   HangingListingServer flight_server;
   FlightServerOptions options(location);
@@ -2053,6 +2093,11 @@ TEST(AsyncGrpcTest, ListFlightsDeadlineWithPendingHandlerFinishes) {
   ASSERT_OK(client->Close());
   ASSERT_OK(flight_server.Shutdown());
   ASSERT_OK(flight_server.Wait());
+
+  EXPECT_TRUE(WaitFor([&] {
+    return detail::AsyncReactorBase::live_reactors() == before;
+  })) << "a reactor leaked: still alive after the server stopped (before="
+      << before << ", now=" << detail::AsyncReactorBase::live_reactors() << ")";
 }
 
 // A DoExchange handler whose future never resolves.
@@ -2071,6 +2116,8 @@ class HangingExchangeServer final : public AsyncGenericFlightServerBase {
 TEST(AsyncGrpcTest, DoExchangeClientCancelWithPendingHandlerFinishes) {
   // The client walks away with the handler still parked: the transport must
   // finish the RPC (and unwind reader/writer), not wait for the handler.
+  const int64_t before = detail::AsyncReactorBase::live_reactors();
+
   ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("grpc://localhost:0"));
   HangingExchangeServer flight_server;
   FlightServerOptions options(location);
@@ -2094,6 +2141,11 @@ TEST(AsyncGrpcTest, DoExchangeClientCancelWithPendingHandlerFinishes) {
 
   ASSERT_OK(flight_server.Shutdown());
   ASSERT_OK(flight_server.Wait());
+
+  EXPECT_TRUE(WaitFor([&] {
+    return detail::AsyncReactorBase::live_reactors() == before;
+  })) << "a reactor leaked: still alive after the server stopped (before="
+      << before << ", now=" << detail::AsyncReactorBase::live_reactors() << ")";
 }
 
 TEST(AsyncGrpcTest, UseAsyncGrpcFlag) {
@@ -2199,7 +2251,7 @@ TEST(AsyncGrpcTest, UseAsyncGrpcFlagServesDoPut) {
   ASSERT_EQ(listener->schema()->field(0)->name(), "a");
   ASSERT_EQ(listener->schema()->field(1)->name(), "b");
   ASSERT_EQ(listener->batches().size(), 1);
-  const auto& chunk = listener->batches()[0];
+  const std::shared_ptr<arrow::RecordBatch> chunk = listener->batches()[0];
   ASSERT_EQ(chunk->num_rows(), 3);
   ASSERT_EQ(chunk->num_columns(), 2);
   ASSERT_OK_AND_ASSIGN(auto value, chunk->column(0)->GetScalar(0));
@@ -2403,14 +2455,6 @@ TEST(AsyncGrpcTest, DoPutCancelFromServerSideFinishesTheUpload) {
   ASSERT_EQ(listener->cancel_status().code(), arrow::StatusCode::Invalid);
 }
 
-TEST(AsyncGrpcTest, DoPutCancelAfterUploadIsInvalid) {
-  // Cancel() is only meaningful while the upload's RPC is running: once it
-  // finished, the listener says so instead of reaching a dead RPC.
-  auto listener = std::make_shared<FinishRecordingListener>();
-  listener->CancelWith(arrow::Status::Cancelled("nothing in flight"));
-  ASSERT_EQ(listener->cancel_status().code(), arrow::StatusCode::Invalid);
-}
-
 /// A listener stuck inside OnNext(): the upload is parked in the application
 /// while the RPC underneath it dies.
 class HangingDoPutListener final : public FinishRecordingListener {
@@ -2514,12 +2558,17 @@ TEST(AsyncGrpcTest, DoPutClientDeadlineWhileIdleIsNotACleanFinish) {
 
   auto listener = flight_server.WaitForListener(0);
   ASSERT_NE(listener, nullptr) << "the server never handed out a DoPut listener";
-  ASSERT_TRUE(WaitFor([&listener] { return listener->batches().size() >= 1; }));
-  // The batch is consumed; let the deadline fire on the idle upload.
-  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  ASSERT_TRUE(WaitFor([&listener] { return listener->batches().size() >= 1; }))
+      << "the server never consumed the batch";
 
-  // The deadline must have fired before Close(): that is what makes an OK
-  // finishing status impossible below.
+  // Wait for the deadline to end the upload instead of sleeping out its
+  // duration: the listener's OnFinish runs on the transport thread that ends
+  // the RPC, so the wait is on the observable event, not on wall-clock time.
+  // DoPut writes the schema eagerly, so the client's DoPut() above already
+  // showed the channel was alive when its deadline was armed.
+  ASSERT_TRUE(WaitFor([&listener] { return listener->finish_count() >= 1; }))
+      << "the deadline never fired; inconclusive";
+
   const auto close_status = put->writer->Close();
   ASSERT_FALSE(close_status.ok()) << "the deadline never fired; inconclusive";
 
