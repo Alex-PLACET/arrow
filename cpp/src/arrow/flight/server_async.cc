@@ -58,23 +58,17 @@ Status AsyncFlightServerBase::SetShutdownOnSignals(const std::vector<int> sigs) 
 }
 
 Status AsyncFlightServerBase::Serve() {
+  if (!impl_->transport_) {
+    return Status::UnknownError("Async Flight server did not start properly");
+  }
   return impl_->signal_state_.Serve(
-      [this]() -> Status {
-        if (!impl_->transport_) {
-          return Status::UnknownError("Async Flight server did not start properly");
-        }
-        return impl_->transport_->Wait();
-      },
+      [this]() -> Status { return impl_->transport_->Wait(); },
       [this](const std::chrono::system_clock::time_point* deadline) -> Status {
-        if (!impl_->transport_) {
-          return Status::Invalid("Shutdown() on uninitialized AsyncFlightServerBase");
-        }
         if (deadline) {
           return impl_->transport_->Shutdown(*deadline);
         }
         return impl_->transport_->Shutdown();
       },
-      "Async Flight server did not start properly",
       "Error shutting down async Flight server");
 }
 
@@ -82,11 +76,11 @@ int AsyncFlightServerBase::GotSignal() const { return impl_->signal_state_.GotSi
 
 Status AsyncFlightServerBase::Shutdown(
     const std::chrono::system_clock::time_point* deadline) {
+  if (!impl_->transport_) {
+    return Status::Invalid("Shutdown() on uninitialized AsyncFlightServerBase");
+  }
   return impl_->signal_state_.Shutdown(
       [this](const std::chrono::system_clock::time_point* maybe_deadline) -> Status {
-        if (!impl_->transport_) {
-          return Status::Invalid("Shutdown() on uninitialized AsyncFlightServerBase");
-        }
         if (maybe_deadline) {
           return impl_->transport_->Shutdown(*maybe_deadline);
         }

@@ -240,6 +240,7 @@ class GrpcServiceHandler final : public FlightService::Service {
 
     std::unique_ptr<FlightInfo> info;
     auto res = impl_->base()->GetFlightInfo(flight_context, descr, &info);
+    helper_.AddMiddlewareHeaders(context, &flight_context);
     SERVICE_RETURN_NOT_OK(flight_context, res);
 
     if (!info) {
