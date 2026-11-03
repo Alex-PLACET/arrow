@@ -15,28 +15,82 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import functools
 import ctypes
+import functools
 import os
 
-import numba as nb
 from numba import types as nbt
-from numba import extending as nbext
 from numba.core import cgutils
-from numba.core.typing.templates import (
-    AttributeTemplate, AttributeTemplate, signature)
-from numba.core.datamodel.models import StructModel
 
 import llvmlite.binding
 from llvmlite import ir
 
 import pyarrow as pa
 
+from ._capsule import no_protocol as _no_protocol
+
+
+def array_from(obj):
+    """A ``pa.Array`` for *obj*, through the Arrow PyCapsule interface.
+
+    Zero copy: the capsules hand over the producer's buffers. Producers that
+    only implement ``__arrow_c_stream__`` (polars, duckdb) are read as a
+    one-column table; a single-chunk column keeps the buffers.
+    """
+    if isinstance(obj, pa.Array):
+        return obj
+    export = getattr(obj, "__arrow_c_array__", None)
+    if export is not None:
+        return pa.Array._import_from_c_capsule(*export())
+    if hasattr(obj, "__arrow_c_stream__"):
+        # a stream of record batches (duckdb) or of arrays (polars); both
+        # import zero copy, but combine_chunks() copies even for one chunk
+        try:
+            chunked = pa.chunked_array(obj)
+        except pa.ArrowInvalid:
+            chunked = pa.table(obj).column(0)
+        if chunked.num_chunks == 0:
+            return pa.array([], type=chunked.type)
+        array = (chunked.chunk(0) if chunked.num_chunks == 1
+                 else chunked.combine_chunks())
+        if pa.types.is_struct(array.type):
+            # a record-batch stream: one struct array, one column
+            array = array.field(0)
+        return array
+    raise _no_protocol(obj)
+
+
+def _is_var_width(ty):
+    """True for string/binary types: elements are views, not scalars."""
+    return (pa.types.is_string(ty) or pa.types.is_large_string(ty)
+            or pa.types.is_binary(ty) or pa.types.is_large_binary(ty)
+            or pa.types.is_fixed_size_binary(ty))
+
 
 def _arrow_type_to_nb_type(ty):
     if pa.types.is_signed_integer(ty):
         return nbt.Integer(str(ty), bitwidth=ty.bit_width, signed=True)
+    if pa.types.is_unsigned_integer(ty):
+        return nbt.Integer(str(ty), bitwidth=ty.bit_width, signed=False)
+    if pa.types.is_float32(ty):
+        return nbt.float32
+    if pa.types.is_float64(ty):
+        return nbt.float64
+    if _is_var_width(ty):
+        # element reads go through StringViewType, there is no scalar type
+        return nbt.uint8
+    if pa.types.is_decimal(ty) and ty.bit_width == 128:
+        # (high, low) of the 128-bit two's complement integer, exact;
+        # use decimal_to_float() when a double is what you want
+        return nbt.Tuple((nbt.int64, nbt.uint64))
+    # temporal types are their storage integers: no unit conversion here
+    if pa.types.is_date32(ty) or pa.types.is_time32(ty):
+        return nbt.int32
+    if (pa.types.is_date64(ty) or pa.types.is_time64(ty)
+            or pa.types.is_timestamp(ty) or pa.types.is_duration(ty)):
+        return nbt.int64
     if pa.types.is_boolean(ty):
+        # bit-packed values: readable as validity, not as elements
         return nbt.boolean
     raise TypeError(f'Unsupported PyArrow type {ty}')
 
@@ -46,7 +100,8 @@ def _arrow_type_to_nb_type(ty):
 # void PyArrow_PoolBufferDestroy(PyArrow_PoolBufferPtr buf);
 # int32_t PyArrow_MakeAndExportArray(int64_t length, int64_t null_count,
 #                                    int32_t num_buffers,
-#                                    PyArrow_PoolBufferPtr* buffer_ptrs, ArrowArray* out)
+#                                    PyArrow_PoolBufferPtr* buffer_ptrs,
+#                                    ArrowArray* out)
 # void PyArrow_ReleaseArray(ArrowArray* array);
 
 

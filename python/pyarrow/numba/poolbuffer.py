@@ -15,21 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from contextlib import ExitStack
-import functools
-import operator
-import os
-
-import numba as nb
 from numba import types as nbt
 from numba import extending as nbext
 from numba.core import cgutils
 from numba.core.typing.templates import (
-    AttributeTemplate, AttributeTemplate, infer_getattr, signature, bound_function)
-from numba.core.datamodel.models import StructModel
-
-import llvmlite.binding
-from llvmlite import ir
+    AttributeTemplate, bound_function, infer_getattr, signature)
 
 import pyarrow as pa
 from ._utils import _arrow_type_to_nb_type, get_pyarrow_cpp_func, int64_t
@@ -69,7 +59,7 @@ class BooleanBufferBuilder:
 class PoolBufferType(nbt.Type):
 
     def __init__(self):
-        super().__init__(name=f'PoolBuffer')
+        super().__init__(name='PoolBuffer')
 
 
 # XXX only needed for pure Python
@@ -97,7 +87,7 @@ class TypedBufferBuilderType(nbt.Type):
 
 # XXX only needed for pure Python
 @nbext.typeof_impl.register(TypedBufferBuilder)
-def typeof_buffer(val, c):
+def typeof_typed_buffer_builder(val, c):
     assert isinstance(val, TypedBufferBuilder)
     return TypedBufferBuilderType(val.value_type)
 
@@ -200,14 +190,18 @@ def _pool_buffer_reserve_or_resize_ll(context, builder, func_name, pool_buffer_t
     builder.call(fn, [pool_buffer.cpp_ptr, size_or_capacity])
 
 
-def pool_buffer_reserve_ll(context, builder, pool_buffer_ty, pool_buffer, capacity):
-    return _pool_buffer_reserve_or_resize_ll(context, builder, 'PyArrow_PoolBufferReserve',
-                                             pool_buffer_ty, pool_buffer, capacity)
+def pool_buffer_reserve_ll(context, builder, pool_buffer_ty, pool_buffer,
+                           capacity):
+    return _pool_buffer_reserve_or_resize_ll(
+        context, builder, 'PyArrow_PoolBufferReserve',
+        pool_buffer_ty, pool_buffer, capacity)
 
 
-def pool_buffer_resize_exactly_ll(context, builder, pool_buffer_ty, pool_buffer, capacity):
-    return _pool_buffer_reserve_or_resize_ll(context, builder, 'PyArrow_PoolBufferResizeExactly',
-                                             pool_buffer_ty, pool_buffer, capacity)
+def pool_buffer_resize_exactly_ll(context, builder, pool_buffer_ty,
+                                  pool_buffer, capacity):
+    return _pool_buffer_reserve_or_resize_ll(
+        context, builder, 'PyArrow_PoolBufferResizeExactly',
+        pool_buffer_ty, pool_buffer, capacity)
 
 
 @nbext.intrinsic
@@ -228,7 +222,8 @@ def pool_buffer_reserve_impl(typingctx, pool_buffer_type, capacity_type):
 
     def codegen(context, builder, signature, args):
         # TODO handle errors
-        return pool_buffer_reserve_ll(context, builder, pool_buffer_type, args[0], *args[1:])
+        return pool_buffer_reserve_ll(
+            context, builder, pool_buffer_type, args[0], *args[1:])
 
     return sig, codegen
 
@@ -306,7 +301,7 @@ def pool_buffer_size(pool_buffer):
 
 
 @nbext.overload_attribute(PoolBufferType, 'capacity')
-def pool_buffer_size(pool_buffer):
+def pool_buffer_capacity(pool_buffer):
     def get(pool_buffer):
         return pool_buffer_get_capa(pool_buffer)
     return get
@@ -369,7 +364,8 @@ def typed_buffer_builder_ctor(context, builder, sig, args):
     return typed_buffer_builder_ctor_ll(context, builder, sig.return_type)
 
 
-def typed_buffer_builder_finish_ll(context, builder, buffer_builder_type, buffer_builder):
+def typed_buffer_builder_finish_ll(context, builder, buffer_builder_type,
+                                   buffer_builder):
     value_type = buffer_builder_type.arrow_type
     buffer_builder = context.make_helper(
         builder, buffer_builder_type, value=buffer_builder)
@@ -385,6 +381,18 @@ def typed_buffer_builder_finish(context, builder, sig, args):
     return typed_buffer_builder_finish_ll(context, builder, sig.args[0], args[0])
 
 
+def grow_ll(context, builder, value_type, buffer_builder, new_capa):
+    """Reserve *new_capa* items and publish the pool buffer's new state."""
+    new_byte_capacity = get_byte_capacity(context, builder, value_type, new_capa)
+    pool_buffer_reserve_ll(context, builder, PoolBufferType(),
+                           buffer_builder.pool_buffer, new_byte_capacity)
+    _, new_capa, new_data = pool_buffer_get_properties(
+        context, builder, PoolBufferType(), buffer_builder.pool_buffer)
+    builder.store(get_item_capacity(context, builder, value_type, new_capa),
+                  buffer_builder.capacity_ptr)
+    builder.store(new_data, buffer_builder.data_ptr_ptr)
+
+
 @nbext.lower_builtin('TypedBufferBuilder.reserve', TypedBufferBuilderType, nbt.int64)
 def typed_buffer_builder_reserve(context, builder, sig, args):
     buffer_builder_type = sig.args[0]
@@ -395,15 +403,7 @@ def typed_buffer_builder_reserve(context, builder, sig, args):
     additional_capa = args[1]
     new_capa = builder.add(current_size, additional_capa)
 
-    # XXX should factor this out (see append below)
-    new_byte_capacity = get_byte_capacity(context, builder, value_type, new_capa)
-    pool_buffer_reserve_ll(
-        context, builder, PoolBufferType(), buffer_builder.pool_buffer, new_byte_capacity)
-    _, new_capa, new_data = pool_buffer_get_properties(
-        context, builder, PoolBufferType(), buffer_builder.pool_buffer)
-    builder.store(get_item_capacity(context, builder, value_type,
-                  new_capa), buffer_builder.capacity_ptr)
-    builder.store(new_data, buffer_builder.data_ptr_ptr)
+    grow_ll(context, builder, value_type, buffer_builder, new_capa)
 
 
 @nbext.lower_builtin('TypedBufferBuilder.append', TypedBufferBuilderType, nbt.Any)
@@ -413,7 +413,6 @@ def typed_buffer_builder_append(context, builder, sig, args):
 
     buffer_builder = context.make_helper(builder, sig.args[0], value=args[0])
     data_value = args[1]
-    sizeof_value = context.get_abi_sizeof(data_value.type)
 
     index = builder.load(buffer_builder.index_ptr)
     index_plus_one = builder.add(index, index.type(1))
@@ -421,18 +420,10 @@ def typed_buffer_builder_append(context, builder, sig, args):
 
     needed_capa = index_plus_one
     not_enough_capa = builder.icmp_signed('<', capa, needed_capa)
-    with builder.if_then(not_enough_capa, likely=False) as then_block:
-        # XXX check growth heuristic
-        new_capa = builder.mul(needed_capa, capa.type(2))
-        new_byte_capacity = get_byte_capacity(context, builder, value_type, new_capa)
-        # TODO: for booleans, should ensure the additional buffer bytes are zeroed
-        pool_buffer_reserve_ll(
-            context, builder, PoolBufferType(), buffer_builder.pool_buffer, new_byte_capacity)
-        _, new_capa, new_data = pool_buffer_get_properties(
-            context, builder, PoolBufferType(), buffer_builder.pool_buffer)
-        builder.store(get_item_capacity(context, builder, value_type,
-                      new_capa), buffer_builder.capacity_ptr)
-        builder.store(new_data, buffer_builder.data_ptr_ptr)
+    with builder.if_then(not_enough_capa, likely=False):
+        # ponytail: doubling growth, one realloc per doubling
+        grow_ll(context, builder, value_type, buffer_builder,
+                builder.mul(needed_capa, capa.type(2)))
 
     data = builder.load(buffer_builder.data_ptr_ptr)
     # TODO make data_ptr_ptr the right pointer type?
@@ -451,31 +442,3 @@ def typed_buffer_builder_append(context, builder, sig, args):
         append_ptr = builder.gep(data, [index])
         builder.store(data_value, append_ptr)
     builder.store(index_plus_one, buffer_builder.index_ptr)
-
-
-# @functools.cache
-# def typed_buffer_builder_ctor_impl(value_type):
-#     result_type = TypedBufferBuilderType(value_type)
-#     sig = result_type()
-#
-#     @nbext.intrinsic
-#     def impl(typingctx):
-#         def codegen(context, builder, signature, args):
-#             buffer_builder = context.make_helper(builder, result_type)
-#             buffer_builder.pool_buffer = pool_buffer_allocate_ll(
-#                 context, builder, PoolBufferType())
-#             zero = context.get_constant(nbt.int64, 0)
-#             buffer_builder.index_ptr = cgutils.alloca_once_value(builder, zero)
-#             return buffer_builder._getvalue()
-#         return sig, codegen
-#
-#     return impl
-#
-#
-# @nbext.overload(Int64BufferBuilder)
-# def int64_buffer_builder_ctor():
-#     wrapped_impl = typed_buffer_builder_ctor_impl(pa.int64())
-#
-#     def impl():
-#         return wrapped_impl()
-#     return impl

@@ -15,27 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from contextlib import ExitStack
-import functools
-import operator
-import os
-
-import numba as nb
 from numba import types as nbt
 from numba import extending as nbext
 from numba.core import cgutils
 from numba.core.typing.templates import (
-    AttributeTemplate, AttributeTemplate, infer_getattr, signature, bound_function)
-from numba.core.datamodel.models import StructModel
-
-import llvmlite.binding
-from llvmlite import ir
+    AttributeTemplate, bound_function, infer_getattr, signature)
 
 import pyarrow as pa
-from ._utils import _arrow_type_to_nb_type, int64_t, get_pyarrow_cpp_func
+from ._utils import _arrow_type_to_nb_type, get_pyarrow_cpp_func
 from .array import PyArrowArrayType
-from .poolbuffer import (PoolBufferType, TypedBufferBuilderType, BooleanBufferBuilder, Int64BufferBuilder,
-                         typed_buffer_builder_ctor_ll, typed_buffer_builder_finish_ll)
+from .poolbuffer import (PoolBufferType, TypedBufferBuilderType,
+                         typed_buffer_builder_ctor_ll,
+                         typed_buffer_builder_finish_ll)
 
 #
 # 0. Pure Python
@@ -44,14 +35,66 @@ from .poolbuffer import (PoolBufferType, TypedBufferBuilderType, BooleanBufferBu
 
 class ArrayBuilder:
     def __init__(self, value_type):
-        if not pa.types.is_integer(value_type) and not pa.types.is_boolean(value_type):
+        if (not pa.types.is_integer(value_type)
+                and not pa.types.is_floating(value_type)
+                and not pa.types.is_boolean(value_type)):
             raise TypeError(f'Cannot create ArrayBuilder for {value_type}')
         self.value_type = value_type
+
+
+class Int8Builder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.int8())
+
+
+class Int16Builder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.int16())
+
+
+class Int32Builder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.int32())
 
 
 class Int64Builder(ArrayBuilder):
     def __init__(self):
         super().__init__(pa.int64())
+
+
+class UInt8Builder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.uint8())
+
+
+class UInt16Builder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.uint16())
+
+
+class UInt32Builder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.uint32())
+
+
+class UInt64Builder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.uint64())
+
+
+class Float32Builder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.float32())
+
+
+class Float64Builder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.float64())
+
+
+class BoolBuilder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.bool_())
 
 
 #
@@ -81,11 +124,25 @@ def typeof_builder(val, c):
 
 
 # TODO rework this once PyArrow types such as Int64Type are Numba-typed
-@nbext.type_callable(Int64Builder)
-def type_int64_builder(context):
-    def typer():
-        return ArrayBuilderType(pa.int64())
-    return typer
+def _builder_typer(arrow_type):
+    def type_callable(context):
+        def typer():
+            return ArrayBuilderType(arrow_type)
+        return typer
+    return type_callable
+
+
+_BUILDERS :  = (
+    (Int8Builder, pa.int8()), (Int16Builder, pa.int16()),
+    (Int32Builder, pa.int32()), (Int64Builder, pa.int64()),
+    (UInt8Builder, pa.uint8()), (UInt16Builder, pa.uint16()),
+    (UInt32Builder, pa.uint32()), (UInt64Builder, pa.uint64()),
+    (Float32Builder, pa.float32()), (Float64Builder, pa.float64()),
+    (BoolBuilder, pa.bool_()),
+)
+
+for _builder_cls, _arrow_type in _BUILDERS:
+    nbext.type_callable(_builder_cls)(_builder_typer(_arrow_type))
 
 
 @infer_getattr
@@ -125,7 +182,6 @@ nbext.make_attribute_wrapper(
 nbext.make_attribute_wrapper(ArrayBuilderType, 'data_builder', 'data_builder')
 
 
-@nbext.lower_builtin(Int64Builder)
 # XXX high-level extending API + @intrinsic doesn't work for this
 # because of recursively embedded EphemeralPointer, report Numba bug?
 def builder_ctor(context, builder, sig, args):
@@ -139,6 +195,10 @@ def builder_ctor(context, builder, sig, args):
     array_builder.null_count_ptr = cgutils.alloca_once_value(builder, zero)
 
     return array_builder._getvalue()
+
+
+for _builder_cls, _ in _BUILDERS:
+    nbext.lower_builtin(_builder_cls)(builder_ctor)
 
 
 @nbext.intrinsic
@@ -158,9 +218,18 @@ def builder_increment_null_count(typingctx, array_builder):
 @nbext.overload_method(ArrayBuilderType, 'append')
 def builder_append(builder, value):
     if value == nbt.none:
+        # the data buffer still needs a placeholder of its own type
+        element = builder.numba_type
+        if isinstance(element, nbt.Float):
+            zero = 0.0
+        elif element == nbt.boolean:
+            zero = False
+        else:
+            zero = 0
+
         def append_impl(builder, value):
             builder.null_bitmap_builder.append(False)
-            builder.data_builder.append(0)
+            builder.data_builder.append(zero)
             builder_increment_null_count(builder)
         return append_impl
     else:
@@ -183,19 +252,17 @@ def builder_finish(context, builder, sig, args):
     value_type = sig.args[0].arrow_type
     array_builder = context.make_helper(builder, sig.args[0], value=args[0])
 
+    null_bitmap_type = TypedBufferBuilderType(pa.bool_())
     length = builder.load(context.make_helper(
-        builder, TypedBufferBuilderType(pa.bool_()), value=array_builder.null_bitmap_builder)
-        .index_ptr)
+        builder, null_bitmap_type,
+        value=array_builder.null_bitmap_builder).index_ptr)
     null_count = builder.load(array_builder.null_count_ptr)
 
-    null_bitmap_buffer = typed_buffer_builder_finish_ll(context, builder,
-                                                        TypedBufferBuilderType(
-                                                            pa.bool_()),
-                                                        array_builder.null_bitmap_builder)
-    data_buffer = typed_buffer_builder_finish_ll(context, builder,
-                                                 TypedBufferBuilderType(
-                                                     value_type),
-                                                 array_builder.data_builder)
+    null_bitmap_buffer = typed_buffer_builder_finish_ll(
+        context, builder, null_bitmap_type, array_builder.null_bitmap_builder)
+    data_buffer = typed_buffer_builder_finish_ll(
+        context, builder, TypedBufferBuilderType(value_type),
+        array_builder.data_builder)
 
     def get_buffer_ptr(pool_buffer):
         pool_buffer = context.make_helper(builder, PoolBufferType(), value=pool_buffer)
@@ -213,6 +280,12 @@ def builder_finish(context, builder, sig, args):
     out_array_ptr = builder.bitcast(out_array._getpointer(), cgutils.voidptr_t)
 
     fn = get_pyarrow_cpp_func(builder, 'PyArrow_MakeAndExportArray')
-    # TODO handle errors
-    builder.call(fn, [length, null_count, num_buffers, buffer_ptrs, out_array_ptr])
+    status = builder.call(
+        fn, [length, null_count, num_buffers, buffer_ptrs, out_array_ptr])
+    # the helper returns the Arrow status as a signed int: negative is an error
+    # and leaves a Python exception set
+    with builder.if_then(builder.icmp_signed('<', status, status.type(0))):
+        context.call_conv.return_user_exc(
+            builder, RuntimeError,
+            ("failed to export the Arrow array",))
     return out_array._getvalue()
