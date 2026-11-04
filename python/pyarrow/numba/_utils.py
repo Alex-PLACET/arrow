@@ -15,22 +15,24 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import annotations
+
 import ctypes
 import functools
 import os
 
+import llvmlite.binding
+from llvmlite import ir
 from numba import types as nbt
 from numba.core import cgutils
 
-import llvmlite.binding
-from llvmlite import ir
-
 import pyarrow as pa
 
+from ._capsule import _protocol_of
 from ._capsule import no_protocol as _no_protocol
 
 
-def array_from(obj):
+def array_from(obj: object) -> pa.Array:
     """A ``pa.Array`` for *obj*, through the Arrow PyCapsule interface.
 
     Zero copy: the capsules hand over the producer's buffers. Producers that
@@ -39,10 +41,10 @@ def array_from(obj):
     """
     if isinstance(obj, pa.Array):
         return obj
-    export = getattr(obj, "__arrow_c_array__", None)
-    if export is not None:
-        return pa.Array._import_from_c_capsule(*export())
-    if hasattr(obj, "__arrow_c_stream__"):
+    protocol = _protocol_of(obj)
+    if protocol == "__arrow_c_array__":
+        return pa.Array._import_from_c_capsule(*getattr(obj, protocol)())
+    if protocol is not None:
         # a stream of record batches (duckdb) or of arrays (polars); both
         # import zero copy, but combine_chunks() copies even for one chunk
         try:
@@ -60,14 +62,14 @@ def array_from(obj):
     raise _no_protocol(obj)
 
 
-def _is_var_width(ty):
+def _is_var_width(ty: pa.DataType) -> bool:
     """True for string/binary types: elements are views, not scalars."""
     return (pa.types.is_string(ty) or pa.types.is_large_string(ty)
             or pa.types.is_binary(ty) or pa.types.is_large_binary(ty)
             or pa.types.is_fixed_size_binary(ty))
 
 
-def _arrow_type_to_nb_type(ty):
+def _arrow_type_to_nb_type(ty: pa.DataType) -> nbt.Type:
     if pa.types.is_signed_integer(ty):
         return nbt.Integer(str(ty), bitwidth=ty.bit_width, signed=True)
     if pa.types.is_unsigned_integer(ty):
@@ -94,16 +96,6 @@ def _arrow_type_to_nb_type(ty):
         return nbt.boolean
     raise TypeError(f'Unsupported PyArrow type {ty}')
 
-# PyArrow_PoolBufferPtr PyArrow_AllocatePoolBuffer(int64_t size);
-# int32_t PyArrow_PoolBufferReserve(PyArrow_PoolBufferPtr buf, int64_t capacity);
-# int32_t PyArrow_PoolBufferResizeExactly(PyArrow_PoolBufferPtr buf, int64_t size);
-# void PyArrow_PoolBufferDestroy(PyArrow_PoolBufferPtr buf);
-# int32_t PyArrow_MakeAndExportArray(int64_t length, int64_t null_count,
-#                                    int32_t num_buffers,
-#                                    PyArrow_PoolBufferPtr* buffer_ptrs,
-#                                    ArrowArray* out)
-# void PyArrow_ReleaseArray(ArrowArray* array);
-
 
 int64_t = ir.IntType(64)
 
@@ -126,7 +118,7 @@ pyarrow_cpp_funcs = {
 
 
 @functools.cache
-def get_pyarrow_dll():
+def get_pyarrow_dll() -> ctypes.CDLL:
     exc = None
     dll = None
     for path in pa.get_library_dirs():
@@ -136,8 +128,10 @@ def get_pyarrow_dll():
         except OSError as e:
             exc = e
     if dll is None:
-        raise exc
-    # TODO use same idiom as Numba (see `_load_global_helpers`)
+        if exc is not None:
+            raise exc
+        raise OSError('Could not locate libarrow_python.so')
+    # symbols must be registered before the first compilation in this process
     for func_name in pyarrow_cpp_funcs:
         func = dll[func_name]
         func_addr = ctypes.cast(func, ctypes.c_void_p).value
@@ -148,7 +142,8 @@ def get_pyarrow_dll():
 dll = get_pyarrow_dll()
 
 
-def get_pyarrow_cpp_func(builder, func_name):
+def get_pyarrow_cpp_func(builder: ir.IRBuilder,
+                         func_name: str) -> ir.Function:
     fnty = pyarrow_cpp_funcs[func_name]
     fn = cgutils.get_or_insert_function(builder.module, fnty,
                                         func_name)

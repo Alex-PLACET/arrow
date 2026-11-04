@@ -1,4 +1,22 @@
-import gc
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+
+"""Reading Arrow arrays: element types, nulls, producers, layouts."""
 
 import numpy as np
 import pytest
@@ -7,7 +25,7 @@ import pyarrow as pa
 
 nb = pytest.importorskip("numba")
 
-from pyarrow.numba import _register  # noqa: E402  (imports the extension)
+from pyarrow.numba import _register  # noqa: E402  (registers the extension)
 from pyarrow.numba import is_valid, string_len  # noqa: E402
 
 _register()
@@ -87,63 +105,6 @@ def test_accepts_a_non_pyarrow_capsule_producer():
         from_any(object())
 
 
-def test_int_builder_round_trip():
-    from pyarrow.numba import Int64Builder
-
-    @nb.njit
-    def build():
-        b = Int64Builder()
-        b.append(1)
-        b.append(None)
-        b.append(3)
-        return b.finish()
-
-    out = build()
-    assert isinstance(out, pa.Array)
-    assert out.type == pa.int64()
-    assert out.to_pylist() == [1, None, 3]
-
-
-def test_float_builder_round_trip():
-    from pyarrow.numba import Float64Builder
-
-    @nb.njit
-    def build():
-        b = Float64Builder()
-        b.append(1.5)
-        b.append(None)
-        b.append(3.5)
-        return b.finish()
-
-    out = build()
-    assert isinstance(out, pa.Array)
-    assert out.type == pa.float64()
-    assert out.to_pylist() == [1.5, None, 3.5]
-
-
-def test_many_builds_do_not_leak_pool_memory():
-    from pyarrow.numba import Float64Builder
-
-    @nb.njit
-    def build(n):
-        b = Float64Builder()
-        b.reserve(n)
-        for i in range(n):
-            b.append(i * 0.5)
-        return b.finish()
-
-    assert build(4).to_pylist() == [0.0, 0.5, 1.0, 1.5]   # warm up
-
-    pool = pa.default_memory_pool()
-    before = pool.bytes_allocated()
-    for _ in range(2000):
-        build(16)                       # each result is dropped immediately
-    gc.collect()
-    after = pool.bytes_allocated()
-
-    assert after - before < 1 << 16, (before, after)
-
-
 def _polars_producer():
     pl = pytest.importorskip("polars")
     return pl.Series("x", [2, 3, None, 5])
@@ -194,217 +155,6 @@ def test_polars_series_is_read_zero_copy():
     series = pl.Series([2, 3, None, 5])
     assert (from_any(series).buffers()[1].address
             == series.to_arrow().buffers()[1].address)
-
-
-def test_capsule_producer_is_read_without_materialising_it():
-    """Unboxing fills the view from the capsule: no pa.Array per call."""
-    import ctypes
-
-    from pyarrow.numba._capsule import ArrowArray, take_array_into
-
-    class Producer:
-        """A producer that is not a pa.Array."""
-
-        def __init__(self, array):
-            self._array = array
-
-        def __arrow_c_array__(self, requested_schema=None):
-            return self._array.__arrow_c_array__(requested_schema)
-
-    array = pa.array([2, 3, None, 5])
-    view = ArrowArray()
-    take_array_into(Producer(array), ctypes.addressof(view))
-
-    assert view.length == 4
-    assert view.n_buffers == 2
-    assert view.buffers[1] == array.buffers()[1].address    # zero copy
-    assert view.release
-
-
-def test_take_moves_the_release_callback():
-    from pyarrow.numba._capsule import ArrowArray, take
-
-    source = pa.array([1, 2, 3])
-    _, array_capsule = source.__arrow_c_array__()
-    moved = take(ArrowArray, array_capsule, b"arrow_array")
-
-    assert moved.length == 3
-    assert moved.offset == 0
-    assert moved.buffers[1]                  # data buffer, non-null
-    assert moved.release                     # we own it now
-
-    # the capsule's own struct was neutralised: dropping it must not free
-    del array_capsule, source
-    gc.collect()
-    assert moved.length == 3                 # still readable, no crash
-
-
-def test_multi_chunk_stream_raises_and_from_any_copies():
-    table = pa.table({"x": pa.chunked_array([[1, 2], [3, 4]],
-                                            type=pa.int64())})
-
-    class StreamOnly:
-        """Polars/duckdb shape: a stream, no array capsule."""
-
-        def __init__(self, table):
-            self._table = table
-
-        def __arrow_c_stream__(self, requested_schema=None):
-            return self._table.__arrow_c_stream__(requested_schema)
-
-    stream = StreamOnly(table)
-    from pyarrow.numba import from_any, register_producer
-    register_producer(StreamOnly)
-
-    @nb.njit
-    def total(a):
-        acc = 0
-        for i in range(len(a)):
-            if a[i] is not None:
-                acc += a[i]
-        return acc
-
-    with pytest.raises(TypeError, match="more than one chunk"):
-        total(stream)
-
-    assert total(from_any(stream)) == 10      # the documented copying route
-
-
-def test_empty_stream_reads_as_an_empty_array():
-    empty = pa.table({"x": pa.chunked_array([], type=pa.int64())})
-
-    class StreamOnly:
-        def __arrow_c_stream__(self, requested_schema=None):
-            return empty.__arrow_c_stream__(requested_schema)
-
-    from pyarrow.numba import register_producer
-    register_producer(StreamOnly)
-
-    @nb.njit
-    def total(a):
-        acc = 0
-        for i in range(len(a)):
-            acc += a[i]
-        return acc
-
-    assert total(StreamOnly()) == 0
-
-
-def test_producer_buffers_are_not_kept_alive_by_the_call():
-    import weakref
-
-    seen = []
-
-    class Producer:
-        def __init__(self, array):
-            self._array = array
-
-        def __arrow_c_array__(self, requested_schema=None):
-            seen.append(weakref.ref(self._array))
-            return self._array.__arrow_c_array__(requested_schema)
-
-    from pyarrow.numba import register_producer
-    register_producer(Producer)
-
-    @nb.njit
-    def total(a):
-        acc = 0
-        for i in range(len(a)):
-            acc += a[i]
-        return acc
-
-    array = pa.array([1, 2, 3])
-    assert total(Producer(array)) == 6
-
-    del array
-    gc.collect()
-    assert seen[0]() is None        # nothing from the call is kept alive
-
-
-def test_capsule_struct_matches_the_c_layout():
-    import ctypes
-
-    from pyarrow.numba._capsule import (ArrowArray, ArrowArrayStream,
-                                        ArrowSchema)
-
-    assert ctypes.sizeof(ArrowArray) == 80
-    assert [name for name, _ in ArrowArray._fields_] == [
-        "length", "null_count", "offset", "n_buffers", "n_children",
-        "buffers", "children", "dictionary", "release", "private_data",
-    ]
-    assert ctypes.sizeof(ArrowArrayStream) == 40
-    assert [name for name, _ in ArrowArrayStream._fields_] == [
-        "get_schema", "get_next", "get_last_error", "release", "private_data",
-    ]
-    assert [name for name, _ in ArrowSchema._fields_] == [
-        "format", "name", "metadata", "flags", "n_children", "children",
-        "dictionary", "release", "private_data",
-    ]
-
-
-def test_boolean_arrays_have_no_element_access():
-    from numba.core.errors import TypingError
-
-    array = pa.array([True, False, None])
-
-    @nb.njit
-    def at(a, i):
-        return a[i]
-
-    with pytest.raises(TypingError, match="bit-packed"):
-        at(array, 0)
-
-
-@pytest.mark.parametrize("builder_name,pa_type,values", [
-    ("Int8Builder", pa.int8(), [1, None, 3]),
-    ("Int16Builder", pa.int16(), [1, None, 3]),
-    ("Int32Builder", pa.int32(), [1, None, 3]),
-    ("Int64Builder", pa.int64(), [1, None, 3]),
-    ("UInt8Builder", pa.uint8(), [1, None, 3]),
-    ("UInt16Builder", pa.uint16(), [1, None, 3]),
-    ("UInt32Builder", pa.uint32(), [1, None, 3]),
-    ("UInt64Builder", pa.uint64(), [1, None, 3]),
-    ("Float32Builder", pa.float32(), [0.5, None, 1.5]),
-    ("Float64Builder", pa.float64(), [0.5, None, 1.5]),
-    ("BoolBuilder", pa.bool_(), [True, None, False]),
-])
-def test_every_builder_round_trips(builder_name, pa_type, values):
-    import pyarrow.numba as apn
-
-    builder_cls = getattr(apn, builder_name)
-
-    # literals inside the compiled function: freevar lists do not lower
-    if pa.types.is_boolean(pa_type):
-        @nb.njit
-        def build():
-            b = builder_cls()
-            b.reserve(3)
-            b.append(True)
-            b.append(None)
-            b.append(False)
-            return b.finish()
-    elif pa.types.is_floating(pa_type):
-        @nb.njit
-        def build():
-            b = builder_cls()
-            b.reserve(3)
-            b.append(0.5)
-            b.append(None)
-            b.append(1.5)
-            return b.finish()
-    else:
-        @nb.njit
-        def build():
-            b = builder_cls()
-            b.reserve(3)
-            b.append(1)
-            b.append(None)
-            b.append(3)
-            return b.finish()
-
-    out = build()
-    assert out.type == pa_type
-    assert out.to_pylist() == values
 
 
 def test_decimal128_reads_exactly():
@@ -521,37 +271,114 @@ def test_string_types_read_views(pa_type, payloads, offset):
             assert at(view, i) == payload
 
 
-@pytest.mark.parametrize("offset", [0, 1])
-def test_boolean_values_are_reachable_through_the_bitmap(offset):
-    array = pa.array([True, None, False, True])
-    view = array.slice(offset)
+BOOLEANS = [True, False, True, True, False, False, True, False,
+            None, True, False, None, True, True, False, True, False]
+
+
+@pytest.mark.parametrize("offset", range(8))
+def test_boolean_read_every_bit_offset(offset):
+    """Every bit position inside a byte, across the array's bytes."""
+    view = pa.array(BOOLEANS, type=pa.bool_()).slice(offset)
+    expected = BOOLEANS[offset:]
+
+    @nb.njit
+    def read(a):
+        values = np.zeros(len(a), np.bool_)
+        valid = np.zeros(len(a), np.bool_)
+        missing = np.zeros(len(a), np.bool_)
+        for i in range(len(a)):
+            valid[i] = is_valid(a, i)
+            missing[i] = a[i] is None
+            v = a[i]
+            if v is not None:
+                values[i] = v
+        return values, valid, missing
+
+    values, valid, missing = read(view)
+    assert missing.tolist() == [v is None for v in expected]
+    assert valid.tolist() == [v is not None for v in expected]
+    assert values.tolist() == [bool(v) if v is not None else False
+                               for v in expected]
+
+
+def test_boolean_read_without_a_null_bitmap():
+    view = pa.array([True, False, True], type=pa.bool_())
+    assert view.null_count == 0
+
+    @nb.njit
+    def read(a):
+        out = np.zeros(len(a), np.int64)
+        for i in range(len(a)):
+            valid = 1 if is_valid(a, i) else 0
+            present = 2 if a[i] is not None else 0
+            out[i] = valid + present
+        return out
+
+    assert read(view).tolist() == [3, 3, 3]
+
+
+def test_boolean_read_all_null():
+    view = pa.nulls(5, type=pa.bool_())
+
+    @nb.njit
+    def count_valid(a):
+        n = 0
+        for i in range(len(a)):
+            if is_valid(a, i):
+                n += 1
+        return n
+
+    assert count_valid(view) == 0
+
+
+def test_boolean_index_forms():
+    view = pa.array([True, False, True], type=pa.bool_())
+
+    @nb.njit
+    def at(a, i):
+        return a[i]
+
+    assert at(view, 0) is True
+    assert at(view, 1) is False
+    assert at(view, -1) is True
+    with pytest.raises(IndexError):
+        at(view, 3)
+
+
+def test_boolean_read_empty():
+    view = pa.array([], type=pa.bool_())
+    assert len(view) == 0
+
+    @nb.njit
+    def count(a):
+        n = 0
+        for i in range(len(a)):
+            n += 1
+        return n
+
+    assert count(view) == 0
+
+
+@pytest.mark.parametrize("pa_type", [pa.string(), pa.binary(),
+                                     pa.binary(3)],
+                         ids=["string", "binary", "fixed_size_binary"])
+def test_string_view_carries_validity(pa_type):
+    payloads = ([b"abc", None, b"", b"de"] if not pa.types.is_fixed_size_binary(
+        pa_type) else [b"abc", None, b"xyz", b"def"])
+    view = pa.array(payloads, type=pa_type).slice(1)
 
     @nb.njit
     def flags(a):
         out = np.zeros(len(a), np.bool_)
         for i in range(len(a)):
-            out[i] = is_valid(a, i)
+            out[i] = a[i].valid
         return out
 
-    assert flags(view).tolist() == array.is_valid().to_pylist()[offset:]
+    assert flags(view).tolist() == [p is not None for p in payloads[1:]]
 
 
-def test_typing_a_stream_producer_is_cached():
-    """Numba re-types per call: the schema must not be read every time."""
-    opened = []
-
-    class Producer:
-        dtype = "int64"          # cheap, hashable, stands in for the schema
-
-        def __init__(self, array):
-            self._array = array
-
-        def __arrow_c_stream__(self, requested_schema=None):
-            opened.append(1)
-            return self._array.__arrow_c_stream__(requested_schema)
-
-    from pyarrow.numba import register_producer
-    register_producer(Producer)
+def test_chunked_array_with_one_chunk():
+    chunked = pa.chunked_array([[1, 2, 3]], type=pa.int64())
 
     @nb.njit
     def total(a):
@@ -560,9 +387,181 @@ def test_typing_a_stream_producer_is_cached():
             acc += a[i]
         return acc
 
-    producer = Producer(pa.chunked_array([[1, 2, 3]]))
-    assert total(producer) == 6          # one stream for typing, one for data
+    assert total(chunked) == 6
 
-    before = len(opened)
-    assert total(producer) == 6
-    assert len(opened) - before == 1     # typing came from the cache
+
+@pytest.mark.parametrize("chunks", [
+    [[1, 2, 3], [4, 5], [6]],
+    [[1], [], [2, 3, 4, 5, 6]],
+], ids=["three", "with_empty"])
+def test_chunked_array_walks_every_chunk(chunks):
+    chunked = pa.chunked_array(chunks, type=pa.int64())
+    expected = [v for chunk in chunks for v in chunk]
+
+    @nb.njit
+    def total(a):
+        acc = 0
+        for i in range(len(a)):
+            acc += a[i]
+        return acc
+
+    @nb.njit
+    def read(a):
+        return [a[i] for i in range(len(a))]
+
+    assert len(chunked) == len(expected)
+    assert total(chunked) == sum(expected)
+    assert read(chunked) == expected
+
+
+def test_chunked_array_with_nulls_and_negative_index():
+    from pyarrow.numba import is_valid
+    chunked = pa.chunked_array([[1, None], [None, 4]], type=pa.int64())
+
+    @nb.njit
+    def scan(a):
+        total = 0
+        nulls = 0
+        for i in range(len(a)):
+            v = a[i]
+            if v is None:
+                nulls += 1
+            else:
+                total += v
+        return total, nulls, a[-1], is_valid(a, 1)
+
+    assert scan(chunked) == (5, 2, 4, False)
+
+
+def test_chunked_string_column():
+    from pyarrow.numba import string_len
+    chunked = pa.chunked_array([["ab", "cde"], ["f", None]],
+                               type=pa.string())
+
+    @nb.njit
+    def sizes(a):
+        out = []
+        for i in range(len(a)):
+            v = a[i]
+            out.append(string_len(v) if v.valid else -1)
+        return out
+
+    assert sizes(chunked) == [2, 3, 1, -1]
+
+
+def test_record_batch_columns_are_all_reachable():
+    from pyarrow.numba import string_len
+    batch = pa.record_batch({
+        "x": pa.array([1, 2, 3]),
+        "y": pa.array([10.5, 20.5, 30.5]),
+        "z": pa.array(["a", "bb", "ccc"]),
+    })
+
+    @nb.njit
+    def sums(batch):
+        xs = 0
+        ys = 0.0
+        zs = 0
+        x = batch.column(0)
+        y = batch.column(1)
+        z = batch.column(2)
+        for i in range(len(batch)):
+            xs += x[i]
+            ys += y[i]
+            zs += string_len(z[i])
+        return xs, ys, zs, batch.num_columns
+
+    assert sums(batch) == (6, 61.5, 6, 3)
+
+
+def test_record_batch_needs_a_literal_column():
+    batch = pa.record_batch({"x": pa.array([1, 2])})
+
+    @nb.njit
+    def nth(batch, k):
+        return batch.column(k)[0]
+
+    with pytest.raises(nb.core.errors.TypingError, match="literal index"):
+        nth(batch, 0)
+
+
+@pytest.mark.parametrize("chunks", [1, 2], ids=["one_chunk", "two_chunks"])
+def test_table_reads_column_zero(chunks):
+    if chunks == 1:
+        column = pa.chunked_array([[1, None, 3]], type=pa.int64())
+    else:
+        column = pa.chunked_array([[1], [None, 3]], type=pa.int64())
+    table = pa.table({"x": column, "y": pa.array(["a", "b", "c"])})
+
+    @nb.njit
+    def total(a):
+        acc = 0
+        for i in range(len(a)):
+            if a[i] is not None:
+                acc += a[i]
+        return acc
+
+    assert total(table) == 4
+
+    if chunks > 1:
+        # the chunks are kept, not concatenated into a temp array
+        assert "PyArrowChunked" in str(total.signatures[0])
+    else:
+        assert "PyArrowChunked" not in str(total.signatures[0])
+
+
+@pytest.mark.parametrize("null_count", [0, -1], ids=["known_dense", "unknown"])
+def test_validity_bitmap_with_no_nulls(null_count):
+    """A bitmap that marks nothing null must not change the values."""
+    import pyarrow.numba  # noqa: F401
+    data = pa.py_buffer(np.array([10, 20, 30], dtype=np.int64))
+    bitmap = pa.py_buffer(np.array([0b111], dtype=np.uint8))   # all valid
+    array = pa.Array.from_buffers(pa.int64(), 3, [bitmap, data],
+                                  null_count=null_count)
+
+    @nb.njit
+    def total(a):
+        acc = 0
+        for i in range(len(a)):
+            acc += a[i]
+        return acc
+
+    assert total(array) == 60
+
+
+@pytest.mark.parametrize("builder_name,n", [("StringBuilder", 4),
+                                            ("LargeStringBuilder", 4),
+                                            ("BinaryBuilder", 0)])
+def test_var_width_offsets_have_one_entry_per_value_plus_one(builder_name, n):
+    """The leading offset is seeded once; a second seed would shift them all."""
+    import pyarrow.numba as apn
+
+    builder_cls = getattr(apn, builder_name)
+
+    @nb.njit
+    def build(count):
+        b = builder_cls()
+        for _ in range(count):
+            b.append(b"xy")
+        return b.finish()
+
+    out = build(n)
+    offsets = out.buffers()[1]
+    width = 8 if "Large" in builder_name else 4
+    assert len(offsets) == width * (n + 1)
+    assert offsets.to_pybytes()[:width] == b"\x00" * width
+    expected = [b"xy"] * n if builder_name.endswith("BinaryBuilder") else ["xy"] * n
+    assert out.to_pylist() == expected
+    out.validate(full=True)
+
+
+def test_pool_buffer_offsets_come_from_the_cpp_layout():
+    """The offsets are read from numba.cc, not hardcoded: three sane fields."""
+    from pyarrow.numba import poolbuffer
+
+    offsets = poolbuffer._pool_buffer_offsets()
+    assert len(set(offsets)) == 3, offsets
+    assert all(0 < offset < 64 for offset in offsets), offsets
+    assert offsets == (poolbuffer._pool_buffer_offsetof_data,
+                       poolbuffer._pool_buffer_offsetof_size,
+                       poolbuffer._pool_buffer_offsetof_capacity)

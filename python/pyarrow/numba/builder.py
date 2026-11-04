@@ -15,29 +15,69 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from numba import types as nbt
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from llvmlite import ir
 from numba import extending as nbext
+from numba import types as nbt
 from numba.core import cgutils
+from numba.core.base import BaseContext
+from numba.core.typing.context import BaseContext as TypingContext
 from numba.core.typing.templates import (
-    AttributeTemplate, bound_function, infer_getattr, signature)
+    AttributeTemplate,
+    Signature,
+    bound_function,
+    infer_getattr,
+    signature,
+)
 
 import pyarrow as pa
-from ._utils import _arrow_type_to_nb_type, get_pyarrow_cpp_func
-from .array import PyArrowArrayType
-from .poolbuffer import (PoolBufferType, TypedBufferBuilderType,
-                         typed_buffer_builder_ctor_ll,
-                         typed_buffer_builder_finish_ll)
+
+from ._utils import _arrow_type_to_nb_type, _is_var_width, get_pyarrow_cpp_func
+from .array import PyArrowArrayType, StringViewType, string_view_data
+from .poolbuffer import (
+    PoolBufferType,
+    TypedBufferBuilderType,
+    typed_buffer_builder_append_ll,
+    typed_buffer_builder_ctor_ll,
+    typed_buffer_builder_finish_ll,
+)
 
 #
 # 0. Pure Python
 #
 
 
+def _data_buffer_type(arrow_type):
+    """What a builder appends into: raw bytes for var-width types.
+
+    ``pa.string().byte_width`` raises ``ValueError``, so the payload buffer of
+    a var-width builder is typed ``uint8`` and driven one byte at a time.
+    """
+    return pa.uint8() if _is_var_width(arrow_type) else arrow_type
+
+
+def _offsets_type(arrow_type):
+    """``int64`` offsets for the ``large_*`` types, ``int32`` otherwise."""
+    return (pa.int64()
+            if arrow_type in (pa.large_string(), pa.large_binary())
+            else pa.int32())
+
+
 class ArrayBuilder:
-    def __init__(self, value_type):
-        if (not pa.types.is_integer(value_type)
-                and not pa.types.is_floating(value_type)
-                and not pa.types.is_boolean(value_type)):
+    def __init__(self, value_type: pa.DataType) -> None:
+        supported = (pa.types.is_integer(value_type)
+                     or pa.types.is_floating(value_type)
+                     or pa.types.is_boolean(value_type)
+                     or pa.types.is_string(value_type)
+                     or pa.types.is_large_string(value_type)
+                     or pa.types.is_binary(value_type)
+                     or pa.types.is_large_binary(value_type))
+        if not supported:
+            # fixed-size binary lands here too: no offsets buffer, so the
+            # var-width layout would be wrong
             raise TypeError(f'Cannot create ArrayBuilder for {value_type}')
         self.value_type = value_type
 
@@ -97,6 +137,26 @@ class BoolBuilder(ArrayBuilder):
         super().__init__(pa.bool_())
 
 
+class StringBuilder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.string())
+
+
+class LargeStringBuilder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.large_string())
+
+
+class BinaryBuilder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.binary())
+
+
+class LargeBinaryBuilder(ArrayBuilder):
+    def __init__(self):
+        super().__init__(pa.large_binary())
+
+
 #
 # 1. Typing
 #
@@ -117,14 +177,16 @@ class ArrayBuilderType(nbt.Type):
         return self._nb_type
 
 
-# XXX only needed for pure Python
+# lets a builder created in Python (outside @njit) be passed to one
 @nbext.typeof_impl.register(ArrayBuilder)
-def typeof_builder(val, c):
+def typeof_builder(val: object, c: TypingContext) -> ArrayBuilderType:
     return ArrayBuilderType(val.value_type)
 
 
-# TODO rework this once PyArrow types such as Int64Type are Numba-typed
-def _builder_typer(arrow_type):
+# one typer per class: the Arrow type is baked in, since PyArrow's own types
+# are not Numba types
+def _builder_typer(arrow_type: pa.DataType
+                   ) -> Callable[[TypingContext], Callable[[], nbt.Type]]:
     def type_callable(context):
         def typer():
             return ArrayBuilderType(arrow_type)
@@ -132,13 +194,15 @@ def _builder_typer(arrow_type):
     return type_callable
 
 
-_BUILDERS :  = (
+_BUILDERS = (
     (Int8Builder, pa.int8()), (Int16Builder, pa.int16()),
     (Int32Builder, pa.int32()), (Int64Builder, pa.int64()),
     (UInt8Builder, pa.uint8()), (UInt16Builder, pa.uint16()),
     (UInt32Builder, pa.uint32()), (UInt64Builder, pa.uint64()),
     (Float32Builder, pa.float32()), (Float64Builder, pa.float64()),
     (BoolBuilder, pa.bool_()),
+    (StringBuilder, pa.string()), (LargeStringBuilder, pa.large_string()),
+    (BinaryBuilder, pa.binary()), (LargeBinaryBuilder, pa.large_binary()),
 )
 
 for _builder_cls, _arrow_type in _BUILDERS:
@@ -164,11 +228,16 @@ class ArrayBuilderAttribute(AttributeTemplate):
 class ArrayBuilderModel(nbext.models.StructModel):
 
     def __init__(self, dmm, fe_type):
+        arrow_type = fe_type.arrow_type
         members = [
             ('null_bitmap_builder', TypedBufferBuilderType(pa.bool_())),
-            ('data_builder', TypedBufferBuilderType(fe_type.arrow_type)),
+            ('data_builder',
+             TypedBufferBuilderType(_data_buffer_type(arrow_type))),
             ('null_count_ptr', nbt.EphemeralPointer(nbt.int64)),
         ]
+        if _is_var_width(arrow_type):
+            members.append(('offsets_builder',
+                            TypedBufferBuilderType(_offsets_type(arrow_type))))
         super().__init__(dmm, fe_type, members)
 
 
@@ -180,19 +249,31 @@ class ArrayBuilderModel(nbext.models.StructModel):
 nbext.make_attribute_wrapper(
     ArrayBuilderType, 'null_bitmap_builder', 'null_bitmap_builder')
 nbext.make_attribute_wrapper(ArrayBuilderType, 'data_builder', 'data_builder')
+nbext.make_attribute_wrapper(ArrayBuilderType, 'offsets_builder',
+                             'offsets_builder')
 
 
-# XXX high-level extending API + @intrinsic doesn't work for this
-# because of recursively embedded EphemeralPointer, report Numba bug?
-def builder_ctor(context, builder, sig, args):
+# a plain lowering, not an @intrinsic: the model embeds EphemeralPointers,
+# which the intrinsic path cannot handle
+def builder_ctor(context: BaseContext, builder: ir.IRBuilder,
+                 sig: Signature, args: tuple[ir.Value, ...]) -> ir.Value:
     value_type = sig.return_type.arrow_type
     array_builder = context.make_helper(builder, sig.return_type)
     array_builder.null_bitmap_builder = typed_buffer_builder_ctor_ll(
         context, builder, TypedBufferBuilderType(pa.bool_()))
     array_builder.data_builder = typed_buffer_builder_ctor_ll(
-        context, builder, TypedBufferBuilderType(value_type))
+        context, builder, TypedBufferBuilderType(_data_buffer_type(value_type)))
     zero = context.get_constant(nbt.int64, 0)
     array_builder.null_count_ptr = cgutils.alloca_once_value(builder, zero)
+    if _is_var_width(value_type):
+        offsets_ty = TypedBufferBuilderType(_offsets_type(value_type))
+        offsets_builder = typed_buffer_builder_ctor_ll(
+            context, builder, offsets_ty)
+        offset_zero = builder.trunc(
+            zero, context.get_value_type(
+                _arrow_type_to_nb_type(_offsets_type(value_type))))
+        array_builder.offsets_builder = typed_buffer_builder_append_ll(
+            context, builder, offsets_ty, offsets_builder, offset_zero)
 
     return array_builder._getvalue()
 
@@ -202,7 +283,9 @@ for _builder_cls, _ in _BUILDERS:
 
 
 @nbext.intrinsic
-def builder_increment_null_count(typingctx, array_builder):
+def builder_increment_null_count(typingctx: TypingContext,
+                                 array_builder: nbt.Type
+                                 ) -> tuple[Signature, Callable[..., None]]:
     assert isinstance(array_builder, ArrayBuilderType)
     sig = nbt.none(array_builder)
 
@@ -215,8 +298,47 @@ def builder_increment_null_count(typingctx, array_builder):
     return sig, codegen
 
 
+@nbext.intrinsic
+def bytes_data(typingctx: TypingContext, value_type: nbt.Type) -> object:
+    """The first byte of a ``bytes`` value, for the bulk builder copy."""
+
+    def codegen(context, builder, signature, args):
+        value = context.make_helper(builder, value_type, value=args[0])
+        return builder.bitcast(value.data, ir.IntType(8).as_pointer())
+
+    return signature(nbt.voidptr, value_type), codegen
+
+
 @nbext.overload_method(ArrayBuilderType, 'append')
 def builder_append(builder, value):
+    if _is_var_width(builder.arrow_type):
+        if value == nbt.none:
+            def append_null(builder, value):
+                builder.null_bitmap_builder.append(False)
+                builder.offsets_builder.append(builder.data_builder.size)
+                builder_increment_null_count(builder)
+            return append_null
+
+        if isinstance(value, nbt.Bytes):
+            def append_bytes(builder, value):
+                builder.data_builder.append_bytes(bytes_data(value), len(value))
+                builder.null_bitmap_builder.append(True)
+                builder.offsets_builder.append(builder.data_builder.size)
+            return append_bytes
+
+        if isinstance(value, StringViewType):
+            def append_view(builder, value):
+                if value.valid:
+                    builder.data_builder.append_bytes(
+                        string_view_data(value), value.end - value.start)
+                else:
+                    builder_increment_null_count(builder)
+                builder.null_bitmap_builder.append(value.valid)
+                builder.offsets_builder.append(builder.data_builder.size)
+            return append_view
+
+        return
+
     if value == nbt.none:
         # the data buffer still needs a placeholder of its own type
         element = builder.numba_type
@@ -241,6 +363,13 @@ def builder_append(builder, value):
 
 @nbext.overload_method(ArrayBuilderType, 'reserve')
 def builder_reserve(builder, capacity):
+    if _is_var_width(builder.arrow_type):
+        def impl_var_width(builder, capacity):
+            builder.null_bitmap_builder.reserve(capacity)
+            builder.data_builder.reserve(capacity)
+            builder.offsets_builder.reserve(capacity)
+        return impl_var_width
+
     def impl(builder, capacity):
         builder.null_bitmap_builder.reserve(capacity)
         builder.data_builder.reserve(capacity)
@@ -248,7 +377,9 @@ def builder_reserve(builder, capacity):
 
 
 @nbext.lower_builtin('ArrayBuilder.finish', ArrayBuilderType)
-def builder_finish(context, builder, sig, args):
+def builder_finish(context: BaseContext, builder: ir.IRBuilder,
+                   sig: Signature,
+                   args: tuple[ir.Value, ...]) -> ir.Value:
     value_type = sig.args[0].arrow_type
     array_builder = context.make_helper(builder, sig.args[0], value=args[0])
 
@@ -261,19 +392,27 @@ def builder_finish(context, builder, sig, args):
     null_bitmap_buffer = typed_buffer_builder_finish_ll(
         context, builder, null_bitmap_type, array_builder.null_bitmap_builder)
     data_buffer = typed_buffer_builder_finish_ll(
-        context, builder, TypedBufferBuilderType(value_type),
+        context, builder, TypedBufferBuilderType(_data_buffer_type(value_type)),
         array_builder.data_builder)
 
     def get_buffer_ptr(pool_buffer):
         pool_buffer = context.make_helper(builder, PoolBufferType(), value=pool_buffer)
         return pool_buffer.cpp_ptr
 
-    buffer_ptrs = cgutils.pack_array(
-        builder, [get_buffer_ptr(null_bitmap_buffer), get_buffer_ptr(data_buffer)])
-    # LLVM doesn't implicitly cast `[2 x i8]*` to `i8**`
+    buffers = [get_buffer_ptr(null_bitmap_buffer)]
+    if _is_var_width(value_type):
+        offsets_ty = TypedBufferBuilderType(_offsets_type(value_type))
+        offsets_builder = array_builder.offsets_builder
+        buffers.append(get_buffer_ptr(
+            typed_buffer_builder_finish_ll(context, builder, offsets_ty,
+                                           offsets_builder)))
+    buffers.append(get_buffer_ptr(data_buffer))
+
+    buffer_ptrs = cgutils.pack_array(builder, buffers)
+    # LLVM doesn't implicitly cast `[n x i8]*` to `i8**`
     buffer_ptrs = builder.bitcast(
         cgutils.alloca_once_value(builder, buffer_ptrs), cgutils.voidptr_t.as_pointer())
-    num_buffers = cgutils.int32_t(2)
+    num_buffers = cgutils.int32_t(len(buffers))
 
     out_array = cgutils.create_struct_proxy(
         PyArrowArrayType(value_type))(context, builder)
