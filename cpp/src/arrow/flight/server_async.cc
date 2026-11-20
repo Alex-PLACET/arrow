@@ -42,6 +42,8 @@ namespace arrow::flight {
 AsyncFlightDataStream::~AsyncFlightDataStream() = default;
 AsyncFlightListing::~AsyncFlightListing() = default;
 AsyncResultStream::~AsyncResultStream() = default;
+AsyncFlightMessageReader::~AsyncFlightMessageReader() = default;
+AsyncFlightMessageWriter::~AsyncFlightMessageWriter() = default;
 
 struct AsyncGenericFlightServerBase::Impl {
   internal::ServerLifecycle lifecycle{"AsyncGenericFlightServerBase"};
@@ -132,6 +134,12 @@ AsyncGenericFlightServerBase::DoActionAsync(const ServerCallContext&, const Acti
 
 arrow::Future<std::vector<ActionType>> AsyncGenericFlightServerBase::ListActionsAsync(
     const ServerCallContext&) {
+  return Status::NotImplemented("NYI");
+}
+
+arrow::Future<> AsyncGenericFlightServerBase::DoExchangeAsync(
+    const ServerCallContext&, std::shared_ptr<AsyncFlightMessageReader>,
+    std::shared_ptr<AsyncFlightMessageWriter>) {
   return Status::NotImplemented("NYI");
 }
 

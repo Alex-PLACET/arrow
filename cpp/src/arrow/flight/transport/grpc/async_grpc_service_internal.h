@@ -182,8 +182,8 @@ class ARROW_FLIGHT_EXPORT AsyncReactorBase : public ::grpc::ServerGenericBidiRea
 
   /// \brief Take a reference: the reactor stays alive until the token is destroyed.
   ///
-  /// Public so code holding a plain pointer to the reactor can pin it; the raw
-  /// Hold()/ReleaseHold() stay protected.
+  /// Public so the DoExchange reader and writer can pin the reactor they reach
+  /// through a back-pointer; the raw Hold()/ReleaseHold() stay protected.
   [[nodiscard]] HoldToken hold() {
     Hold();
     return HoldToken(this);
@@ -343,6 +343,8 @@ ARROW_FLIGHT_EXPORT ::grpc::ServerGenericBidiReactor* MakeListFlightsReactor(
 ARROW_FLIGHT_EXPORT ::grpc::ServerGenericBidiReactor* MakeUnaryReactor(
     FlightMethod method, AsyncCallContext flight_context,
     AsyncGenericFlightServerBase* base);
+ARROW_FLIGHT_EXPORT ::grpc::ServerGenericBidiReactor* MakeExchangeReactor(
+    AsyncCallContext flight_context, AsyncGenericFlightServerBase* base);
 
 #endif  // ARROW_FLIGHT_HAS_ASYNC_SERVER
 

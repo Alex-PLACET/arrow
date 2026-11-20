@@ -217,6 +217,9 @@ if(ARROW_GRPC_VERSION VERSION_GREATER_EQUAL "1.65")
        transport/grpc/async_grpc_service.cc
        transport/grpc/async_grpc_do_get.cc
        transport/grpc/async_grpc_do_put.cc
+       transport/grpc/async_grpc_exchange.cc
+       transport/grpc/async_grpc_exchange_reader.cc
+       transport/grpc/async_grpc_exchange_writer.cc
        transport/grpc/async_grpc_handshake.cc
        transport/grpc/async_grpc_streaming.cc)
 endif()
@@ -372,6 +375,7 @@ if(ARROW_GRPC_VERSION VERSION_GREATER_EQUAL "1.65")
                  transport/grpc/async_grpc_do_put_test.cc
                  transport/grpc/async_grpc_unary_test.cc
                  transport/grpc/async_grpc_streaming_test.cc
+                 transport/grpc/async_grpc_exchange_test.cc
                  transport/grpc/async_grpc_handshake_test.cc
                  STATIC_LINK_LIBS
                  ${ARROW_FLIGHT_TEST_LINK_LIBS}
