@@ -162,6 +162,9 @@ std::optional<MethodRequest> ValidRequest(std::string_view method) {
     // Handshake() answers NotImplemented whatever the payload.
     return MethodRequest{method, ""};
   }
+  if (method == "DoGet") {
+    return MethodRequest{method, WireBytes(Ticket{"ticket"})};
+  }
   if (method == "GetFlightInfo" || method == "GetSchema" || method == "PollFlightInfo") {
     return MethodRequest{method, WireBytes(FlightDescriptor::Path({"path"}))};
   }
@@ -193,13 +196,14 @@ TEST(AsyncGrpcTest, RawRequestFailures) {
   };
 
   const std::vector<std::string> no_message_methods = {
-      "Handshake",   "GetFlightInfo", "GetSchema",  "PollFlightInfo",
-      "ListActions", "DoAction",      "ListFlights"};
+      "Handshake",   "GetFlightInfo", "GetSchema",   "PollFlightInfo",
+      "ListActions", "DoAction",      "ListFlights", "DoGet"};
   const std::vector<std::pair<std::string, std::string>> parse_names = {
       {"Handshake", "HandshakeRequest"},
       {"GetFlightInfo", "FlightDescriptor"},
       {"GetSchema", "FlightDescriptor"},
       {"PollFlightInfo", "FlightDescriptor"},
+      {"DoGet", "Ticket"},
       {"DoAction", "Action"},
       {"ListFlights", "Criteria"}};
 
@@ -273,6 +277,7 @@ TEST(AsyncGrpcTest, DefaultHandlersAreUnimplemented) {
       {"GetSchema", "NYI"},
       {"DoAction", "NYI"},
       {"ListActions", "NYI"},
+      {"DoGet", "DoGetAsync is not implemented"},
       {"Handshake", "authentication mechanism"},
   };
 
@@ -317,9 +322,9 @@ TEST(AsyncGrpcTest, UnknownMethodsAreUnimplemented) {
 
 TEST(AsyncGrpcTest, MiddlewareCompletesOncePerCall) {
   // StartCall, SendingHeaders and CallCompleted run once per call, whatever its
-  // outcome: a handler error or an unknown method. CallCompleted carries the
-  // call's own status, which is the only Arrow-level oracle for a call that
-  // never reached a handler.
+  // outcome: success, handler error, a rejected call, an unknown method, and a
+  // cancellation. CallCompleted carries the call's own status, which is the only
+  // Arrow-level oracle for a call that never reached a handler.
   struct Case {
     std::string name;
     std::function<void(FlightClient*, const std::string&)> drive;
@@ -328,6 +333,13 @@ TEST(AsyncGrpcTest, MiddlewareCompletesOncePerCall) {
   };
 
   const std::vector<Case> cases = {
+      {"success",
+       [](FlightClient* client, const std::string&) {
+         ASSERT_OK_AND_ASSIGN(auto reader, client->DoGet(Ticket{kSchemaOnlyTicket}));
+         ASSERT_OK_AND_ASSIGN(auto chunk, reader->Next());
+         EXPECT_EQ(nullptr, chunk.data);
+       },
+       true, [](const Status& status) { EXPECT_TRUE(status.ok()) << status; }},
       {"handler error",
        [](FlightClient* client, const std::string&) {
          auto status = client->GetFlightInfo(FlightDescriptor::Command("fail")).status();
@@ -364,9 +376,68 @@ TEST(AsyncGrpcTest, MiddlewareCompletesOncePerCall) {
         << "CallCompleted must run exactly once per call";
     test.check_status(trace->completed_statuses[0]);
   }
+
+  {
+    // A rejecting middleware still completes the middleware that already
+    // started, with the rejection, and no handler runs.
+    auto trace = std::make_shared<MiddlewareTrace>();
+    TestFlightServer flight_server;
+    FlightServerOptions options(LocalhostLocation());
+    options.middleware = {
+        {"recording", std::make_shared<RecordingServerMiddlewareFactory>(trace)},
+        {"rejecting", std::make_shared<RejectingServerMiddlewareFactory>()}};
+    ASSERT_OK_AND_ASSIGN(auto client, StartAndConnect(&flight_server, options));
+    auto status = client->DoGet(Ticket{"rejected"}).status();
+    EXPECT_FALSE(status.ok());
+    EXPECT_THAT(status.ToString(), ::testing::HasSubstr("rejected by middleware"));
+    ASSERT_OK(StopClientAndServer(client.get(), &flight_server));
+    EXPECT_EQ(0, flight_server.handler_calls()) << "a rejected call reached its handler";
+    std::lock_guard<std::mutex> guard(trace->mutex);
+    EXPECT_EQ(1, trace->start_call);
+    ASSERT_EQ(1, trace->completed_statuses.size());
+    EXPECT_THAT(trace->completed_statuses[0].ToString(),
+                ::testing::HasSubstr("rejected by middleware"));
+  }
 }
 
 namespace {
+
+/// A DoGet handler that serves its schema and then parks its first payload until
+/// the call is cancelled, so a shutdown deadline has a pending RPC to end.
+class HangingDoGetServerForLifecycle final : public AsyncGenericFlightServerBase {
+ public:
+  arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
+      const ServerCallContext& context, const Ticket&) override {
+    entered.MarkFinished();
+    ARROW_RETURN_NOT_OK(AddCancelCallback(context, [this] { cancelled.MarkFinished(); }));
+    auto reader = arrow::RecordBatchReader::Make(
+                      {}, arrow::schema({arrow::field("value", arrow::int64())}))
+                      .ValueOrDie();
+    return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+        std::make_shared<HangingPayloadStream>(std::move(reader)));
+  }
+
+  /// A stream that hands out its schema and never a payload.
+  class HangingPayloadStream final : public AsyncFlightDataStream {
+   public:
+    explicit HangingPayloadStream(std::shared_ptr<RecordBatchReader> reader)
+        : resolved_(std::move(reader)) {}
+
+    arrow::Future<FlightPayload> GetSchemaPayloadAsync() override {
+      return resolved_.GetSchemaPayloadAsync();
+    }
+    arrow::Future<std::optional<FlightPayload>> NextAsync() override {
+      return arrow::Future<std::optional<FlightPayload>>::Make();
+    }
+    Status Close() override { return resolved_.Close(); }
+
+   private:
+    ResolvedStream resolved_;
+  };
+
+  Future<> entered = Future<>::Make();
+  Future<> cancelled = Future<>::Make();
+};
 
 /// A cancellable context the async service handed out, for the cancel-registry
 /// cases: the callback set is the reactor's, driven without a network.
@@ -438,8 +509,8 @@ TEST(AsyncGrpcTest, CancelCallbackRegistry) {
 }
 
 TEST(AsyncGrpcTest, AsyncServerStartupLifecycle) {
-  // An unsupported location scheme is refused by name, and a served RPC ends on
-  // Shutdown().
+  // An unsupported location scheme is refused by name, a served RPC ends on
+  // Shutdown(), and a shutdown deadline ends a call whose handler is still in.
   {
     AsyncGenericFlightServerBase server;
     ASSERT_OK_AND_ASSIGN(auto location, Location::Parse("unknown://127.0.0.1:0"));
@@ -456,6 +527,27 @@ TEST(AsyncGrpcTest, AsyncServerStartupLifecycle) {
     ASSERT_OK(client->Close());
     ARROW_EXPECT_OK(server.Shutdown());
     ARROW_EXPECT_OK(server.Wait());
+  }
+  {
+    // A pending RPC keeps Shutdown() from returning until its deadline ends it.
+    HangingDoGetServerForLifecycle server;
+    ASSERT_OK_AND_ASSIGN(auto client, StartAndConnect(&server));
+    FlightCallOptions patient;
+    patient.timeout = std::chrono::seconds(10);
+    auto reader = client->DoGet(patient, Ticket{"hang"});
+    ASSERT_OK(reader);
+    ASSERT_TRUE(server.entered.Wait(10)) << "the handler never ran";
+    // The deadline ends the pending call rather than waiting out its handler: the
+    // cancellation reaches the handler and Shutdown()/Wait() return.
+    const auto deadline =
+        std::chrono::system_clock::now() + std::chrono::milliseconds(500);
+    ASSERT_OK(server.Shutdown(&deadline));
+    EXPECT_TRUE(server.cancelled.Wait(10))
+        << "the pending handler was never told the call was cancelled";
+    ASSERT_OK(server.Wait());
+    EXPECT_FALSE(client->DoGet(patient, Ticket{"hang"}).ok())
+        << "the server must be gone after Shutdown()";
+    ARROW_UNUSED(client->Close());
   }
 }
 

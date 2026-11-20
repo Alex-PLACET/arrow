@@ -115,6 +115,7 @@ arrow_flight_srcs = [
 if has_async_server
     arrow_flight_srcs += [
         'transport/grpc/async_grpc_service.cc',
+        'transport/grpc/async_grpc_do_get.cc',
         'transport/grpc/async_grpc_handshake.cc',
         'transport/grpc/async_grpc_streaming.cc',
     ]
@@ -193,6 +194,7 @@ if has_async_server
         'flight-async-grpc-test',
         sources: [
             'transport/grpc/async_grpc_service_test.cc',
+            'transport/grpc/async_grpc_do_get_test.cc',
             'transport/grpc/async_grpc_unary_test.cc',
             'transport/grpc/async_grpc_streaming_test.cc',
             'transport/grpc/async_grpc_handshake_test.cc',

@@ -39,6 +39,7 @@
 
 namespace arrow::flight {
 
+AsyncFlightDataStream::~AsyncFlightDataStream() = default;
 AsyncFlightListing::~AsyncFlightListing() = default;
 AsyncResultStream::~AsyncResultStream() = default;
 
@@ -132,6 +133,11 @@ AsyncGenericFlightServerBase::DoActionAsync(const ServerCallContext&, const Acti
 arrow::Future<std::vector<ActionType>> AsyncGenericFlightServerBase::ListActionsAsync(
     const ServerCallContext&) {
   return Status::NotImplemented("NYI");
+}
+
+arrow::Future<std::shared_ptr<AsyncFlightDataStream>>
+AsyncGenericFlightServerBase::DoGetAsync(const ServerCallContext&, const Ticket&) {
+  return Status::NotImplemented("DoGetAsync is not implemented");
 }
 
 Status AsyncGenericFlightServerBase::Handshake(const ServerCallContext&,

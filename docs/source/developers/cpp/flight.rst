@@ -49,6 +49,7 @@ File                                Contents
 ``async_grpc_service_internal.h``   ``AsyncCallContext``, ``AsyncReactorBase``,
                                     the unary reactor
 ``async_grpc_streaming.cc``         ListActions, DoAction, ListFlights
+``async_grpc_do_get.cc``            DoGet
 ``async_grpc_handshake.cc``         Handshake
 ==================================  ===========================================
 
@@ -103,7 +104,7 @@ Cancellation
 ``AsyncReactorBase::OnCancel()`` is ``final`` and does two things in order:
 
 1. ``TearDownOnCancel()``: the reactor's own teardown, which settles the
-   status with ``FinishOnce()`` and then unwinds.
+   status with ``FinishOnce()`` and then unwinds (DoGet closes its stream).
 2. ``AsyncCallContext::RunCancelCallbacks()``: runs the callbacks handlers
    registered through
    :func:`arrow::flight::AsyncGenericFlightServerBase::AddCancelCallback`.
@@ -114,6 +115,16 @@ into the reactor, and registering never touches gRPC state.
 ``AddCancelCallback()`` finds the registry with a ``dynamic_cast`` from
 ``ServerCallContext``, and refuses (``Invalid``) contexts that the async
 server did not create.
+
+Per-method notes
+================
+
+DoGet
+   ``stream_mutex_`` guards the stream, ``closed_`` and ``wrote_schema_``.
+   Each ``GetSchemaPayloadAsync()`` / ``NextAsync()`` demand is made under it,
+   and ``CloseStreamOnce()`` claims the stream under it. So ``Close()`` never
+   overlaps a demand, and runs exactly once. A stream that arrives after
+   cancellation is closed by whichever path sees it last.
 
 Testing
 =======
