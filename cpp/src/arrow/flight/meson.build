@@ -23,6 +23,7 @@ install_headers(
         'client.h',
         'client_middleware.h',
         'client_tracing_middleware.h',
+        'flight_data_decoder.h',
         'middleware.h',
         'otel_logging.h',
         'platform.h',
@@ -92,6 +93,7 @@ arrow_flight_srcs = [
     'client_cookie_middleware.cc',
     'client_tracing_middleware.cc',
     'cookie_internal.cc',
+    'flight_data_decoder.cc',
     'middleware.cc',
     'serialization_internal.cc',
     'server.cc',
@@ -116,6 +118,7 @@ if has_async_server
     arrow_flight_srcs += [
         'transport/grpc/async_grpc_service.cc',
         'transport/grpc/async_grpc_do_get.cc',
+        'transport/grpc/async_grpc_do_put.cc',
         'transport/grpc/async_grpc_handshake.cc',
         'transport/grpc/async_grpc_streaming.cc',
     ]
@@ -195,6 +198,7 @@ if has_async_server
         sources: [
             'transport/grpc/async_grpc_service_test.cc',
             'transport/grpc/async_grpc_do_get_test.cc',
+            'transport/grpc/async_grpc_do_put_test.cc',
             'transport/grpc/async_grpc_unary_test.cc',
             'transport/grpc/async_grpc_streaming_test.cc',
             'transport/grpc/async_grpc_handshake_test.cc',

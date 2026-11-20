@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "arrow/flight/flight_data_decoder.h"
 #include "arrow/flight/server.h"
 #include "arrow/flight/types.h"
 #include "arrow/util/future.h"
@@ -124,7 +125,8 @@ class ARROW_FLIGHT_EXPORT AsyncResultStream {
 /// Threading: the transport has no thread or executor of its own. It chains
 /// its continuation on every future you return (a handler's result,
 /// AsyncFlightDataStream::GetSchemaPayloadAsync()/NextAsync(),
-/// AsyncFlightListing::NextAsync(), and AsyncResultStream::NextAsync()) with the
+/// AsyncFlightListing::NextAsync(), AsyncResultStream::NextAsync(), and an
+/// AsyncFlightDataListener's OnDescriptor()/OnNext()/OnFinish()) with the
 /// default CallbackOptions, so the continuation runs on whichever thread
 /// completes your future, or inline on the gRPC callback thread that called
 /// you if the future is already complete when you return it. That
@@ -303,6 +305,14 @@ class ARROW_FLIGHT_EXPORT AsyncGenericFlightServerBase {
   /// future, register a callback with AddCancelCallback().
   virtual arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
       const ServerCallContext& context, const Ticket& request);
+
+  /// \brief Create the AsyncFlightDataListener serving one DoPut RPC.
+  /// \see AsyncFlightDataListener
+  /// \param[in] context is the server call context.
+  /// \return A shared pointer to the AsyncFlightDataListener handling the upload, or
+  /// `nullptr` to refuse the upload.
+  virtual std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
+      const ServerCallContext& context);
 
   /// \brief Handle the handshake protocol with the client.
   /// \param[in] context is the server call context.

@@ -31,6 +31,7 @@
 #include <grpcpp/support/proto_buffer_reader.h>
 #include <grpcpp/support/slice.h>
 
+#include "arrow/flight/flight_data_decoder.h"
 #include "arrow/flight/serialization_internal.h"
 #include "arrow/flight/server_async.h"
 #include "arrow/flight/transport/grpc/async_grpc_compat.h"
@@ -331,6 +332,8 @@ ARROW_FLIGHT_EXPORT ::grpc::ServerGenericBidiReactor* MakeHandshakeReactor(
     AsyncCallContext flight_context, AsyncGenericFlightServerBase* base);
 ARROW_FLIGHT_EXPORT ::grpc::ServerGenericBidiReactor* MakeDoGetReactor(
     AsyncCallContext flight_context, AsyncGenericFlightServerBase* base);
+ARROW_FLIGHT_EXPORT ::grpc::ServerGenericBidiReactor* MakeDoPutReactor(
+    AsyncCallContext flight_context, std::shared_ptr<AsyncFlightDataListener> listener);
 ARROW_FLIGHT_EXPORT ::grpc::ServerGenericBidiReactor* MakeListActionsReactor(
     AsyncCallContext flight_context, AsyncGenericFlightServerBase* base);
 ARROW_FLIGHT_EXPORT ::grpc::ServerGenericBidiReactor* MakeDoActionReactor(
