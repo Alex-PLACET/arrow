@@ -64,8 +64,87 @@ inline FlightInfo MakeTestFlightInfo(FlightDescriptor descriptor) {
       .ValueOrDie();
 }
 
+// A vector-backed async iterator: every NextAsync() resolves immediately, and
+// exhaustion is reported as a null item.  Instantiated below for both iterator
+// interfaces the streaming RPCs use.
+template <typename T, typename Base>
+class VectorAsyncIterator final : public Base {
+ public:
+  explicit VectorAsyncIterator(std::vector<T> items) : items_(std::move(items)) {}
+
+  arrow::Future<std::shared_ptr<T>> NextAsync() override {
+    if (next_ >= items_.size()) {
+      return arrow::Future<std::shared_ptr<T>>::MakeFinished(std::shared_ptr<T>{});
+    }
+    return arrow::Future<std::shared_ptr<T>>::MakeFinished(
+        std::make_shared<T>(std::move(items_[next_++])));
+  }
+
+ private:
+  std::vector<T> items_;
+  size_t next_ = 0;
+};
+
+using SimpleListingAdapter = VectorAsyncIterator<FlightInfo, AsyncFlightListing>;
+using VectorAsyncResultStream = VectorAsyncIterator<Result, AsyncResultStream>;
+
+// An async iterator that yields one item and then fails: the error must become
+// the RPC status, not truncate the stream into a success.  `make_item` produces
+// that first item, or the status that fails the RPC before it.
+template <typename T, typename Base>
+class FailAfterFirstAsyncIterator final : public Base {
+ public:
+  FailAfterFirstAsyncIterator(std::function<arrow::Result<T>()> make_item,
+                              std::string error_message)
+      : make_item_(std::move(make_item)), error_message_(std::move(error_message)) {}
+
+  arrow::Future<std::shared_ptr<T>> NextAsync() override {
+    if (served_) {
+      return arrow::Future<std::shared_ptr<T>>::MakeFinished(
+          arrow::Status::IOError(error_message_));
+    }
+    served_ = true;
+    auto item = make_item_();
+    if (!item.ok()) {
+      return arrow::Future<std::shared_ptr<T>>::MakeFinished(item.status());
+    }
+    return arrow::Future<std::shared_ptr<T>>::MakeFinished(
+        std::make_shared<T>(std::move(*item)));
+  }
+
+ private:
+  std::function<arrow::Result<T>()> make_item_;
+  std::string error_message_;
+  bool served_ = false;
+};
+
+/// An iterator whose very first NextAsync() fails: the RPC must end with that error
+/// before anything is written.
+template <typename T, typename Base>
+class FailFirstAsyncIterator final : public Base {
+ public:
+  explicit FailFirstAsyncIterator(std::string error_message)
+      : error_message_(std::move(error_message)) {}
+
+  arrow::Future<std::shared_ptr<T>> NextAsync() override {
+    return arrow::Future<std::shared_ptr<T>>::MakeFinished(
+        arrow::Status::IOError(error_message_));
+  }
+
+ private:
+  std::string error_message_;
+};
+
+using FailFirstAsyncResultStream = FailFirstAsyncIterator<Result, AsyncResultStream>;
+using FailFirstAsyncListing = FailFirstAsyncIterator<FlightInfo, AsyncFlightListing>;
+
+using MidStreamErrorAsyncResultStream =
+    FailAfterFirstAsyncIterator<Result, AsyncResultStream>;
+using MidStreamErrorAsyncListing =
+    FailAfterFirstAsyncIterator<FlightInfo, AsyncFlightListing>;
+
 // Serves the canned answers the async-transport tests drive: one canned answer
-// per unary RPC. The handlers run on gRPC threads, the tests read the
+// per unary/streaming RPC. The handlers run on gRPC threads, the tests read the
 // recordings only after the server has shut down.
 class TestFlightServer final : public AsyncGenericFlightServerBase {
  public:
@@ -130,6 +209,98 @@ class TestFlightServer final : public AsyncGenericFlightServerBase {
     return arrow::Future<std::shared_ptr<PollInfo>>::MakeFinished(std::move(poll_info));
   }
 
+  // The streaming trio: ListActions (a vector), DoAction (an AsyncResultStream)
+  // and ListFlights (an AsyncFlightListing). `last_criteria_` records the
+  // filter the client sent (read only after the server stopped), the
+  // "fail-mid-stream" sentinels drive the error-path tests.
+  arrow::Future<std::vector<ActionType>> ListActionsAsync(
+      const ServerCallContext&) override {
+    handler_calls_.fetch_add(1);
+    std::vector<ActionType> actions = {ActionType("echo", "echo back"),
+                                       ActionType("fail", "always fails")};
+    if (fail_actions_) {
+      return arrow::Future<std::vector<ActionType>>::MakeFinished(
+          arrow::Status::KeyError("no such actions"));
+    }
+    if (empty_actions_) {
+      actions.clear();
+    }
+    return arrow::Future<std::vector<ActionType>>::MakeFinished(std::move(actions));
+  }
+
+  arrow::Future<std::shared_ptr<AsyncResultStream>> DoActionAsync(
+      const ServerCallContext&, const Action& action) override {
+    handler_calls_.fetch_add(1);
+    last_action_type_ = action.type;
+    if (action.type == "fail-mid-stream") {
+      return arrow::Future<std::shared_ptr<AsyncResultStream>>::MakeFinished(
+          std::make_shared<MidStreamErrorAsyncResultStream>(
+              [] { return Result{arrow::Buffer::FromString("first")}; },
+              "mid-stream action failure"));
+    }
+    if (action.type == "fail-first-next") {
+      return arrow::Future<std::shared_ptr<AsyncResultStream>>::MakeFinished(
+          std::make_shared<FailFirstAsyncResultStream>("first demand failed"));
+    }
+    if (action.type == "empty-result-stream") {
+      return arrow::Future<std::shared_ptr<AsyncResultStream>>::MakeFinished(
+          std::make_shared<VectorAsyncResultStream>(std::vector<Result>{}));
+    }
+    if (action.type == "null-result-stream") {
+      // Answered with a null stream: the transport answers CANCELLED for this
+      // case (grpc_server.cc:404-406), before writing anything.
+      return arrow::Future<std::shared_ptr<AsyncResultStream>>::MakeFinished(
+          std::shared_ptr<AsyncResultStream>{});
+    }
+    std::vector<Result> made;
+    made.emplace_back(arrow::Buffer::FromString("one"));
+    if (action.type == "multi") {
+      made.emplace_back(arrow::Buffer::FromString("two"));
+      made.emplace_back(arrow::Buffer::FromString("three"));
+    }
+    return arrow::Future<std::shared_ptr<AsyncResultStream>>::MakeFinished(
+        std::make_shared<VectorAsyncResultStream>(std::move(made)));
+  }
+
+  arrow::Future<std::shared_ptr<AsyncFlightListing>> ListFlightsAsync(
+      const ServerCallContext&, const Criteria* criteria) override {
+    handler_calls_.fetch_add(1);
+    criteria_was_null_ = criteria == nullptr;
+    if (criteria != nullptr) {
+      last_criteria_ = *criteria;
+    }
+    const std::string expression = criteria == nullptr ? "" : criteria->expression;
+    if (expression == "fail-mid-stream") {
+      return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(
+          std::make_shared<MidStreamErrorAsyncListing>(
+              [] {
+                return MakeTestFlightInfo(FlightDescriptor::Path({"first-listing"}));
+              },
+              "mid-stream listing failure"));
+    }
+    if (expression == "fail-first-next") {
+      return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(
+          std::make_shared<FailFirstAsyncListing>("first demand failed"));
+    }
+    if (expression == "null-listing") {
+      return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(
+          std::shared_ptr<AsyncFlightListing>{});
+    }
+    if (expression.empty()) {
+      // No criteria: the sync handler passes an empty (never null) Criteria
+      // to the handler and the async reactor must do the same, so an empty
+      // expression is reachable here.
+      return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(
+          std::make_shared<SimpleListingAdapter>(std::vector<FlightInfo>{}));
+    }
+    std::vector<FlightInfo> flights;
+    for (const auto& name : {"first-listing", "second-listing"}) {
+      flights.push_back(MakeTestFlightInfo(FlightDescriptor::Path({name})));
+    }
+    return arrow::Future<std::shared_ptr<AsyncFlightListing>>::MakeFinished(
+        std::make_shared<SimpleListingAdapter>(std::move(flights)));
+  }
+
   /// \brief Handshake delegates to the base class.
   ///
   /// Declared so the call is counted like every other handler: a malformed
@@ -140,15 +311,26 @@ class TestFlightServer final : public AsyncGenericFlightServerBase {
     return AsyncGenericFlightServerBase::Handshake(context, password, response);
   }
 
+  void set_empty_actions() { empty_actions_ = true; }
+  void set_failing_actions() { fail_actions_ = true; }
+
   /// How many handler overrides have run: zero proves a request was rejected
   /// before dispatch.
   int handler_calls() const { return handler_calls_.load(); }
 
   const FlightDescriptor& last_descriptor() const { return last_descriptor_; }
+  const std::string& last_action_type() const { return last_action_type_; }
+  const Criteria& last_criteria() const { return last_criteria_; }
+  bool criteria_was_null() const { return criteria_was_null_; }
 
  private:
   std::atomic<int> handler_calls_{0};
   FlightDescriptor last_descriptor_;
+  std::string last_action_type_;
+  Criteria last_criteria_;
+  bool criteria_was_null_ = false;
+  bool empty_actions_ = false;
+  bool fail_actions_ = false;
 };
 
 // Middleware execution counts, shared between the factory, the middleware and
@@ -635,6 +817,31 @@ inline arrow::Result<std::unique_ptr<FlightClient>> ConnectToWarmed(int port) {
   // The status is not checked: any answer means the channel is connected.
   static_cast<void>(client->GetFlightInfo(FlightDescriptor::Path({"warm-up"})));
   return client;
+}
+
+// Drain a DoAction result stream, projecting each Result to a string.
+inline arrow::Result<std::vector<std::string>> DrainResultBodies(ResultStream* results) {
+  std::vector<std::string> out;
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto result, results->Next());
+    if (result == nullptr) {
+      return out;
+    }
+    out.push_back(result->body->ToString());
+  }
+}
+
+// Drain a ListFlights listing, projecting each FlightInfo to its path.
+inline arrow::Result<std::vector<std::vector<std::string>>> DrainListingPaths(
+    FlightListing* listing) {
+  std::vector<std::vector<std::string>> out;
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto info, listing->Next());
+    if (info == nullptr) {
+      return out;
+    }
+    out.push_back(info->descriptor().path);
+  }
 }
 
 // Poll `predicate` until it holds or the timeout expires: tests use it to bound

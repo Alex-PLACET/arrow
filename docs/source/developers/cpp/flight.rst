@@ -48,6 +48,7 @@ File                                Contents
                                     name to a reactor
 ``async_grpc_service_internal.h``   ``AsyncCallContext``, ``AsyncReactorBase``,
                                     the unary reactor
+``async_grpc_streaming.cc``         ListActions, DoAction, ListFlights
 ``async_grpc_handshake.cc``         Handshake
 ==================================  ===========================================
 

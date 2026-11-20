@@ -147,6 +147,15 @@ call. Authentication goes through ``Handshake()`` and ``ValidateToken()``: a
 blocking :class:`arrow::flight::ServerAuthHandler` in the server options is
 rejected by ``Init()``. Server middleware is supported.
 
+The streaming RPCs return a source the transport pulls one future at a time:
+
+=================  =====================================================
+RPC                Handler returns
+=================  =====================================================
+``ListFlights``    :class:`arrow::flight::AsyncFlightListing`
+``DoAction``       :class:`arrow::flight::AsyncResultStream`
+=================  =====================================================
+
 Reacting to Cancellation
 ------------------------
 
