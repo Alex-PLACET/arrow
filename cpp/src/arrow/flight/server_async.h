@@ -20,6 +20,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,44 @@
 #include "arrow/util/macros.h"
 
 namespace arrow::flight {
+
+/// \brief Interface that produces a sequence of IPC payloads to be sent in
+/// FlightData protobuf messages, where a payload may arrive later.
+class ARROW_FLIGHT_EXPORT AsyncFlightDataStream {
+ public:
+  virtual ~AsyncFlightDataStream();
+
+  /// \brief Compute FlightPayload containing serialized RecordBatch schema
+  ///
+  /// Called once, before any NextAsync() payload is requested.
+  /// \return A future completed with the schema payload. A non-OK status fails the RPC.
+  virtual arrow::Future<FlightPayload> GetSchemaPayloadAsync() = 0;
+
+  /// \brief When the stream is completed, the last payload written will have null
+  /// metadata
+  ///
+  /// The transport keeps one call in flight at a time and only asks again once
+  /// the previous payload has been written.
+  ///
+  /// \return A future completed with the next payload, or with a nullopt once the stream
+  /// is exhausted. A non-OK status fails the RPC.
+  virtual arrow::Future<std::optional<FlightPayload>> NextAsync() = 0;
+
+  /// \brief Stop the stream: the RPC it was producing for is over.
+  ///
+  /// Called once, possibly from any thread, whichever way the RPC ends, including for a
+  /// stream DoGetAsync() resolves after the RPC was cancelled. A pending
+  /// NextAsync()/GetSchemaPayloadAsync() future must be resolved here (or abandoned
+  /// knowingly): the transport does not wait for it. Close() never overlaps a
+  /// GetSchemaPayloadAsync()/NextAsync() call, and neither is called once Close()
+  /// has started.
+  /// Its return status becomes the RPC's final status only on the normal end-of-stream
+  /// path (after NextAsync() reports end of stream).
+  /// On every other path (write failure, cancellation) the RPC already has a status and
+  /// the returned status is discarded.
+  /// \return The status of closing the stream.
+  virtual Status Close() { return Status::OK(); }
+};
 
 /// \brief An asynchronous iterator of FlightInfo instances, returned by
 /// ListFlightsAsync.
@@ -67,6 +106,10 @@ class ARROW_FLIGHT_EXPORT AsyncResultStream {
 ///   arrow::Future<std::shared_ptr<arrow::flight::FlightInfo>> GetFlightInfoAsync(
 ///       const arrow::flight::ServerCallContext&,
 ///       const arrow::flight::FlightDescriptor&) override;
+///
+///   arrow::Future<std::shared_ptr<arrow::flight::AsyncFlightDataStream>> DoGetAsync(
+///       const arrow::flight::ServerCallContext&,
+///       const arrow::flight::Ticket&) override;
 /// };
 /// \endcode
 ///
@@ -80,17 +123,18 @@ class ARROW_FLIGHT_EXPORT AsyncResultStream {
 ///
 /// Threading: the transport has no thread or executor of its own. It chains
 /// its continuation on every future you return (a handler's result,
-/// AsyncFlightListing::NextAsync() and AsyncResultStream::NextAsync()) with the
+/// AsyncFlightDataStream::GetSchemaPayloadAsync()/NextAsync(),
+/// AsyncFlightListing::NextAsync(), and AsyncResultStream::NextAsync()) with the
 /// default CallbackOptions, so the continuation runs on whichever thread
 /// completes your future, or inline on the gRPC callback thread that called
 /// you if the future is already complete when you return it. That
 /// continuation starts the RPC's next operation: the next StartWrite() (a
-/// listing entry, an action result, a unary response), the next
+/// payload, a listing entry, an action result, a unary response), the next
 /// StartRead(), or Finish(). Complete your futures on the executor you want
 /// the RPC's I/O issued from.
 ///
-/// Every request argument a handler receives (`FlightDescriptor`, `Criteria`,
-/// `Action`) is only valid for the duration of that handler call:
+/// Every request argument a handler receives (`Ticket`, `FlightDescriptor`,
+/// `Criteria`, `Action`) is only valid for the duration of that handler call:
 /// copy what you need before completing the returned future from another
 /// thread. The `ServerCallContext` handed to a handler is likewise the call's
 /// own context and must not outlive it.
@@ -238,6 +282,27 @@ class ARROW_FLIGHT_EXPORT AsyncGenericFlightServerBase {
   /// \see FlightServerBase::ListActions.
   virtual arrow::Future<std::vector<ActionType>> ListActionsAsync(
       const ServerCallContext& context);
+
+  /// \brief The stream serving one DoGet RPC.
+  ///
+  /// Called after the ticket is parsed, the request is only valid for the
+  /// duration of the call.
+  /// \param[in] context is the server call context.
+  /// \param[in] request is an opaque ticket.
+  /// \return A future completed with the stream to serve, or with a non-OK
+  /// status to fail the RPC.
+  /// A future completed with a `nullptr` stream answers `KeyError("No data in this
+  /// flight")`. Complete the future from your ownthread or pool: the transport writes
+  /// whatever stream it resolves to, and must not be blocked waiting for it.
+  ///
+  /// If the RPC is cancelled while the returned future is pending, the
+  /// transport finishes the RPC without waiting for it. The stream the future
+  /// eventually resolves to is never read from, but still receives Close():
+  /// on the thread that completes the future, or on the transport's thread when
+  /// that completion races the cancellation. To stop the work behind a pending
+  /// future, register a callback with AddCancelCallback().
+  virtual arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
+      const ServerCallContext& context, const Ticket& request);
 
   /// \brief Handle the handshake protocol with the client.
   /// \param[in] context is the server call context.

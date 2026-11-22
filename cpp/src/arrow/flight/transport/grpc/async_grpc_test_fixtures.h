@@ -56,6 +56,10 @@
 
 namespace arrow::flight::transport::grpc {
 
+// The ticket the test server answers with a stream that has a schema and no
+// batches at all, every other ticket gets the 3-batch stream.
+constexpr const char* kSchemaOnlyTicket = "schema-only-do-get-ticket";
+
 // One canned FlightInfo, `descriptor` names it for the assertions.
 inline FlightInfo MakeTestFlightInfo(FlightDescriptor descriptor) {
   return FlightInfo::Make(*arrow::schema({arrow::field("value", arrow::int64())}),
@@ -63,6 +67,31 @@ inline FlightInfo MakeTestFlightInfo(FlightDescriptor descriptor) {
                           /*total_records=*/-1, /*total_bytes=*/-1)
       .ValueOrDie();
 }
+
+// An AsyncFlightDataStream over an in-memory RecordBatchReader: every payload is
+// already available, so each future is finished when it is created.
+class ResolvedStream : public AsyncFlightDataStream {
+ public:
+  explicit ResolvedStream(std::shared_ptr<RecordBatchReader> reader)
+      : stream_(std::move(reader)) {}
+
+  arrow::Future<FlightPayload> GetSchemaPayloadAsync() override {
+    return stream_.GetSchemaPayload();
+  }
+
+  arrow::Future<std::optional<FlightPayload>> NextAsync() override {
+    ARROW_ASSIGN_OR_RAISE(auto payload, stream_.Next());
+    if (payload.ipc_message.metadata == nullptr) {
+      return std::optional<FlightPayload>();  // end of stream
+    }
+    return std::optional<FlightPayload>(std::move(payload));
+  }
+
+  Status Close() override { return stream_.Close(); }
+
+ private:
+  RecordBatchStream stream_;
+};
 
 // A vector-backed async iterator: every NextAsync() resolves immediately, and
 // exhaustion is reported as a null item.  Instantiated below for both iterator
@@ -143,11 +172,34 @@ using MidStreamErrorAsyncResultStream =
 using MidStreamErrorAsyncListing =
     FailAfterFirstAsyncIterator<FlightInfo, AsyncFlightListing>;
 
-// Serves the canned answers the async-transport tests drive: one canned answer
-// per unary/streaming RPC. The handlers run on gRPC threads, the tests read the
+// Serves the canned answers the async-transport tests drive: 3 batches of 5
+// rows for any ticket except kSchemaOnlyTicket, and one canned answer per
+// unary/streaming RPC. The handlers run on gRPC threads, the tests read the
 // recordings only after the server has shut down.
 class TestFlightServer final : public AsyncGenericFlightServerBase {
  public:
+  arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
+      const ServerCallContext&, const Ticket& request) override {
+    handler_calls_.fetch_add(1);
+    ticket_ = request.ticket;
+    auto schema = arrow::schema(
+        {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+    if (request.ticket == kSchemaOnlyTicket) {
+      // An empty reader still carries the schema, NextAsync() reports the end
+      // of stream right away.
+      return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+          std::make_shared<ResolvedStream>(
+              arrow::RecordBatchReader::Make({}, schema).ValueOrDie()));
+    }
+    auto batch = arrow::RecordBatch::Make(
+        schema, 5,
+        {arrow::ArrayFromJSON(arrow::int64(), "[1, 2, 3, 4, 5]"),
+         arrow::ArrayFromJSON(arrow::int64(), "[10, 20, 30, 40, 50]")});
+    return arrow::Future<std::shared_ptr<AsyncFlightDataStream>>::MakeFinished(
+        std::make_shared<ResolvedStream>(
+            arrow::RecordBatchReader::Make({batch, batch, batch}).ValueOrDie()));
+  }
+
   // The unary trio: canned responses. `last_descriptor_` records the request
   // of the last one served (it is written on a gRPC thread, so tests read it
   // only after the server has shut down), Command("fail") is the sentinel that
@@ -318,6 +370,7 @@ class TestFlightServer final : public AsyncGenericFlightServerBase {
   /// before dispatch.
   int handler_calls() const { return handler_calls_.load(); }
 
+  const std::string& ticket() const { return ticket_; }
   const FlightDescriptor& last_descriptor() const { return last_descriptor_; }
   const std::string& last_action_type() const { return last_action_type_; }
   const Criteria& last_criteria() const { return last_criteria_; }
@@ -325,6 +378,7 @@ class TestFlightServer final : public AsyncGenericFlightServerBase {
 
  private:
   std::atomic<int> handler_calls_{0};
+  std::string ticket_;
   FlightDescriptor last_descriptor_;
   std::string last_action_type_;
   Criteria last_criteria_;

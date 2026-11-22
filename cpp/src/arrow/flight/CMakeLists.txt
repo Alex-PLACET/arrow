@@ -214,6 +214,7 @@ if(ARROW_GRPC_VERSION VERSION_GREATER_EQUAL "1.65")
   list(APPEND
        ARROW_FLIGHT_SRCS
        transport/grpc/async_grpc_service.cc
+       transport/grpc/async_grpc_do_get.cc
        transport/grpc/async_grpc_handshake.cc
        transport/grpc/async_grpc_streaming.cc)
 endif()
@@ -365,6 +366,7 @@ if(ARROW_GRPC_VERSION VERSION_GREATER_EQUAL "1.65")
   add_arrow_test(flight_async_grpc_test
                  SOURCES
                  transport/grpc/async_grpc_service_test.cc
+                 transport/grpc/async_grpc_do_get_test.cc
                  transport/grpc/async_grpc_unary_test.cc
                  transport/grpc/async_grpc_streaming_test.cc
                  transport/grpc/async_grpc_handshake_test.cc

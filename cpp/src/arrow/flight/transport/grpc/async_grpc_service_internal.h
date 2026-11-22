@@ -329,6 +329,8 @@ class UnaryReactor final : public AsyncReactorBase {
 
 ARROW_FLIGHT_EXPORT ::grpc::ServerGenericBidiReactor* MakeHandshakeReactor(
     AsyncCallContext flight_context, AsyncGenericFlightServerBase* base);
+ARROW_FLIGHT_EXPORT ::grpc::ServerGenericBidiReactor* MakeDoGetReactor(
+    AsyncCallContext flight_context, AsyncGenericFlightServerBase* base);
 ARROW_FLIGHT_EXPORT ::grpc::ServerGenericBidiReactor* MakeListActionsReactor(
     AsyncCallContext flight_context, AsyncGenericFlightServerBase* base);
 ARROW_FLIGHT_EXPORT ::grpc::ServerGenericBidiReactor* MakeDoActionReactor(

@@ -32,6 +32,7 @@ namespace pb = arrow::flight::protocol;
 
 constexpr std::string_view kPrefix = "/arrow.flight.protocol.FlightService/";
 constexpr std::string_view kHandshakeMethod = "Handshake";
+constexpr std::string_view kDoGetMethod = "DoGet";
 constexpr std::string_view kDoActionMethod = "DoAction";
 constexpr std::string_view kListActionsMethod = "ListActions";
 constexpr std::string_view kPollFlightInfoMethod = "PollFlightInfo";
@@ -44,6 +45,7 @@ static const std::unordered_map<std::string_view, FlightMethod> kMethodMap = {
     {kListFlightsMethod, FlightMethod::ListFlights},
     {kGetFlightInfoMethod, FlightMethod::GetFlightInfo},
     {kGetSchemaMethod, FlightMethod::GetSchema},
+    {kDoGetMethod, FlightMethod::DoGet},
     {kDoActionMethod, FlightMethod::DoAction},
     {kListActionsMethod, FlightMethod::ListActions},
     {kPollFlightInfoMethod, FlightMethod::PollFlightInfo},
@@ -102,6 +104,8 @@ AsyncGenericFlightService::AsyncGenericFlightService(
       return detail::MakeDoActionReactor(std::move(flight_context), base_);
     case FlightMethod::ListFlights:
       return detail::MakeListFlightsReactor(std::move(flight_context), base_);
+    case FlightMethod::DoGet:
+      return detail::MakeDoGetReactor(std::move(flight_context), base_);
     default:
       break;
   }

@@ -154,7 +154,57 @@ RPC                Handler returns
 =================  =====================================================
 ``ListFlights``    :class:`arrow::flight::AsyncFlightListing`
 ``DoAction``       :class:`arrow::flight::AsyncResultStream`
+``DoGet``          :class:`arrow::flight::AsyncFlightDataStream`
 =================  =====================================================
+
+Serving DoGet
+-------------
+
+An :class:`arrow::flight::AsyncFlightDataStream` produces IPC payloads (see
+:func:`arrow::ipc::GetSchemaPayload` and
+:func:`arrow::ipc::GetRecordBatchPayload`). The transport asks for the schema
+first, then for one payload at a time, and asks again only once the previous
+payload has been written:
+
+.. code-block:: cpp
+
+   class QueryStream : public arrow::flight::AsyncFlightDataStream {
+    public:
+     explicit QueryStream(std::shared_ptr<Query> query) : query_(std::move(query)) {}
+
+     arrow::Future<arrow::flight::FlightPayload> GetSchemaPayloadAsync() override {
+       return query_->SchemaPayload();
+     }
+
+     arrow::Future<std::optional<arrow::flight::FlightPayload>> NextAsync() override {
+       // Complete with std::nullopt at the end of the stream.
+       return query_->NextPayload();
+     }
+
+     arrow::Status Close() override {
+       // The RPC is over: stop producing and resolve any pending NextAsync().
+       return query_->Stop();
+     }
+
+    private:
+     std::shared_ptr<Query> query_;
+   };
+
+   arrow::Future<std::shared_ptr<arrow::flight::AsyncFlightDataStream>> DoGetAsync(
+       const arrow::flight::ServerCallContext& context,
+       const arrow::flight::Ticket& request) override {
+     return catalog_->Open(request).Then(
+         [](const std::shared_ptr<Query>& query)
+             -> std::shared_ptr<arrow::flight::AsyncFlightDataStream> {
+           return std::make_shared<QueryStream>(query);
+         });
+   }
+
+``Close()`` is called exactly once, however the RPC ends. That includes a
+stream ``DoGetAsync()`` only completes after the client cancelled: such a
+stream is never read from, but it is still closed. ``Close()`` never overlaps
+``GetSchemaPayloadAsync()`` or ``NextAsync()``, and neither is called once
+``Close()`` has started.
 
 Reacting to Cancellation
 ------------------------
@@ -205,8 +255,9 @@ futures:
 Complete futures promptly and never block inside a handler: a blocked gRPC
 callback thread stalls every other RPC served by it.
 
-The internals of the transport are described in
-:ref:`cpp-flight-async-internals`.
+A complete program ships as
+``cpp/examples/arrow/flight_async_generic_doget_example.cc``. The internals of
+the transport are described in :ref:`cpp-flight-async-internals`.
 
 Using the Flight Client
 =======================
