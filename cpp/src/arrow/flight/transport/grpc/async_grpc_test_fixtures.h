@@ -173,11 +173,24 @@ using MidStreamErrorAsyncListing =
     FailAfterFirstAsyncIterator<FlightInfo, AsyncFlightListing>;
 
 // Serves the canned answers the async-transport tests drive: 3 batches of 5
-// rows for any ticket except kSchemaOnlyTicket, and one canned answer per
-// unary/streaming RPC. The handlers run on gRPC threads, the tests read the
-// recordings only after the server has shut down.
+// rows for any ticket except kSchemaOnlyTicket, uploads through the listener the
+// test installs, and one canned answer per unary/streaming RPC. The handlers
+// run on gRPC threads, the tests read the recordings only after the server has
+// shut down.
 class TestFlightServer final : public AsyncGenericFlightServerBase {
  public:
+  // The listener the next DoPut RPC is handed, nullptr (the default) refuses
+  // uploads, which is the base class behavior.
+  std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
+      const ServerCallContext&) override {
+    handler_calls_.fetch_add(1);
+    return listener_;
+  }
+
+  void set_listener(std::shared_ptr<AsyncFlightDataListener> listener) {
+    listener_ = std::move(listener);
+  }
+
   arrow::Future<std::shared_ptr<AsyncFlightDataStream>> DoGetAsync(
       const ServerCallContext&, const Ticket& request) override {
     handler_calls_.fetch_add(1);
@@ -378,6 +391,7 @@ class TestFlightServer final : public AsyncGenericFlightServerBase {
 
  private:
   std::atomic<int> handler_calls_{0};
+  std::shared_ptr<AsyncFlightDataListener> listener_;
   std::string ticket_;
   FlightDescriptor last_descriptor_;
   std::string last_action_type_;
@@ -386,6 +400,308 @@ class TestFlightServer final : public AsyncGenericFlightServerBase {
   bool empty_actions_ = false;
   bool fail_actions_ = false;
 };
+
+// Records what the decoder hands to the application: the schema, every chunk,
+// the descriptor, which status the test configured for each callback, and the
+// terminal events (OnFinish and what Cancel() reported), so the upload's error
+// path and its ending are both reachable from here. The callbacks run on gRPC
+// threads while the test thread reads the accessors, so everything they share
+// goes through mutex_.
+class RecordingListener : public AsyncFlightDataListener {
+ public:
+  arrow::Status OnSchemaDecoded(std::shared_ptr<arrow::Schema> schema) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++schema_count_;
+    schema_ = std::move(schema);
+    return schema_status_;
+  }
+
+  arrow::Future<> OnNext(FlightStreamChunk chunk) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (chunk.data) {
+      batches_.push_back(std::move(chunk.data));
+    } else {
+      ++metadata_only_count_;
+      metadata_chunks_.push_back(std::move(chunk.app_metadata));
+    }
+    return next_status_;
+  }
+
+  // Records the upload's descriptor and reports whatever status the test
+  // configured, so the descriptor rejection path is reachable from here too.
+  arrow::Future<> OnDescriptor(const FlightDescriptor& descriptor) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    descriptors_.push_back(descriptor);
+    return descriptor_status_;
+  }
+
+  arrow::Future<> OnFinish(Status status) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++finish_count_;
+    finish_status_ = std::move(status);
+    return finish_result_;
+  }
+
+  /// \brief Cancel from whatever thread the test drives, recording what Cancel() said.
+  Status CancelWith(Status status) {
+    const Status cancel_status = Cancel(std::move(status));
+    std::lock_guard<std::mutex> lock(mutex_);
+    cancel_status_ = cancel_status;
+    return cancel_status_;
+  }
+
+  // Consumer-side rejection of the upload, as the decoder tests do.
+  void set_next_status(arrow::Status status) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    next_status_ = std::move(status);
+  }
+  // Rejection before any schema or data arrives.
+  void set_descriptor_status(arrow::Status status) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    descriptor_status_ = std::move(status);
+  }
+  // Rejection of the schema.
+  void set_schema_status(arrow::Status status) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    schema_status_ = std::move(status);
+  }
+  // The result OnFinish() returns: a failing one overrides a successful upload.
+  void set_finish_status(arrow::Status status) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    finish_result_ = std::move(status);
+  }
+  /// The status OnFinish() returns, for a test that completes it late.
+  void set_finish_result(Future<> result) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    finish_result_ = std::move(result);
+  }
+
+  int schema_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return schema_count_;
+  }
+  int descriptor_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<int>(descriptors_.size());
+  }
+  int metadata_only_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return metadata_only_count_;
+  }
+  int finish_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return finish_count_;
+  }
+  std::shared_ptr<arrow::Schema> schema() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return schema_;
+  }
+  std::vector<FlightDescriptor> descriptors() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return descriptors_;
+  }
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return batches_;
+  }
+  std::vector<std::shared_ptr<arrow::Buffer>> metadata_chunks() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return metadata_chunks_;
+  }
+  Status finish_status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return finish_status_;
+  }
+  Status cancel_status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cancel_status_;
+  }
+
+ protected:
+  /// The callbacks run on gRPC threads while the test thread reads the
+  /// accessors, so everything they share goes through this.
+  mutable std::mutex mutex_;
+  int schema_count_ = 0;
+  int metadata_only_count_ = 0;
+  int finish_count_ = 0;
+  std::shared_ptr<arrow::Schema> schema_;
+  std::vector<FlightDescriptor> descriptors_;
+  std::vector<std::shared_ptr<arrow::RecordBatch>> batches_;
+  std::vector<std::shared_ptr<arrow::Buffer>> metadata_chunks_;
+  arrow::Status schema_status_;
+  arrow::Status descriptor_status_;
+  arrow::Status next_status_;
+  arrow::Status finish_status_;
+  arrow::Status cancel_status_;
+  Future<> finish_result_ = Future<>::MakeFinished();
+};
+
+/// Which RecordingListener callback ParkedUploadListener() parks.
+enum class RecordingListenerPhase { kDescriptor, kNext, kFinish };
+
+/// \brief A RecordingListener whose selected callback parks until the test
+/// releases it, the way an application that must do asynchronous work before
+/// accepting a message does. The base records the callback first; subsequent
+/// callbacks of the same kind use the base result.
+template <RecordingListenerPhase kPhase>
+class ParkedUploadListener : public RecordingListener {
+ public:
+  Future<> OnDescriptor(const FlightDescriptor& descriptor) override {
+    auto recorded = RecordingListener::OnDescriptor(descriptor);
+    if constexpr (kPhase == RecordingListenerPhase::kDescriptor) {
+      return Park(recorded);
+    }
+    return recorded;
+  }
+
+  Future<> OnNext(FlightStreamChunk chunk) override {
+    auto recorded = RecordingListener::OnNext(std::move(chunk));
+    if constexpr (kPhase == RecordingListenerPhase::kNext) {
+      return Park(recorded);
+    }
+    return recorded;
+  }
+
+  Future<> OnFinish(Status status) override {
+    auto recorded = RecordingListener::OnFinish(std::move(status));
+    if constexpr (kPhase == RecordingListenerPhase::kFinish) {
+      return Park(recorded);
+    }
+    return recorded;
+  }
+
+  /// A future completed once the parked callback has been entered.
+  Future<> entered() const { return entered_; }
+
+  /// Release the parked callback, once, with `status`; later calls are no-ops.
+  void Release(Status status = Status::OK()) {
+    Future<> pending;
+    {
+      std::lock_guard<std::mutex> lock(park_mutex_);
+      if (!pending_.is_valid() || pending_.is_finished()) {
+        return;
+      }
+      pending = std::move(pending_);
+    }
+    pending.MarkFinished(std::move(status));
+  }
+
+ private:
+  Future<> Park(Future<> recorded) {
+    {
+      std::lock_guard<std::mutex> lock(park_mutex_);
+      if (parked_) {
+        return recorded;  // only the first callback of this kind parks
+      }
+      parked_ = true;
+      pending_ = Future<>::Make();
+    }
+    entered_.MarkFinished();
+    return pending_;
+  }
+
+  mutable std::mutex park_mutex_;
+  bool parked_ = false;
+  Future<> pending_;
+  Future<> entered_ = Future<>::Make();
+};
+
+// A server that accepts uploads: the transport asks the server for the per-RPC
+// listener through CreateDoPutListener().  One fresh listener per RPC, as
+// overlapping uploads require.  The test either reads them after the server has
+// stopped, or waits for them with WaitForListener when it must act mid-upload.
+//
+// The listener type is the fixture's parameter, so a test can plug in one that
+// parks, defers or cancels an upload without re-implementing the seam.
+template <typename Listener>
+class RecordingUploadServer : public AsyncGenericFlightServerBase {
+ public:
+  std::shared_ptr<AsyncFlightDataListener> CreateDoPutListener(
+      const ServerCallContext&) override {
+    auto listener = std::make_shared<Listener>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    listeners_.push_back(listener);
+    return listener;
+  }
+
+  int calls() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<int>(listeners_.size());
+  }
+
+  std::shared_ptr<Listener> listener(size_t i) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return listeners_[i];
+  }
+
+  /// \brief Wait (bounded) for the listener of the i-th upload to exist.
+  /// The factory runs on a gRPC thread, so a test that must act mid-upload
+  /// waits for it here instead of racing the read.
+  std::shared_ptr<Listener> WaitForListener(size_t i = 0) const {
+    for (int attempt = 0; attempt < 500; attempt++) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (listeners_.size() > i) return listeners_[i];
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return nullptr;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::shared_ptr<Listener>> listeners_;
+};
+
+using TestUploadServer = RecordingUploadServer<RecordingListener>;
+
+/// A listener that acknowledges every batch it is handed with one application
+/// metadata message, the way an application reports per-chunk progress, and
+/// takes the next batch only once that ack is written: chaining OnNext()'s
+/// future on WriteMetadataAsync()'s is the upload's backpressure. The batch
+/// recording itself is RecordingListener's.
+class MetadataReplyingListener final : public RecordingListener {
+ public:
+  arrow::Future<> OnNext(FlightStreamChunk chunk) override {
+    if (!chunk.data) {
+      return RecordingListener::OnNext(std::move(chunk));
+    }
+    const auto ack = arrow::Buffer::FromString(
+        "ack " + std::to_string(chunk.data->num_rows()) + " rows");
+    return writer()->WriteMetadataAsync(*ack).Then([this, chunk]() {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++wrote_;
+      }
+      return RecordingListener::OnNext(chunk);
+    });
+  }
+
+  int wrote() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return wrote_;
+  }
+
+ private:
+  int wrote_ = 0;
+};
+
+/// A listener that calls back into the writer from OnFinish: OnFinish is
+/// application code running on a transport thread, so the transport must not
+/// hold its own write lock across it.
+class FinishingAckListener final : public RecordingListener {
+ public:
+  arrow::Future<> OnFinish(Status status) override {
+    finish_write =
+        writer()->WriteMetadataAsync(*arrow::Buffer::FromString("from-onfinish"));
+    return RecordingListener::OnFinish(std::move(status));
+  }
+
+  arrow::Future<> finish_write;
+};
+
+/// Hands out a MetadataReplyingListener for every upload.
+using MetadataReplyingUploadServer = RecordingUploadServer<MetadataReplyingListener>;
 
 // Middleware execution counts, shared between the factory, the middleware and
 // the test thread (all three touch it).
@@ -462,6 +778,19 @@ static const char kServerUri[] = "grpc://127.0.0.1:0";
 // method the service does not have.
 constexpr const char* kUnknownMethod =
     "/arrow.flight.protocol.FlightService/NoSuchMethod";
+
+/// The bytes of a gRPC message, for parsing a reply back from the wire.
+inline std::string ByteBufferToString(::grpc::ByteBuffer message) {
+  std::vector<::grpc::Slice> slices;
+  std::string out;
+  if (!message.Dump(&slices).ok()) {
+    return out;
+  }
+  for (const auto& slice : slices) {
+    out.append(reinterpret_cast<const char*>(slice.begin()), slice.size());
+  }
+  return out;
+}
 
 /// The full method path of one FlightService RPC, for a raw generic call.
 inline std::string MethodPath(std::string_view method) {
@@ -873,6 +1202,20 @@ inline arrow::Result<std::unique_ptr<FlightClient>> ConnectToWarmed(int port) {
   return client;
 }
 
+// The "a", "b" int64 schema the canned streams serve.
+inline std::shared_ptr<Schema> TwoColumnSchema() {
+  return arrow::schema(
+      {arrow::field("a", arrow::int64()), arrow::field("b", arrow::int64())});
+}
+
+// One 3-row batch of TwoColumnSchema(), the payload the DoPut tests upload.
+inline std::shared_ptr<RecordBatch> TwoColumnBatch(
+    const std::shared_ptr<Schema>& schema) {
+  return arrow::RecordBatch::Make(schema, 3,
+                                  {arrow::ArrayFromJSON(arrow::int64(), "[1, 2, 3]"),
+                                   arrow::ArrayFromJSON(arrow::int64(), "[10, 20, 30]")});
+}
+
 // Drain a DoAction result stream, projecting each Result to a string.
 inline arrow::Result<std::vector<std::string>> DrainResultBodies(ResultStream* results) {
   std::vector<std::string> out;
@@ -932,6 +1275,23 @@ inline Status StopClientAndServer(FlightClient* client,
   if (status.ok()) status = shutdown;
   if (status.ok()) status = wait;
   return status;
+}
+
+// Upload one batch and report whichever surface first reports an error: the
+// DoPut call, the write, or Close.
+inline std::pair<std::string, arrow::Status> UploadOneBatch(
+    FlightClient* client, const FlightDescriptor& descriptor,
+    const std::shared_ptr<arrow::Schema>& schema,
+    const std::shared_ptr<arrow::RecordBatch>& batch) {
+  auto result = client->DoPut(descriptor, schema);
+  if (!result.ok()) {
+    return {"DoPut", result.status()};
+  }
+  auto write_status = result->writer->WriteRecordBatch(*batch);
+  if (!write_status.ok()) {
+    return {"WriteRecordBatch", write_status};
+  }
+  return {"Close", result->writer->Close()};
 }
 
 }  // namespace arrow::flight::transport::grpc

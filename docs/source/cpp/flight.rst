@@ -155,6 +155,8 @@ RPC                Handler returns
 ``ListFlights``    :class:`arrow::flight::AsyncFlightListing`
 ``DoAction``       :class:`arrow::flight::AsyncResultStream`
 ``DoGet``          :class:`arrow::flight::AsyncFlightDataStream`
+``DoPut``          an :class:`arrow::flight::AsyncFlightDataListener`,
+                   from ``CreateDoPutListener()``
 =================  =====================================================
 
 Serving DoGet
@@ -206,6 +208,55 @@ stream is never read from, but it is still closed. ``Close()`` never overlaps
 ``GetSchemaPayloadAsync()`` or ``NextAsync()``, and neither is called once
 ``Close()`` has started.
 
+Serving DoPut
+-------------
+
+``CreateDoPutListener()`` returns one fresh
+:class:`arrow::flight::AsyncFlightDataListener` per upload, or ``nullptr`` to
+refuse uploads (the client then sees ``NotImplemented``). The transport reads
+the next message only once the future returned by ``OnNext()`` completes.
+:func:`arrow::flight::AsyncFlightDataWriter::WriteMetadataAsync` sends one
+acknowledgement and completes when it has been written, so returning a future
+chained on it holds back the upload until the client has been answered:
+
+.. code-block:: cpp
+
+   class IngestListener : public arrow::flight::AsyncFlightDataListener {
+    public:
+     explicit IngestListener(std::shared_ptr<Sink> sink) : sink_(std::move(sink)) {}
+
+     arrow::Future<> OnNext(arrow::flight::FlightStreamChunk chunk) override {
+       if (chunk.data == nullptr) {
+         return arrow::Future<>::MakeFinished();  // a metadata-only message
+       }
+       return sink_->Append(chunk.data).Then([this](int64_t rows) {
+         const auto ack = arrow::Buffer::FromString(std::to_string(rows));
+         // The next message is read only once this ack has been written.
+         return writer()->WriteMetadataAsync(*ack);
+       });
+     }
+
+     arrow::Future<> OnFinish(arrow::Status status) override {
+       // Called once, however the upload ends. The client is answered only
+       // once this future completes, and a failure here fails the upload.
+       return status.ok() ? sink_->Commit() : sink_->Abort(status);
+     }
+
+    private:
+     std::shared_ptr<Sink> sink_;
+   };
+
+   std::shared_ptr<arrow::flight::AsyncFlightDataListener> CreateDoPutListener(
+       const arrow::flight::ServerCallContext& context) override {
+     return std::make_shared<IngestListener>(catalog_->NewSink());
+   }
+
+Only one acknowledgement is in flight at a time: ``WriteMetadataAsync()``
+returns an already-failed ``Invalid`` future while the previous one is still
+being written. To reject an upload from the server side (a quota, a bad
+batch), call :func:`arrow::flight::AsyncFlightDataListener::Cancel` from any
+thread.
+
 Reacting to Cancellation
 ------------------------
 
@@ -255,9 +306,10 @@ futures:
 Complete futures promptly and never block inside a handler: a blocked gRPC
 callback thread stalls every other RPC served by it.
 
-A complete program ships as
-``cpp/examples/arrow/flight_async_generic_doget_example.cc``. The internals of
-the transport are described in :ref:`cpp-flight-async-internals`.
+Two complete programs ship with the C++ examples:
+``cpp/examples/arrow/flight_async_generic_doget_example.cc`` and
+``cpp/examples/arrow/flight_async_generic_doput_example.cc``. How the
+transport is built is described in :ref:`cpp-flight-async-internals`.
 
 Using the Flight Client
 =======================

@@ -189,6 +189,7 @@ set(ARROW_FLIGHT_SRCS
     client_cookie_middleware.cc
     client_tracing_middleware.cc
     cookie_internal.cc
+    flight_data_decoder.cc
     middleware.cc
     serialization_internal.cc
     server.cc
@@ -215,6 +216,7 @@ if(ARROW_GRPC_VERSION VERSION_GREATER_EQUAL "1.65")
        ARROW_FLIGHT_SRCS
        transport/grpc/async_grpc_service.cc
        transport/grpc/async_grpc_do_get.cc
+       transport/grpc/async_grpc_do_put.cc
        transport/grpc/async_grpc_handshake.cc
        transport/grpc/async_grpc_streaming.cc)
 endif()
@@ -367,6 +369,7 @@ if(ARROW_GRPC_VERSION VERSION_GREATER_EQUAL "1.65")
                  SOURCES
                  transport/grpc/async_grpc_service_test.cc
                  transport/grpc/async_grpc_do_get_test.cc
+                 transport/grpc/async_grpc_do_put_test.cc
                  transport/grpc/async_grpc_unary_test.cc
                  transport/grpc/async_grpc_streaming_test.cc
                  transport/grpc/async_grpc_handshake_test.cc

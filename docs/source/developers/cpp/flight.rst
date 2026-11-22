@@ -50,10 +50,13 @@ File                                Contents
                                     the unary reactor
 ``async_grpc_streaming.cc``         ListActions, DoAction, ListFlights
 ``async_grpc_do_get.cc``            DoGet
+``async_grpc_do_put.cc``            DoPut
 ``async_grpc_handshake.cc``         Handshake
 ==================================  ===========================================
 
-``arrow/flight/server_async.h`` declares the public handler interfaces.
+``arrow/flight/server_async.h`` declares the public handler interfaces, and
+``arrow/flight/flight_data_decoder.h`` declares the DoPut listener, its
+metadata writer and the push decoder DoPut uses.
 
 Dispatch
 ========
@@ -61,7 +64,8 @@ Dispatch
 ``AsyncGenericFlightService::CreateReactor()`` runs once per RPC on a gRPC
 thread. It builds the call's ``AsyncCallContext`` (running authentication and
 server middleware through ``GrpcServerCallContextHelper``), then creates the
-reactor for the method. An unknown method gets a reactor that only finishes
+reactor for the method. An unknown method and a DoPut whose
+``CreateDoPutListener()`` returns ``nullptr`` get a reactor that only finishes
 the call as ``UNIMPLEMENTED``. Every other reactor derives from
 ``AsyncReactorBase``; a handler the server class does not override answers
 ``NotImplemented`` through that reactor.
@@ -104,7 +108,8 @@ Cancellation
 ``AsyncReactorBase::OnCancel()`` is ``final`` and does two things in order:
 
 1. ``TearDownOnCancel()``: the reactor's own teardown, which settles the
-   status with ``FinishOnce()`` and then unwinds (DoGet closes its stream).
+   status with ``FinishOnce()`` and then unwinds (DoGet closes its stream,
+   DoPut reports ``OnFinish()``).
 2. ``AsyncCallContext::RunCancelCallbacks()``: runs the callbacks handlers
    registered through
    :func:`arrow::flight::AsyncGenericFlightServerBase::AddCancelCallback`.
@@ -125,6 +130,18 @@ DoGet
    and ``CloseStreamOnce()`` claims the stream under it. So ``Close()`` never
    overlaps a demand, and runs exactly once. A stream that arrives after
    cancellation is closed by whichever path sees it last.
+
+DoPut
+   The reactor is the listener's
+   ``internal::FlightDataListenerTransport``. It is published with
+   ``SetTransport(listener, this)`` and retired with
+   ``SetTransport(listener, nullptr)`` in ``OnDone()``, under the listener's
+   mutexes. ``AsyncFlightDataListener::Cancel()`` pins it with ``Hold()``
+   under that mutex before calling in. One PutResult write slot is shared by
+   ``WriteMetadataAsync()`` and the final acknowledgement, and
+   ``OnWriteDone()`` completes the pending metadata future. ``upload_ending_``
+   makes the first ending (client, server cancel, failure) decide the
+   upload's status.
 
 Testing
 =======

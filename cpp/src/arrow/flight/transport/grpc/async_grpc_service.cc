@@ -33,6 +33,7 @@ namespace pb = arrow::flight::protocol;
 constexpr std::string_view kPrefix = "/arrow.flight.protocol.FlightService/";
 constexpr std::string_view kHandshakeMethod = "Handshake";
 constexpr std::string_view kDoGetMethod = "DoGet";
+constexpr std::string_view kDoPutMethod = "DoPut";
 constexpr std::string_view kDoActionMethod = "DoAction";
 constexpr std::string_view kListActionsMethod = "ListActions";
 constexpr std::string_view kPollFlightInfoMethod = "PollFlightInfo";
@@ -46,6 +47,7 @@ static const std::unordered_map<std::string_view, FlightMethod> kMethodMap = {
     {kGetFlightInfoMethod, FlightMethod::GetFlightInfo},
     {kGetSchemaMethod, FlightMethod::GetSchema},
     {kDoGetMethod, FlightMethod::DoGet},
+    {kDoPutMethod, FlightMethod::DoPut},
     {kDoActionMethod, FlightMethod::DoAction},
     {kListActionsMethod, FlightMethod::ListActions},
     {kPollFlightInfoMethod, FlightMethod::PollFlightInfo},
@@ -106,6 +108,17 @@ AsyncGenericFlightService::AsyncGenericFlightService(
       return detail::MakeListFlightsReactor(std::move(flight_context), base_);
     case FlightMethod::DoGet:
       return detail::MakeDoGetReactor(std::move(flight_context), base_);
+    case FlightMethod::DoPut: {
+      std::shared_ptr<AsyncFlightDataListener> listener =
+          base_->CreateDoPutListener(flight_context);
+      if (!listener) {
+        return new Unimplemented(
+            flight_context,
+            ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
+                           "DoPut is not implemented: no listener available"));
+      }
+      return detail::MakeDoPutReactor(std::move(flight_context), std::move(listener));
+    }
     default:
       break;
   }

@@ -140,6 +140,12 @@ AsyncGenericFlightServerBase::DoGetAsync(const ServerCallContext&, const Ticket&
   return Status::NotImplemented("DoGetAsync is not implemented");
 }
 
+std::shared_ptr<AsyncFlightDataListener>
+AsyncGenericFlightServerBase::CreateDoPutListener(const ServerCallContext&) {
+  // The default refuses uploads, a server that accepts them overrides this.
+  return nullptr;
+}
+
 Status AsyncGenericFlightServerBase::Handshake(const ServerCallContext&,
                                                const std::string&, std::string*) {
   return Status::NotImplemented(

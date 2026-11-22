@@ -153,7 +153,7 @@ struct MethodRequest {
 };
 
 // A well-formed but incomplete FlightDescriptor protobuf: field 1 announces 127
-// bytes and carries two.
+// bytes and carries two. Same literal as the DoPut tests below.
 const char kTruncatedDescriptor[] = "\x0a\x7f\x01\x02";
 
 std::optional<MethodRequest> ValidRequest(std::string_view method) {
@@ -165,7 +165,8 @@ std::optional<MethodRequest> ValidRequest(std::string_view method) {
   if (method == "DoGet") {
     return MethodRequest{method, WireBytes(Ticket{"ticket"})};
   }
-  if (method == "GetFlightInfo" || method == "GetSchema" || method == "PollFlightInfo") {
+  if (method == "DoPut" || method == "GetFlightInfo" || method == "GetSchema" ||
+      method == "PollFlightInfo") {
     return MethodRequest{method, WireBytes(FlightDescriptor::Path({"path"}))};
   }
   if (method == "DoAction") {
@@ -259,6 +260,55 @@ TEST(AsyncGrpcTest, RawRequestFailures) {
   }
 }
 
+TEST(AsyncGrpcTest, DoPutRawRequestFailures) {
+  // The upload's malformed cases, as raw rows: the descriptor-less schema, the
+  // malformed first message, the empty upload and a missing first message.
+  struct Case {
+    std::string name;
+    std::vector<::grpc::ByteBuffer> request;
+    std::string message;
+  };
+  auto schema = TwoColumnSchema();
+  auto batch = TwoColumnBatch(schema);
+  auto reader = arrow::RecordBatchReader::Make({batch}, schema).ValueOrDie();
+  RecordBatchStream stream(std::move(reader));
+  ASSERT_OK_AND_ASSIGN(auto schema_payload, stream.GetSchemaPayload());
+  schema_payload.descriptor = nullptr;
+  ::grpc::ByteBuffer descriptor_less;
+  bool own_buffer = false;
+  ASSERT_TRUE(FlightDataSerialize(schema_payload, &descriptor_less, &own_buffer).ok());
+
+  const std::vector<Case> cases = {
+      {"descriptor-less schema", {descriptor_less}, "Descriptor missing"},
+      {"malformed first message",
+       {RawMessage(std::string(kTruncatedDescriptor, 4))},
+       "Unable to read FlightDescriptor"},
+      {"no message at all", {}, "empty upload"},
+  };
+
+  for (const auto& test : cases) {
+    SCOPED_TRACE(test.name);
+    TestFlightServer flight_server;
+    auto listener = std::make_shared<RecordingListener>();
+    flight_server.set_listener(listener);
+    ASSERT_OK_AND_ASSIGN(auto client, StartAndConnect(&flight_server));
+    ASSERT_OK_AND_ASSIGN(
+        auto raw, CallRaw(flight_server.port(), MethodPath("DoPut"), test.request));
+    EXPECT_FALSE(raw.status.ok());
+    EXPECT_THAT(raw.status.error_message(), ::testing::HasSubstr(test.message));
+    EXPECT_TRUE(raw.responses.empty()) << "a rejected upload must answer nothing";
+    // The factory ran, the descriptor/schema/data callbacks did not.
+    EXPECT_EQ(1, flight_server.handler_calls());
+    EXPECT_EQ(0, listener->descriptor_count());
+    EXPECT_EQ(0, listener->schema_count());
+    EXPECT_EQ(0, listener->batches().size());
+    EXPECT_EQ(0, listener->metadata_only_count());
+    ASSERT_OK(StopClientAndServer(client.get(), &flight_server));
+    EXPECT_EQ(1, listener->finish_count()) << "the upload must end exactly once";
+    EXPECT_FALSE(listener->finish_status().ok());
+  }
+}
+
 TEST(AsyncGrpcTest, DefaultHandlersAreUnimplemented) {
   // A bare async server implements no handler: every RPC must answer
   // UNIMPLEMENTED with the message of its own default, before anything is
@@ -278,6 +328,7 @@ TEST(AsyncGrpcTest, DefaultHandlersAreUnimplemented) {
       {"DoAction", "NYI"},
       {"ListActions", "NYI"},
       {"DoGet", "DoGetAsync is not implemented"},
+      {"DoPut", "no listener available"},
       {"Handshake", "authentication mechanism"},
   };
 
