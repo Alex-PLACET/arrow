@@ -157,6 +157,10 @@ RPC                Handler returns
 ``DoGet``          :class:`arrow::flight::AsyncFlightDataStream`
 ``DoPut``          an :class:`arrow::flight::AsyncFlightDataListener`,
                    from ``CreateDoPutListener()``
+``DoExchange``     a future that completes when the exchange is over;
+                   the handler is given an
+                   :class:`arrow::flight::AsyncFlightMessageReader` and an
+                   :class:`arrow::flight::AsyncFlightMessageWriter`
 =================  =====================================================
 
 Serving DoGet

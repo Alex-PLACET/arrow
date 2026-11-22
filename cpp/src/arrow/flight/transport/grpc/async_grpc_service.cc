@@ -36,6 +36,7 @@ constexpr std::string_view kDoGetMethod = "DoGet";
 constexpr std::string_view kDoPutMethod = "DoPut";
 constexpr std::string_view kDoActionMethod = "DoAction";
 constexpr std::string_view kListActionsMethod = "ListActions";
+constexpr std::string_view kDoExchangeMethod = "DoExchange";
 constexpr std::string_view kPollFlightInfoMethod = "PollFlightInfo";
 constexpr std::string_view kListFlightsMethod = "ListFlights";
 constexpr std::string_view kGetFlightInfoMethod = "GetFlightInfo";
@@ -50,6 +51,7 @@ static const std::unordered_map<std::string_view, FlightMethod> kMethodMap = {
     {kDoPutMethod, FlightMethod::DoPut},
     {kDoActionMethod, FlightMethod::DoAction},
     {kListActionsMethod, FlightMethod::ListActions},
+    {kDoExchangeMethod, FlightMethod::DoExchange},
     {kPollFlightInfoMethod, FlightMethod::PollFlightInfo},
 };
 
@@ -106,6 +108,8 @@ AsyncGenericFlightService::AsyncGenericFlightService(
       return detail::MakeDoActionReactor(std::move(flight_context), base_);
     case FlightMethod::ListFlights:
       return detail::MakeListFlightsReactor(std::move(flight_context), base_);
+    case FlightMethod::DoExchange:
+      return detail::MakeExchangeReactor(std::move(flight_context), base_);
     case FlightMethod::DoGet:
       return detail::MakeDoGetReactor(std::move(flight_context), base_);
     case FlightMethod::DoPut: {

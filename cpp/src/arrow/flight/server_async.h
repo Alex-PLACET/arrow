@@ -97,6 +97,68 @@ class ARROW_FLIGHT_EXPORT AsyncResultStream {
   virtual arrow::Future<std::shared_ptr<Result>> NextAsync() = 0;
 };
 
+/// \brief The reader of one DoExchange: the messages the client sends, pulled
+/// one NextAsync() at a time.
+///
+/// Runs on the thread that calls it, at most one NextAsync() may be
+/// outstanding.
+/// Schema and dictionary messages are read through (they are not chunks), a metadata-only
+/// message is a chunk with a null data member, and the chunk whose members are both null
+/// ends the exchange.
+/// The reader must not be used after the future returned by DoExchangeAsync completes.
+class ARROW_FLIGHT_EXPORT AsyncFlightMessageReader {
+ public:
+  virtual ~AsyncFlightMessageReader();
+
+  /// \brief The descriptor of this exchange.
+  virtual const FlightDescriptor& descriptor() const = 0;
+
+  /// \brief The next message of the exchange, decoded.
+  /// \return A future completed with the next chunk, both of its members are
+  /// null at the end of the exchange. A non-OK status fails the RPC.
+  virtual arrow::Future<FlightStreamChunk> NextAsync() = 0;
+};
+
+/// \brief The writer of one DoExchange: the messages the server sends back.
+///
+/// Runs on the thread that calls it, await each returned future before
+/// writing again. The writer must not be used after the future returned by
+/// DoExchangeAsync completes.
+class ARROW_FLIGHT_EXPORT AsyncFlightMessageWriter {
+ public:
+  virtual ~AsyncFlightMessageWriter();
+
+  /// \brief Start the writer with the schema of the messages it will write.
+  /// Must be called before any record batch is written.
+  /// \param schema The schema of the messages to be written.
+  /// \return A future that completes once the writer is ready to accept messages.
+  virtual arrow::Future<> BeginAsync(std::shared_ptr<Schema> schema) = 0;
+
+  /// \brief Write one record batch.
+  /// \param batch The record batch to write.
+  /// \return A future that completes once the batch has been written.
+  virtual arrow::Future<> WriteRecordBatchAsync(const RecordBatch& batch) = 0;
+
+  /// \brief Write one application-metadata-only message.
+  /// \param app_metadata The application metadata to write.
+  /// \return A future that completes once the metadata has been written.
+  virtual arrow::Future<> WriteMetadataAsync(std::shared_ptr<Buffer> app_metadata) = 0;
+
+  /// \brief Write one record batch with application metadata attached.
+  /// \param batch The record batch to write.
+  /// \param app_metadata The application metadata to attach.
+  /// \return A future that completes once the batch and metadata have been written.
+  virtual arrow::Future<> WriteWithMetadataAsync(
+      const RecordBatch& batch, std::shared_ptr<Buffer> app_metadata) = 0;
+
+  /// \brief Finish the write side: end the IPC stream.
+  ///
+  /// Call once, after the last message, then await it before completing
+  /// DoExchangeAsync's future.
+  /// \return A future that completes once the write side has been closed.
+  virtual arrow::Future<> CloseAsync() = 0;
+};
+
 /// \brief a Flight server served by the async generic gRPC
 /// callback service.
 ///
@@ -284,6 +346,19 @@ class ARROW_FLIGHT_EXPORT AsyncGenericFlightServerBase {
   /// \see FlightServerBase::ListActions.
   virtual arrow::Future<std::vector<ActionType>> ListActionsAsync(
       const ServerCallContext& context);
+
+  /// \brief Asynchronously process a bidirectional stream of IPC payloads.
+  /// \see FlightServerBase::DoExchange.
+  /// \param[in] context is the server call context.
+  /// \param[in] reader is the asynchronous reader for the client's messages.
+  /// \param[in] writer is the asynchronous writer for the server's messages.
+  /// \return A future completed when the exchange is over, its status is the
+  /// RPC's status.
+  /// While it runs, consume the client's messages through the reader and send the
+  /// server's through the writer. Both must not be used after the future completes.
+  virtual arrow::Future<> DoExchangeAsync(
+      const ServerCallContext& context, std::shared_ptr<AsyncFlightMessageReader> reader,
+      std::shared_ptr<AsyncFlightMessageWriter> writer);
 
   /// \brief The stream serving one DoGet RPC.
   ///

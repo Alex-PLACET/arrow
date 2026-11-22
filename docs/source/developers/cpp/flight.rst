@@ -51,12 +51,13 @@ File                                Contents
 ``async_grpc_streaming.cc``         ListActions, DoAction, ListFlights
 ``async_grpc_do_get.cc``            DoGet
 ``async_grpc_do_put.cc``            DoPut
+``async_grpc_exchange*.cc``         DoExchange: reactor, reader, writer
 ``async_grpc_handshake.cc``         Handshake
 ==================================  ===========================================
 
 ``arrow/flight/server_async.h`` declares the public handler interfaces, and
 ``arrow/flight/flight_data_decoder.h`` declares the DoPut listener, its
-metadata writer and the push decoder DoPut uses.
+metadata writer and the push decoder that DoPut and DoExchange share.
 
 Dispatch
 ========
@@ -109,7 +110,7 @@ Cancellation
 
 1. ``TearDownOnCancel()``: the reactor's own teardown, which settles the
    status with ``FinishOnce()`` and then unwinds (DoGet closes its stream,
-   DoPut reports ``OnFinish()``).
+   DoExchange wakes its reader and writer, DoPut reports ``OnFinish()``).
 2. ``AsyncCallContext::RunCancelCallbacks()``: runs the callbacks handlers
    registered through
    :func:`arrow::flight::AsyncGenericFlightServerBase::AddCancelCallback`.
@@ -143,6 +144,12 @@ DoPut
    makes the first ending (client, server cancel, failure) decide the
    upload's status.
 
+DoExchange
+   ``ExchangeReader`` and ``ExchangeWriter`` reach the reactor through plain
+   back-pointers guarded by their own mutex. ``OnDone()`` detaches both
+   before releasing the RPC's reference. The reader and writer take a
+   ``HoldToken`` under that mutex around each call into the reactor.
+
 Testing
 =======
 
@@ -164,4 +171,4 @@ example:
 .. code-block:: shell
 
    arrow-flight-async-grpc-test --gtest_repeat=20 \
-     --gtest_filter='*Cancel*:*PendingHandlerFinishes*'
+     --gtest_filter='*DoExchange*:*Cancel*:*PendingHandlerFinishes*'

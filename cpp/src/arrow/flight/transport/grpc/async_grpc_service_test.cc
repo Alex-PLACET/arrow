@@ -153,7 +153,7 @@ struct MethodRequest {
 };
 
 // A well-formed but incomplete FlightDescriptor protobuf: field 1 announces 127
-// bytes and carries two. Same literal as the DoPut tests below.
+// bytes and carries two. Same literal as the DoPut and DoExchange tests below.
 const char kTruncatedDescriptor[] = "\x0a\x7f\x01\x02";
 
 std::optional<MethodRequest> ValidRequest(std::string_view method) {
@@ -178,7 +178,22 @@ std::optional<MethodRequest> ValidRequest(std::string_view method) {
   if (method == "ListFlights") {
     return MethodRequest{method, WireBytes(Criteria{})};
   }
+  if (method == "DoExchange") {
+    // DoExchange's own first message is a FlightData, built by the caller.
+    return std::nullopt;
+  }
   return std::nullopt;
+}
+
+/// The FlightData a FlightClient sends as DoExchange's first message: the
+/// descriptor alone.
+::grpc::ByteBuffer ExchangeDescriptorMessage(const FlightDescriptor& descriptor) {
+  FlightPayload payload;
+  EXPECT_TRUE(internal::ToPayload(descriptor, &payload.descriptor).ok());
+  ::grpc::ByteBuffer out;
+  bool own_buffer = false;
+  EXPECT_TRUE(FlightDataSerialize(payload, &out, &own_buffer).ok());
+  return out;
 }
 
 }  // namespace
@@ -197,8 +212,8 @@ TEST(AsyncGrpcTest, RawRequestFailures) {
   };
 
   const std::vector<std::string> no_message_methods = {
-      "Handshake",   "GetFlightInfo", "GetSchema",   "PollFlightInfo",
-      "ListActions", "DoAction",      "ListFlights", "DoGet"};
+      "Handshake", "GetFlightInfo", "GetSchema",  "PollFlightInfo", "ListActions",
+      "DoAction",  "ListFlights",   "DoExchange", "DoGet"};
   const std::vector<std::pair<std::string, std::string>> parse_names = {
       {"Handshake", "HandshakeRequest"},
       {"GetFlightInfo", "FlightDescriptor"},
@@ -309,6 +324,112 @@ TEST(AsyncGrpcTest, DoPutRawRequestFailures) {
   }
 }
 
+TEST(AsyncGrpcTest, DoExchangeRawRequestFailures) {
+  // DoExchange's own malformed inputs: the outer FlightData protobuf and the
+  // descriptor are checked before the handler runs, the inner IPC message after
+  // it (the handler's own NextAsync() reports that one).
+  {
+    TestFlightServer flight_server;
+    ASSERT_OK_AND_ASSIGN(auto client, StartAndConnect(&flight_server));
+    ASSERT_OK_AND_ASSIGN(auto raw,
+                         CallRaw(flight_server.port(), MethodPath("DoExchange"),
+                                 {RawMessage(std::string(kTruncatedDescriptor, 4))}));
+    // FlightDataDeserialize() reports gRPC's own reason, wrapped by the reactor.
+    EXPECT_EQ(::grpc::StatusCode::INTERNAL, raw.status.error_code());
+    EXPECT_THAT(raw.status.error_message(),
+                ::testing::HasSubstr("Unable to read FlightDescriptor"));
+    EXPECT_TRUE(raw.responses.empty());
+    EXPECT_EQ(0, flight_server.handler_calls());
+    ASSERT_OK(StopClientAndServer(client.get(), &flight_server));
+  }
+  {
+    // A valid FlightData with no descriptor: the exchange cannot be routed.
+    FlightPayload payload;
+    payload.app_metadata = Buffer::FromString("no-descriptor");
+    ::grpc::ByteBuffer message;
+    bool own_buffer = false;
+    ASSERT_TRUE(FlightDataSerialize(payload, &message, &own_buffer).ok());
+    TestFlightServer flight_server;
+    ASSERT_OK_AND_ASSIGN(auto client, StartAndConnect(&flight_server));
+    ASSERT_OK_AND_ASSIGN(
+        auto raw, CallRaw(flight_server.port(), MethodPath("DoExchange"), {message}));
+    EXPECT_EQ(::grpc::StatusCode::INTERNAL, raw.status.error_code());
+    EXPECT_THAT(raw.status.error_message(), ::testing::HasSubstr("Descriptor missing"));
+    EXPECT_TRUE(raw.responses.empty());
+    EXPECT_EQ(0, flight_server.handler_calls());
+    ASSERT_OK(StopClientAndServer(client.get(), &flight_server));
+  }
+  {
+    // One message carrying the descriptor AND an IPC metadata that is not a
+    // message: the handler runs (the descriptor is intact) and its demand
+    // reports the decoder's error, which must fail the RPC rather than turn
+    // into a truncated success.
+    class BadIpcExchangeServer final : public AsyncGenericFlightServerBase {
+     public:
+      arrow::Future<> DoExchangeAsync(
+          const ServerCallContext&, std::shared_ptr<AsyncFlightMessageReader> reader,
+          std::shared_ptr<AsyncFlightMessageWriter>) override {
+        handler_entered_.MarkFinished();
+        auto out = Future<>::Make();
+        reader->NextAsync().AddCallback(
+            [this, reader, out](const arrow::Result<FlightStreamChunk>& result) mutable {
+              if (result.ok()) {
+                out.MarkFinished(Status::Invalid("the malformed message was accepted"));
+                return;
+              }
+              first_error_ = result.status();
+              // The same error must replay on the next demand, not become a
+              // clean end of input.
+              reader->NextAsync().AddCallback(
+                  [this, out](const arrow::Result<FlightStreamChunk>& replay) mutable {
+                    replayed_status_ =
+                        replay.ok() ? Status::Invalid("the second demand succeeded")
+                                    : replay.status();
+                    out.MarkFinished(first_error_);
+                  });
+            });
+        return out;
+      }
+
+      arrow::Future<> handler_entered() const { return handler_entered_; }
+      Status first_error() const { return first_error_; }
+      Status replayed_status() const { return replayed_status_; }
+
+     private:
+      Future<> handler_entered_ = Future<>::Make();
+      Status first_error_;
+      Status replayed_status_;
+    };
+
+    BadIpcExchangeServer flight_server;
+    ASSERT_OK_AND_ASSIGN(auto client, StartAndConnect(&flight_server));
+    FlightPayload malformed;
+    ASSERT_OK(
+        internal::ToPayload(FlightDescriptor::Command("bad-ipc"), &malformed.descriptor));
+    malformed.ipc_message.type = ipc::MessageType::RECORD_BATCH;
+    malformed.ipc_message.metadata = Buffer::FromString("not-an-ipc-message");
+    ::grpc::ByteBuffer message;
+    bool own_buffer = false;
+    ASSERT_TRUE(FlightDataSerialize(malformed, &message, &own_buffer).ok());
+
+    ASSERT_OK_AND_ASSIGN(
+        auto raw, CallRaw(flight_server.port(), MethodPath("DoExchange"), {message}));
+    ASSERT_TRUE(flight_server.handler_entered().Wait(10));
+    EXPECT_FALSE(raw.status.ok()) << "a bad IPC message must fail the exchange";
+    // The native IPC decoder's flatbuffer validation is what rejected it, and
+    // the handler propagated that status rather than accepting the message.
+    EXPECT_FALSE(raw.arrow_status.ok()) << raw.arrow_status;
+    EXPECT_THAT(raw.arrow_status.ToString(),
+                ::testing::HasSubstr("Invalid flatbuffers message"));
+    EXPECT_FALSE(flight_server.first_error().ok());
+    EXPECT_EQ(flight_server.first_error().ToString(),
+              flight_server.replayed_status().ToString())
+        << "the reader's error must replay on the next NextAsync()";
+    EXPECT_TRUE(raw.responses.empty());
+    ASSERT_OK(StopClientAndServer(client.get(), &flight_server));
+  }
+}
+
 TEST(AsyncGrpcTest, DefaultHandlersAreUnimplemented) {
   // A bare async server implements no handler: every RPC must answer
   // UNIMPLEMENTED with the message of its own default, before anything is
@@ -327,6 +448,7 @@ TEST(AsyncGrpcTest, DefaultHandlersAreUnimplemented) {
       {"GetSchema", "NYI"},
       {"DoAction", "NYI"},
       {"ListActions", "NYI"},
+      {"DoExchange", "NYI"},
       {"DoGet", "DoGetAsync is not implemented"},
       {"DoPut", "no listener available"},
       {"Handshake", "authentication mechanism"},
@@ -335,9 +457,13 @@ TEST(AsyncGrpcTest, DefaultHandlersAreUnimplemented) {
   const int64_t before = detail::AsyncReactorBase::live_reactors();
   for (const auto& test : cases) {
     SCOPED_TRACE(test.method);
-    const auto made = ValidRequest(test.method);
-    ASSERT_TRUE(made.has_value());
-    const std::vector<::grpc::ByteBuffer> request = {RawMessage(made->message)};
+    std::vector<::grpc::ByteBuffer> request;
+    if (auto made = ValidRequest(test.method)) {
+      request.push_back(RawMessage(made->message));
+    } else {
+      // DoExchange's first message is a FlightData carrying the descriptor.
+      request.push_back(ExchangeDescriptorMessage(FlightDescriptor::Command("nyi")));
+    }
     ASSERT_OK_AND_ASSIGN(auto raw,
                          CallRaw(flight_server.port(), MethodPath(test.method), request));
     EXPECT_EQ(::grpc::StatusCode::UNIMPLEMENTED, raw.status.error_code())

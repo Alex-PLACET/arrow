@@ -366,7 +366,7 @@ class TestFlightServer final : public AsyncGenericFlightServerBase {
         std::make_shared<SimpleListingAdapter>(std::move(flights)));
   }
 
-  /// \brief Handshake delegates to the base class.
+  /// \brief Handshake and DoExchange delegate to the base class.
   ///
   /// Declared so the call is counted like every other handler: a malformed
   /// request must never reach one, whichever RPC it names.
@@ -374,6 +374,14 @@ class TestFlightServer final : public AsyncGenericFlightServerBase {
                    std::string* response) override {
     handler_calls_.fetch_add(1);
     return AsyncGenericFlightServerBase::Handshake(context, password, response);
+  }
+
+  arrow::Future<> DoExchangeAsync(
+      const ServerCallContext& context, std::shared_ptr<AsyncFlightMessageReader> reader,
+      std::shared_ptr<AsyncFlightMessageWriter> writer) override {
+    handler_calls_.fetch_add(1);
+    return AsyncGenericFlightServerBase::DoExchangeAsync(context, std::move(reader),
+                                                         std::move(writer));
   }
 
   void set_empty_actions() { empty_actions_ = true; }
@@ -399,6 +407,73 @@ class TestFlightServer final : public AsyncGenericFlightServerBase {
   bool criteria_was_null_ = false;
   bool empty_actions_ = false;
   bool fail_actions_ = false;
+};
+
+// Echoes every chunk of a DoExchange back, in order, on the async API: the
+// reader's demand drives the loop, each write is awaited, and the all-null
+// chunk ends the exchange. `exchanges_in_flight` proves an abandoned
+// exchange still leaves the handler: the state object is freed when the last
+// continuation dies and decrements the counter on destruction.
+class EchoExchangeTestServer : public AsyncGenericFlightServerBase {
+ public:
+  arrow::Future<> DoExchangeAsync(
+      const ServerCallContext&, std::shared_ptr<AsyncFlightMessageReader> reader,
+      std::shared_ptr<AsyncFlightMessageWriter> writer) override {
+    exchange_count_.fetch_add(1);
+    exchanges_in_flight_.fetch_add(1);
+    auto state = std::make_shared<EchoState>();
+    state->reader = std::move(reader);
+    state->writer = std::move(writer);
+    state->in_flight = &exchanges_in_flight_;
+    return EchoNext(state);
+  }
+
+  int exchanges_in_flight() const { return exchanges_in_flight_.load(); }
+  int exchange_count() const { return exchange_count_.load(); }
+
+ private:
+  struct EchoState {
+    std::shared_ptr<AsyncFlightMessageReader> reader;
+    std::shared_ptr<AsyncFlightMessageWriter> writer;
+    std::atomic<int>* in_flight = nullptr;
+    bool begun = false;
+    ~EchoState() { in_flight->fetch_sub(1); }
+  };
+
+  arrow::Future<> EchoNext(const std::shared_ptr<EchoState>& state) {
+    // The recursion depth follows the batch count of one exchange.  Flatten
+    // into a loop if a single exchange ever carries thousands.
+    return state->reader->NextAsync().Then(
+        [this, state](const FlightStreamChunk& chunk) -> arrow::Future<> {
+          if (chunk.data == nullptr && chunk.app_metadata == nullptr) {
+            // End of the exchange.
+            return arrow::Future<>::MakeFinished();
+          }
+          arrow::Future<> written = arrow::Future<>::MakeFinished();
+          if (chunk.data != nullptr && !state->begun) {
+            state->begun = true;
+            written = state->writer->BeginAsync(chunk.data->schema());
+          }
+          if (chunk.data != nullptr && chunk.app_metadata != nullptr) {
+            written = written.Then([state, chunk]() {
+              return state->writer->WriteWithMetadataAsync(*chunk.data,
+                                                           chunk.app_metadata);
+            });
+          } else if (chunk.data != nullptr) {
+            written = written.Then([state, chunk]() {
+              return state->writer->WriteRecordBatchAsync(*chunk.data);
+            });
+          } else {
+            written = written.Then([state, chunk]() {
+              return state->writer->WriteMetadataAsync(chunk.app_metadata);
+            });
+          }
+          return written.Then([this, state]() { return EchoNext(state); });
+        });
+  }
+
+  std::atomic<int> exchanges_in_flight_{0};
+  std::atomic<int> exchange_count_{0};
 };
 
 // Records what the decoder hands to the application: the schema, every chunk,
@@ -1241,8 +1316,8 @@ inline arrow::Result<std::vector<std::vector<std::string>>> DrainListingPaths(
   }
 }
 
-// Poll `predicate` until it holds or the timeout expires: tests use it to bound
-// server-side cleanup instead of sleeping a fixed time.
+// Poll `predicate` until it holds or the timeout expires, the DoExchange tests
+// use it to bound server-side cleanup instead of sleeping a fixed time.
 template <typename Predicate>
 inline bool WaitFor(Predicate predicate,
                     std::chrono::milliseconds timeout = std::chrono::seconds(10)) {

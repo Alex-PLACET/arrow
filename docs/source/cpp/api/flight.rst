@@ -205,6 +205,14 @@ See :ref:`cpp-flight-async-server` for an overview.
    :project: arrow_cpp
    :members:
 
+.. doxygenclass:: arrow::flight::AsyncFlightMessageReader
+   :project: arrow_cpp
+   :members:
+
+.. doxygenclass:: arrow::flight::AsyncFlightMessageWriter
+   :project: arrow_cpp
+   :members:
+
 .. doxygenclass:: arrow::flight::AsyncFlightDataListener
    :project: arrow_cpp
    :members:
