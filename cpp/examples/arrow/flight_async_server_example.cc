@@ -42,6 +42,8 @@
 //
 // The catalog holds named schemas. It serves:
 //   GetFlightInfo, GetSchema, PollFlightInfo  look up one flight by path
+//   ListFlights                               every flight, one at a time
+//   ListActions, DoAction("drop")             remove a flight by name
 // RPCs it does not override answer UNIMPLEMENTED.
 //
 // Usage:
@@ -87,6 +89,24 @@ class Catalog {
     return MakeInfo(it->first, it->second);
   }
 
+  arrow::Result<std::vector<flight::FlightInfo>> All() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<flight::FlightInfo> infos;
+    for (const auto& [name, schema] : schemas_) {
+      ARROW_ASSIGN_OR_RAISE(auto info, MakeInfo(name, schema));
+      infos.push_back(std::move(*info));
+    }
+    return infos;
+  }
+
+  arrow::Status Drop(const std::string& name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (schemas_.erase(name) == 0) {
+      return arrow::Status::KeyError("No flight named ", name);
+    }
+    return arrow::Status::OK();
+  }
+
  private:
   void Add(std::string name, std::shared_ptr<arrow::Schema> schema) {
     schemas_.emplace(std::move(name), std::move(schema));
@@ -103,6 +123,43 @@ class Catalog {
 
   mutable std::mutex mutex_;
   std::map<std::string, std::shared_ptr<arrow::Schema>> schemas_;
+};
+
+/// \brief ListFlights' answer: the transport pulls one FlightInfo at a time.
+class VectorListing : public flight::AsyncFlightListing {
+ public:
+  explicit VectorListing(std::vector<flight::FlightInfo> infos)
+      : infos_(std::move(infos)) {}
+
+  arrow::Future<std::shared_ptr<flight::FlightInfo>> NextAsync() override {
+    if (next_ == infos_.size()) {
+      return std::shared_ptr<flight::FlightInfo>();  // end of the listing
+    }
+    return std::make_shared<flight::FlightInfo>(std::move(infos_[next_++]));
+  }
+
+ private:
+  std::vector<flight::FlightInfo> infos_;
+  size_t next_ = 0;
+};
+
+/// \brief DoAction's answer: a single result.
+class SingleResult : public flight::AsyncResultStream {
+ public:
+  explicit SingleResult(std::string body) : body_(std::move(body)) {}
+
+  arrow::Future<std::shared_ptr<flight::Result>> NextAsync() override {
+    if (done_) {
+      return std::shared_ptr<flight::Result>();
+    }
+    done_ = true;
+    return std::make_shared<flight::Result>(
+        flight::Result{arrow::Buffer::FromString(body_)});
+  }
+
+ private:
+  std::string body_;
+  bool done_ = false;
 };
 
 class ExampleServer : public flight::AsyncGenericFlightServerBase {
@@ -140,6 +197,34 @@ class ExampleServer : public flight::AsyncGenericFlightServerBase {
         });
   }
 
+  arrow::Future<std::shared_ptr<flight::AsyncFlightListing>> ListFlightsAsync(
+      const flight::ServerCallContext&, const flight::Criteria*) override {
+    return OnIoPool(
+        [this]() -> arrow::Result<std::shared_ptr<flight::AsyncFlightListing>> {
+          ARROW_ASSIGN_OR_RAISE(auto infos, catalog_.All());
+          return std::make_shared<VectorListing>(std::move(infos));
+        });
+  }
+
+  arrow::Future<std::vector<flight::ActionType>> ListActionsAsync(
+      const flight::ServerCallContext&) override {
+    return std::vector<flight::ActionType>{
+        {"drop", "Remove the flight named by the action body"}};
+  }
+
+  arrow::Future<std::shared_ptr<flight::AsyncResultStream>> DoActionAsync(
+      const flight::ServerCallContext&, const flight::Action& action) override {
+    if (action.type != "drop") {
+      return arrow::Status::NotImplemented("Unknown action: ", action.type);
+    }
+    std::string name = action.body ? action.body->ToString() : "";
+    return OnIoPool(
+        [this, name]() -> arrow::Result<std::shared_ptr<flight::AsyncResultStream>> {
+          ARROW_RETURN_NOT_OK(catalog_.Drop(name));
+          return std::make_shared<SingleResult>("dropped " + name);
+        });
+  }
+
  private:
   Catalog catalog_;
 };
@@ -161,9 +246,30 @@ arrow::Status RunDemo(int port) {
   ARROW_ASSIGN_OR_RAISE(auto poll, client->PollFlightInfo(prices));
   std::cout << "PollFlightInfo: progress=" << poll->progress.value_or(0) << std::endl;
 
-  // An unknown flight fails with the handler's own status.
-  if (client->GetFlightInfo(flight::FlightDescriptor::Path({"missing"})).ok()) {
-    return arrow::Status::Invalid("An unknown flight was served");
+  ARROW_ASSIGN_OR_RAISE(auto actions, client->ListActions());
+  for (const auto& action : actions) {
+    std::cout << "ListActions: " << action.type << std::endl;
+  }
+
+  ARROW_ASSIGN_OR_RAISE(auto results,
+                        client->DoAction({"drop", arrow::Buffer::FromString("trades")}));
+  ARROW_ASSIGN_OR_RAISE(auto result, results->Next());
+  std::cout << "DoAction: " << result->body->ToString() << std::endl;
+
+  ARROW_ASSIGN_OR_RAISE(auto listing, client->ListFlights());
+  int flights = 0;
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto next, listing->Next());
+    if (next == nullptr) break;
+    std::cout << "ListFlights: " << next->descriptor().ToString() << std::endl;
+    ++flights;
+  }
+  if (flights != 1) {
+    return arrow::Status::Invalid("Expected 1 flight after the drop, got ", flights);
+  }
+
+  if (client->GetFlightInfo(flight::FlightDescriptor::Path({"trades"})).ok()) {
+    return arrow::Status::Invalid("The dropped flight is still served");
   }
   std::cout << "PASS" << std::endl;
   return client->Close();

@@ -211,8 +211,11 @@ set(ARROW_FLIGHT_SRCS
 # 1.65 on (see transport/grpc/async_grpc_compat.h).  This floor is higher than
 # GRPC_ENABLE_ASYNC above, which only gates the async client.
 if(ARROW_GRPC_VERSION VERSION_GREATER_EQUAL "1.65")
-  list(APPEND ARROW_FLIGHT_SRCS transport/grpc/async_grpc_service.cc
-       transport/grpc/async_grpc_handshake.cc)
+  list(APPEND
+       ARROW_FLIGHT_SRCS
+       transport/grpc/async_grpc_service.cc
+       transport/grpc/async_grpc_handshake.cc
+       transport/grpc/async_grpc_streaming.cc)
 endif()
 
 # Handle Unity build header conflicts on Windows.
@@ -363,6 +366,7 @@ if(ARROW_GRPC_VERSION VERSION_GREATER_EQUAL "1.65")
                  SOURCES
                  transport/grpc/async_grpc_service_test.cc
                  transport/grpc/async_grpc_unary_test.cc
+                 transport/grpc/async_grpc_streaming_test.cc
                  transport/grpc/async_grpc_handshake_test.cc
                  STATIC_LINK_LIBS
                  ${ARROW_FLIGHT_TEST_LINK_LIBS}

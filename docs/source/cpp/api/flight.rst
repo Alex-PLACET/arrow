@@ -193,6 +193,14 @@ See :ref:`cpp-flight-async-server` for an overview.
    :project: arrow_cpp
    :members:
 
+.. doxygenclass:: arrow::flight::AsyncFlightListing
+   :project: arrow_cpp
+   :members:
+
+.. doxygenclass:: arrow::flight::AsyncResultStream
+   :project: arrow_cpp
+   :members:
+
 Error Handling
 ==============
 

@@ -30,6 +30,33 @@
 
 namespace arrow::flight {
 
+/// \brief An asynchronous iterator of FlightInfo instances, returned by
+/// ListFlightsAsync.
+///
+/// The transport pulls it one NextAsync() at a time and writes each
+/// FlightInfo to the client as it becomes available.
+class ARROW_FLIGHT_EXPORT AsyncFlightListing {
+ public:
+  virtual ~AsyncFlightListing();
+
+  /// \brief The next FlightInfo in the listing.
+  /// \return A future completed with the next FlightInfo, or with a nullptr
+  /// once the listing is exhausted. A non-OK status fails the RPC.
+  virtual arrow::Future<std::shared_ptr<FlightInfo>> NextAsync() = 0;
+};
+
+/// \brief An asynchronous iterator of Result instances, returned by
+/// DoActionAsync.
+class ARROW_FLIGHT_EXPORT AsyncResultStream {
+ public:
+  virtual ~AsyncResultStream();
+
+  /// \brief The next Result in the stream.
+  /// \return A future completed with the next Result, or with a nullptr once
+  /// the stream is exhausted. A non-OK status fails the RPC.
+  virtual arrow::Future<std::shared_ptr<Result>> NextAsync() = 0;
+};
+
 /// \brief a Flight server served by the async generic gRPC
 /// callback service.
 ///
@@ -52,18 +79,20 @@ namespace arrow::flight {
 /// Non overriding handlers will return `Status::NotImplemented` by default.
 ///
 /// Threading: the transport has no thread or executor of its own. It chains
-/// its continuation on every future you return (a handler's result) with the
+/// its continuation on every future you return (a handler's result,
+/// AsyncFlightListing::NextAsync() and AsyncResultStream::NextAsync()) with the
 /// default CallbackOptions, so the continuation runs on whichever thread
 /// completes your future, or inline on the gRPC callback thread that called
 /// you if the future is already complete when you return it. That
 /// continuation starts the RPC's next operation: the next StartWrite() (a
-/// unary response), the next StartRead(), or Finish(). Complete your futures
-/// on the executor you want the RPC's I/O issued from.
+/// listing entry, an action result, a unary response), the next
+/// StartRead(), or Finish(). Complete your futures on the executor you want
+/// the RPC's I/O issued from.
 ///
-/// Every request argument a handler receives (`FlightDescriptor`) is only
-/// valid for the duration of that handler call: copy what you need before
-/// completing the returned future from another thread. The
-/// `ServerCallContext` handed to a handler is likewise the call's
+/// Every request argument a handler receives (`FlightDescriptor`, `Criteria`,
+/// `Action`) is only valid for the duration of that handler call:
+/// copy what you need before completing the returned future from another
+/// thread. The `ServerCallContext` handed to a handler is likewise the call's
 /// own context and must not outlive it.
 ///
 /// Authentication goes through Handshake()/ValidateToken(): a blocking
@@ -146,6 +175,20 @@ class ARROW_FLIGHT_EXPORT AsyncGenericFlightServerBase {
   static Status AddCancelCallback(const ServerCallContext& context,
                                   std::function<void()> callback);
 
+  /// \brief Asynchronously retrieve a list of available fields given an
+  /// optional opaque criteria.
+  /// \param[in] context is the server call context.
+  /// \param[in] criteria is the optional opaque criteria for listing flights.
+  /// \see FlightServerBase::ListFlights
+  ///
+  /// \return A future completed with the listing, or with a non-OK status to
+  /// fail the RPC.
+  /// A future completed with a nullptr listing serves an empty listing.
+  /// The transport pulls the listing one NextAsync() at a time, the criteria pointer is
+  /// never null and is only valid for the duration of the call.
+  virtual arrow::Future<std::shared_ptr<AsyncFlightListing>> ListFlightsAsync(
+      const ServerCallContext& context, const Criteria* criteria);
+
   /// \brief Asynchronously retrieve the schema and an access plan for the
   /// indicated descriptor.
   /// \see FlightServerBase::GetFlightInfo
@@ -176,6 +219,25 @@ class ARROW_FLIGHT_EXPORT AsyncGenericFlightServerBase {
   /// A `nullptr` schema answers `KeyError("Flight not found")`.
   virtual arrow::Future<std::shared_ptr<SchemaResult>> GetSchemaAsync(
       const ServerCallContext& context, const FlightDescriptor& request);
+
+  /// \brief Asynchronously execute an action, returning a stream of zero or
+  /// more results.
+  /// \param[in] context is the server call context.
+  /// \param[in] action is the action to execute.
+  /// \see FlightServerBase::DoAction.
+  /// \return A future completed with the result stream, or with a non-OK
+  /// status to fail the RPC. A future completed with a `nullptr` stream
+  /// answers CANCELLED, as a synchronous server that returns OK without a
+  /// stream does.
+  /// The transport pulls the stream one NextAsync() at a time.
+  virtual arrow::Future<std::shared_ptr<AsyncResultStream>> DoActionAsync(
+      const ServerCallContext& context, const Action& action);
+
+  /// \brief Asynchronously retrieve the list of available actions.
+  /// \param[in] context is the server call context.
+  /// \see FlightServerBase::ListActions.
+  virtual arrow::Future<std::vector<ActionType>> ListActionsAsync(
+      const ServerCallContext& context);
 
   /// \brief Handle the handshake protocol with the client.
   /// \param[in] context is the server call context.

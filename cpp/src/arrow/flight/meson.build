@@ -116,6 +116,7 @@ if has_async_server
     arrow_flight_srcs += [
         'transport/grpc/async_grpc_service.cc',
         'transport/grpc/async_grpc_handshake.cc',
+        'transport/grpc/async_grpc_streaming.cc',
     ]
 endif
 
@@ -193,6 +194,7 @@ if has_async_server
         sources: [
             'transport/grpc/async_grpc_service_test.cc',
             'transport/grpc/async_grpc_unary_test.cc',
+            'transport/grpc/async_grpc_streaming_test.cc',
             'transport/grpc/async_grpc_handshake_test.cc',
             # these transitively include Flight.grpc.pb.h via the fixtures
             # header, so we must declare it here to avoid a race condition

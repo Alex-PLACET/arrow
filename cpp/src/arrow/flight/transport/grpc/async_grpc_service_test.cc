@@ -165,6 +165,15 @@ std::optional<MethodRequest> ValidRequest(std::string_view method) {
   if (method == "GetFlightInfo" || method == "GetSchema" || method == "PollFlightInfo") {
     return MethodRequest{method, WireBytes(FlightDescriptor::Path({"path"}))};
   }
+  if (method == "DoAction") {
+    return MethodRequest{method, WireBytes(Action{"echo", nullptr})};
+  }
+  if (method == "ListActions") {
+    return MethodRequest{method, ""};
+  }
+  if (method == "ListFlights") {
+    return MethodRequest{method, WireBytes(Criteria{})};
+  }
   return std::nullopt;
 }
 
@@ -183,13 +192,16 @@ TEST(AsyncGrpcTest, RawRequestFailures) {
     bool expect_handler;  // DoPut's listener factory runs before any message
   };
 
-  const std::vector<std::string> no_message_methods = {"Handshake", "GetFlightInfo",
-                                                       "GetSchema", "PollFlightInfo"};
+  const std::vector<std::string> no_message_methods = {
+      "Handshake",   "GetFlightInfo", "GetSchema",  "PollFlightInfo",
+      "ListActions", "DoAction",      "ListFlights"};
   const std::vector<std::pair<std::string, std::string>> parse_names = {
       {"Handshake", "HandshakeRequest"},
       {"GetFlightInfo", "FlightDescriptor"},
       {"GetSchema", "FlightDescriptor"},
-      {"PollFlightInfo", "FlightDescriptor"}};
+      {"PollFlightInfo", "FlightDescriptor"},
+      {"DoAction", "Action"},
+      {"ListFlights", "Criteria"}};
 
   std::vector<Case> cases;
   // No message at all, then a half-close: nothing to parse.
@@ -255,9 +267,12 @@ TEST(AsyncGrpcTest, DefaultHandlersAreUnimplemented) {
     std::string message;
   };
   const std::vector<Case> cases = {
+      {"ListFlights", "NYI"},
       {"GetFlightInfo", "NYI"},
       {"PollFlightInfo", "NYI"},
       {"GetSchema", "NYI"},
+      {"DoAction", "NYI"},
+      {"ListActions", "NYI"},
       {"Handshake", "authentication mechanism"},
   };
 

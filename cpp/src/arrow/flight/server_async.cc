@@ -39,6 +39,9 @@
 
 namespace arrow::flight {
 
+AsyncFlightListing::~AsyncFlightListing() = default;
+AsyncResultStream::~AsyncResultStream() = default;
+
 struct AsyncGenericFlightServerBase::Impl {
   internal::ServerLifecycle lifecycle{"AsyncGenericFlightServerBase"};
 };
@@ -98,6 +101,12 @@ Status AsyncGenericFlightServerBase::AddCancelCallback(const ServerCallContext& 
 
 // --- handler defaults: the same answers FlightServerBase's defaults give ---
 
+arrow::Future<std::shared_ptr<AsyncFlightListing>>
+AsyncGenericFlightServerBase::ListFlightsAsync(const ServerCallContext&,
+                                               const Criteria*) {
+  return Status::NotImplemented("NYI");
+}
+
 arrow::Future<std::shared_ptr<FlightInfo>>
 AsyncGenericFlightServerBase::GetFlightInfoAsync(const ServerCallContext&,
                                                  const FlightDescriptor&) {
@@ -112,6 +121,16 @@ AsyncGenericFlightServerBase::PollFlightInfoAsync(const ServerCallContext&,
 
 arrow::Future<std::shared_ptr<SchemaResult>> AsyncGenericFlightServerBase::GetSchemaAsync(
     const ServerCallContext&, const FlightDescriptor&) {
+  return Status::NotImplemented("NYI");
+}
+
+arrow::Future<std::shared_ptr<AsyncResultStream>>
+AsyncGenericFlightServerBase::DoActionAsync(const ServerCallContext&, const Action&) {
+  return Status::NotImplemented("NYI");
+}
+
+arrow::Future<std::vector<ActionType>> AsyncGenericFlightServerBase::ListActionsAsync(
+    const ServerCallContext&) {
   return Status::NotImplemented("NYI");
 }
 

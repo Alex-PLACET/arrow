@@ -33,8 +33,9 @@ namespace arrow::flight::transport::grpc {
 /// Constructed with the AsyncGenericFlightServerBase whose handlers are served.
 /// The server's middleware runs for every call, through the shared context
 /// helper, which also authenticates every method except Handshake. Handshake
-/// and the unary Flight methods (GetFlightInfo, GetSchema, PollFlightInfo) have
-/// a reactor. Every other method is answered UNIMPLEMENTED.
+/// and the synchronous Flight methods (GetFlightInfo, GetSchema,
+/// PollFlightInfo, ListActions, DoAction, ListFlights) have a reactor. Every
+/// other method is answered UNIMPLEMENTED.
 
 // Silence warning
 // "non dll-interface class CallbackGenericService used as base for dll-interface class"
